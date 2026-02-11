@@ -33,6 +33,7 @@ Latest completions:
 - Range predicate index selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — planner now emits `IndexRange` access paths for indexed `<`/`<=`/`>`/`>=`/`BETWEEN` predicates (including reversed comparisons), and SELECT/UPDATE candidate reads consume planner range paths with residual WHERE filtering
 - SELECT `GROUP BY` / `HAVING` parser support in `crates/parser` (Agent 4) — added SELECT AST fields for grouping/filtering clauses, parser support for `GROUP BY ...` and `HAVING ...`, and integration guards in `crates/ralph-sqlite` to return explicit unsupported errors until grouped execution is implemented
 - B+tree delete leaf occupancy rebalance in `crates/storage` (Agent codex) — delete underflow now triggers on low logical leaf occupancy (not only empty pages), with sibling merge when combined pages fit and sibling redistribution plus parent separator-key updates when they do not
+- B+tree delete interior occupancy rebalance in `crates/storage` (Agent codex) — interior delete underflow now triggers on low logical interior occupancy (not only empty pages), with sibling merge/redistribution and parent separator-key updates
 - SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
 - Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable (with scan-all fallback for non-orderable bounds such as text)
 
@@ -44,6 +45,8 @@ Test pass rate:
 - `cargo test -p ralph-planner` (post-range-seek sanity): pass, 0 failed (13 tests).
 - `cargo test -p ralph-sqlite` (ordered range index seeks): pass, 0 failed (41 tests).
 - `./test.sh --fast` (ordered range index seeks, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-storage` (B+tree interior occupancy rebalance): pass, 0 failed (55 tests).
+- `./test.sh --fast` (B+tree interior occupancy rebalance, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (B+tree leaf occupancy rebalance): pass, 0 failed (53 tests).
 - `./test.sh --fast` (B+tree leaf occupancy rebalance, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-sqlite` (GROUP BY/HAVING execution semantics): pass, 0 failed (38 tests).
@@ -122,6 +125,7 @@ Test pass rate:
 23. ~~SELECT `GROUP BY` / `HAVING` parser support + integration guardrails~~ ✓
 24. ~~SELECT `GROUP BY` / `HAVING` execution semantics~~ ✓
 25. ~~Ordered range index seeks for index range predicates~~ ✓
+26. ~~B+tree interior occupancy rebalance~~ ✓
 
 ## Completed Tasks
 
@@ -186,6 +190,10 @@ Test pass rate:
   - Added leaf underflow detection based on logical live-cell utilization (35% threshold), not just empty-page checks
   - Added sibling merge/redistribution for non-empty underfull leaves with parent separator-key updates on redistribution
   - Added storage tests for non-empty merge and redistribution paths; see `notes/btree-delete-occupancy-rebalance.md`
+- [x] B+tree delete interior occupancy rebalance (agent codex)
+  - Added interior underflow detection based on logical interior utilization (35% threshold), not just empty-page checks
+  - Added generalized interior sibling merge/redistribution with parent separator-key updates
+  - Added storage tests for delete-triggered non-empty interior rebalance and redistribution overflow path; see `notes/btree-delete-interior-occupancy-rebalance.md`
 - [x] B+tree delete compaction freelist reclamation (agent 3)
   - Wired `Pager::free_page()` into delete compaction paths so removed leaf/interior pages are returned to freelist
   - Added `delete_compaction_reclaims_pages_to_freelist` coverage in storage tests
@@ -279,7 +287,6 @@ Test pass rate:
 ## Known Issues
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
-- B+tree delete occupancy rebalance is implemented for leaf pages; interior pages still compact only empty-node underflow and do not yet enforce occupancy-based redistribution/merge thresholds.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
 - Range index planning now uses ordered key-range scans for numeric bounds and falls back to full index-bucket scans for non-orderable bounds (for example text), because those values still use hash keys.

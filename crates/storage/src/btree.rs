@@ -58,6 +58,9 @@ const LEAF_CELL_HEADER_SIZE: usize = 12;
 /// Minimum leaf occupancy ratio before delete-time rebalance is triggered.
 const LEAF_MIN_UTILIZATION_NUMERATOR: usize = 35;
 const LEAF_MIN_UTILIZATION_DENOMINATOR: usize = 100;
+/// Minimum interior occupancy ratio before delete-time rebalance is triggered.
+const INTERIOR_MIN_UTILIZATION_NUMERATOR: usize = 35;
+const INTERIOR_MIN_UTILIZATION_DENOMINATOR: usize = 100;
 
 /// A B+tree handle, rooted at a given page.
 pub struct BTree<'a> {
@@ -495,8 +498,9 @@ impl<'a> BTree<'a> {
                 let underflow = if is_root {
                     false
                 } else {
+                    let page_size = self.pager.page_size();
                     let page = self.pager.read_page(page_num)?;
-                    get_cell_count(page) == 0
+                    interior_is_underfull(page, page_size)
                 };
 
                 Ok(DeleteResult {
@@ -551,7 +555,7 @@ impl<'a> BTree<'a> {
 
         match child_page_type {
             PAGE_TYPE_LEAF => self.rebalance_leaf_child(parent_page_num, child_idx),
-            PAGE_TYPE_INTERIOR => self.rebalance_empty_interior_child(parent_page_num, child_idx),
+            PAGE_TYPE_INTERIOR => self.rebalance_interior_child(parent_page_num, child_idx),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown page type for underflowed child: {}", other),
@@ -634,7 +638,7 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    fn rebalance_empty_interior_child(
+    fn rebalance_interior_child(
         &mut self,
         parent_page_num: PageNum,
         child_idx: usize,
@@ -644,28 +648,107 @@ impl<'a> BTree<'a> {
             let page = self.pager.read_page(parent_page_num)?;
             read_interior_node(page)
         };
-        let child_page_num = parent.children[child_idx];
-        let only_grandchild = {
-            let child = self.pager.read_page(child_page_num)?;
-            if get_cell_count(child) != 0 {
+        if parent.children.len() <= 1 {
+            return Ok(());
+        }
+
+        let left_idx = if child_idx > 0 { child_idx - 1 } else { 0 };
+        let right_idx = left_idx + 1;
+        if right_idx >= parent.children.len() {
+            return Ok(());
+        }
+
+        let left_page_num = parent.children[left_idx];
+        let right_page_num = parent.children[right_idx];
+
+        let left_node = {
+            let page = self.pager.read_page(left_page_num)?;
+            if page[0] != PAGE_TYPE_INTERIOR {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "expected underflowed interior child to have zero keys",
+                    "expected left rebalance sibling to be an interior page",
                 ));
             }
-            get_right_child(child)
+            read_interior_node(page)
         };
-        if only_grandchild == 0 {
+        let right_node = {
+            let page = self.pager.read_page(right_page_num)?;
+            if page[0] != PAGE_TYPE_INTERIOR {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected right rebalance sibling to be an interior page",
+                ));
+            }
+            read_interior_node(page)
+        };
+        let separator_key = parent.keys[left_idx];
+
+        let mut merged_keys = left_node.keys;
+        merged_keys.push(separator_key);
+        merged_keys.extend(right_node.keys.iter().copied());
+
+        let mut merged_children = left_node.children;
+        merged_children.extend(right_node.children.iter().copied());
+
+        if merged_keys.len() + 1 != merged_children.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "underflowed interior child had no remaining subtree",
+                "interior merge produced inconsistent key/child counts",
             ));
         }
 
-        parent.children[child_idx] = only_grandchild;
-        let page = self.pager.write_page(parent_page_num)?;
-        write_interior_node(page, page_size, &parent);
-        self.pager.free_page(child_page_num)?;
+        if interior_entries_fit_in_page(merged_keys.len(), page_size) {
+            let merged_node = InteriorNodeData {
+                keys: merged_keys,
+                children: merged_children,
+            };
+            let left_page = self.pager.write_page(left_page_num)?;
+            write_interior_node(left_page, page_size, &merged_node);
+
+            parent.keys.remove(left_idx);
+            parent.children.remove(right_idx);
+            {
+                let parent_page = self.pager.write_page(parent_page_num)?;
+                write_interior_node(parent_page, page_size, &parent);
+            }
+            self.pager.free_page(right_page_num)?;
+            return Ok(());
+        }
+
+        let (left_key_count, promoted_key) =
+            choose_interior_redistribution_split(&merged_keys, page_size)?;
+        let left_keys = merged_keys[..left_key_count].to_vec();
+        let right_keys = merged_keys[left_key_count + 1..].to_vec();
+        let left_children = merged_children[..left_key_count + 1].to_vec();
+        let right_children = merged_children[left_key_count + 1..].to_vec();
+
+        if left_keys.is_empty() || right_keys.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "interior redistribution produced empty sibling",
+            ));
+        }
+
+        let left_node = InteriorNodeData {
+            keys: left_keys,
+            children: left_children,
+        };
+        let right_node = InteriorNodeData {
+            keys: right_keys,
+            children: right_children,
+        };
+
+        {
+            let left_page = self.pager.write_page(left_page_num)?;
+            write_interior_node(left_page, page_size, &left_node);
+        }
+        {
+            let right_page = self.pager.write_page(right_page_num)?;
+            write_interior_node(right_page, page_size, &right_node);
+        }
+        parent.keys[left_idx] = promoted_key;
+        let parent_page = self.pager.write_page(parent_page_num)?;
+        write_interior_node(parent_page, page_size, &parent);
         Ok(())
     }
 
@@ -1095,6 +1178,24 @@ fn leaf_is_underfull(page: &[u8], page_size: usize) -> bool {
         < page_size * LEAF_MIN_UTILIZATION_NUMERATOR
 }
 
+fn interior_logical_used_bytes(page: &[u8]) -> usize {
+    let cell_count = get_cell_count(page);
+    PAGE_HEADER_SIZE + cell_count * (CELL_PTR_SIZE + INTERIOR_CELL_SIZE)
+}
+
+fn interior_is_underfull(page: &[u8], page_size: usize) -> bool {
+    interior_logical_used_bytes(page) * INTERIOR_MIN_UTILIZATION_DENOMINATOR
+        < page_size * INTERIOR_MIN_UTILIZATION_NUMERATOR
+}
+
+fn interior_entries_required_bytes(key_count: usize) -> usize {
+    PAGE_HEADER_SIZE + key_count * (CELL_PTR_SIZE + INTERIOR_CELL_SIZE)
+}
+
+fn interior_entries_fit_in_page(key_count: usize, page_size: usize) -> bool {
+    interior_entries_required_bytes(key_count) <= page_size
+}
+
 fn leaf_entries_required_bytes(entries: &[(i64, Vec<u8>)]) -> usize {
     PAGE_HEADER_SIZE
         + entries.len() * CELL_PTR_SIZE
@@ -1151,6 +1252,42 @@ fn choose_leaf_redistribution_split(
         io::Error::new(
             io::ErrorKind::InvalidData,
             "could not find valid leaf redistribution split",
+        )
+    })
+}
+
+fn choose_interior_redistribution_split(
+    keys: &[i64],
+    page_size: usize,
+) -> io::Result<(usize, i64)> {
+    if keys.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "need at least three keys for interior redistribution",
+        ));
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for promoted_idx in 1..keys.len() - 1 {
+        let left_key_count = promoted_idx;
+        let right_key_count = keys.len() - promoted_idx - 1;
+        if !interior_entries_fit_in_page(left_key_count, page_size)
+            || !interior_entries_fit_in_page(right_key_count, page_size)
+        {
+            continue;
+        }
+
+        let gap = left_key_count.abs_diff(right_key_count);
+        match best {
+            Some((_, best_gap)) if best_gap <= gap => {}
+            _ => best = Some((promoted_idx, gap)),
+        }
+    }
+
+    best.map(|(idx, _)| (idx, keys[idx])).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "could not find valid interior redistribution split",
         )
     })
 }
@@ -1229,6 +1366,39 @@ mod tests {
 
     fn cleanup(path: &std::path::Path) {
         fs::remove_file(path).ok();
+    }
+
+    fn allocate_leaf_with_range(
+        pager: &mut Pager,
+        start_key: i64,
+        count: usize,
+        payload: &[u8],
+    ) -> PageNum {
+        let page_size = pager.page_size();
+        let page_num = pager.allocate_page().unwrap();
+        let entries: Vec<(i64, Vec<u8>)> = (0..count)
+            .map(|idx| (start_key + idx as i64, payload.to_vec()))
+            .collect();
+        {
+            let page = pager.write_page(page_num).unwrap();
+            write_leaf_entries(page, page_size, &entries, 0);
+        }
+        page_num
+    }
+
+    fn allocate_interior_with_children(
+        pager: &mut Pager,
+        keys: Vec<i64>,
+        children: Vec<PageNum>,
+    ) -> PageNum {
+        let page_size = pager.page_size();
+        let page_num = pager.allocate_page().unwrap();
+        let node = InteriorNodeData { keys, children };
+        {
+            let page = pager.write_page(page_num).unwrap();
+            write_interior_node(page, page_size, &node);
+        }
+        page_num
     }
 
     #[test]
@@ -1674,6 +1844,161 @@ mod tests {
             .map(|entry| entry.key)
             .collect();
         assert_eq!(keys, (7..50).map(|k| k as i64).collect::<Vec<_>>());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_rebalances_non_empty_underfull_interior() {
+        let path = temp_db_path("btree_delete_non_empty_interior_rebalance.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+
+        let payload = vec![0xD1; 100];
+        let left_leaf_0 = allocate_leaf_with_range(&mut pager, 0, 24, &payload);
+        let left_leaf_1 = allocate_leaf_with_range(&mut pager, 500, 24, &payload);
+        let left_leaf_2 = allocate_leaf_with_range(&mut pager, 700, 24, &payload);
+        let right_leaf_0 = allocate_leaf_with_range(&mut pager, 1000, 24, &payload);
+        let right_leaf_1 = allocate_leaf_with_range(&mut pager, 1500, 24, &payload);
+        let right_leaf_2 = allocate_leaf_with_range(&mut pager, 1700, 24, &payload);
+
+        let left_interior = allocate_interior_with_children(
+            &mut pager,
+            vec![500, 700],
+            vec![left_leaf_0, left_leaf_1, left_leaf_2],
+        );
+        let right_interior = allocate_interior_with_children(
+            &mut pager,
+            vec![1500, 1700],
+            vec![right_leaf_0, right_leaf_1, right_leaf_2],
+        );
+
+        {
+            let page_size = pager.page_size();
+            let root_page = pager.write_page(root).unwrap();
+            write_interior_node(
+                root_page,
+                page_size,
+                &InteriorNodeData {
+                    keys: vec![1000],
+                    children: vec![left_interior, right_interior],
+                },
+            );
+        }
+
+        let mut tree = BTree::new(&mut pager, root);
+        let root_before = tree.pager.read_page(root).unwrap();
+        assert_eq!(root_before[0], PAGE_TYPE_INTERIOR);
+        assert_eq!(get_cell_count(root_before), 1);
+
+        let page_size = tree.pager.page_size();
+        let (left_cell_count, left_underfull) = {
+            let left_before = tree.pager.read_page(left_interior).unwrap();
+            (
+                get_cell_count(left_before),
+                interior_is_underfull(left_before, page_size),
+            )
+        };
+        assert!(left_cell_count > 0);
+        assert!(left_underfull);
+
+        assert!(tree.delete(10).unwrap());
+        assert_eq!(tree.lookup(10).unwrap(), None);
+        assert_eq!(tree.lookup(11).unwrap(), Some(payload.clone()));
+        assert_eq!(tree.lookup(1005).unwrap(), Some(payload.clone()));
+
+        let root_after = tree.pager.read_page(root).unwrap();
+        assert_eq!(root_after[0], PAGE_TYPE_INTERIOR);
+        assert_eq!(
+            get_cell_count(root_after),
+            5,
+            "expected root to compact merged interior child in-place"
+        );
+
+        for key in [0_i64, 11, 23, 500, 523, 700, 723, 1000, 1023, 1500, 1523] {
+            assert_eq!(
+                tree.lookup(key).unwrap(),
+                Some(payload.clone()),
+                "expected key {} to remain readable",
+                key
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rebalance_interior_child_redistributes_when_merge_does_not_fit() {
+        let path = temp_db_path("btree_interior_redistribute.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+
+        let filler_payload = vec![0xD2; 8];
+        let left_children: Vec<PageNum> = (0..81)
+            .map(|idx| {
+                allocate_leaf_with_range(&mut pager, 10_000 + idx as i64, 1, &filler_payload)
+            })
+            .collect();
+        let right_children: Vec<PageNum> = (0..241)
+            .map(|idx| {
+                allocate_leaf_with_range(&mut pager, 20_000 + idx as i64, 1, &filler_payload)
+            })
+            .collect();
+
+        let left_keys: Vec<i64> = (0..80).map(|idx| idx as i64).collect();
+        let right_keys: Vec<i64> = (1001..1241).collect();
+        let left_interior = allocate_interior_with_children(&mut pager, left_keys, left_children);
+        let right_interior =
+            allocate_interior_with_children(&mut pager, right_keys, right_children);
+
+        {
+            let page_size = pager.page_size();
+            let root_page = pager.write_page(root).unwrap();
+            write_interior_node(
+                root_page,
+                page_size,
+                &InteriorNodeData {
+                    keys: vec![1000],
+                    children: vec![left_interior, right_interior],
+                },
+            );
+        }
+
+        let freelist_before = pager.header().freelist_count;
+        let mut tree = BTree::new(&mut pager, root);
+        tree.rebalance_interior_child(root, 0).unwrap();
+
+        let root_page = tree.pager.read_page(root).unwrap();
+        let root_node = read_interior_node(root_page);
+        assert_eq!(root_node.keys.len(), 1);
+        assert_eq!(root_node.children.len(), 2);
+        assert_eq!(
+            root_node.keys[0], 1080,
+            "expected parent separator to be updated from redistribution split"
+        );
+
+        let page_size = tree.pager.page_size();
+        let left_cell_count = {
+            let left_page = tree.pager.read_page(left_interior).unwrap();
+            assert!(!interior_is_underfull(left_page, page_size));
+            get_cell_count(left_page)
+        };
+        let right_cell_count = {
+            let right_page = tree.pager.read_page(right_interior).unwrap();
+            assert!(!interior_is_underfull(right_page, page_size));
+            get_cell_count(right_page)
+        };
+        assert_eq!(left_cell_count, 160);
+        assert_eq!(right_cell_count, 160);
+        assert_eq!(
+            tree.pager.header().freelist_count,
+            freelist_before,
+            "redistribution should not reclaim either sibling page"
+        );
 
         cleanup(&path);
     }

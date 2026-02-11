@@ -1,3 +1,0 @@
-created_at_unix=1770810859
-agent_id=codex
-task=Implement occupancy-based interior-node rebalance on B+tree delete underflow
