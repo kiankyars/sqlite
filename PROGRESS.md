@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality metadata for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality + prefix fanout metadata for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -56,11 +56,14 @@ Latest completions:
 - Persisted planner statistics metadata in `crates/storage` + `crates/ralph-sqlite` (Agent 4) — schema now persists table/index planner stats entries, planner stats now load from persisted metadata instead of per-query scans, and write paths refresh/drop stats metadata on CREATE/INSERT/UPDATE/DELETE/DROP; see `notes/persisted-planner-statistics.md`
 - Planner stats selectivity/cost refinement in `crates/planner` (Agent codex) — stats-aware `AND` path preference now compares candidate costs before picking `IndexAnd` vs simpler equality paths, and stats-based `IndexOr`/`IndexAnd` row estimation now combines branch selectivities using probability unions/intersections instead of sum/min heuristics; see `notes/planner-stats-selectivity-cost-refinement.md`
 - LIKE operator fix in `crates/executor` + `crates/ralph-sqlite` (Agent opus) — replaced naive `String::contains` LIKE implementation with correct SQL pattern matching: `%` matches zero-or-more chars, `_` matches one char, case-insensitive ASCII matching per SQLite defaults, and NULL operand propagation; see `notes/like-operator-fix.md`
+- Planner histogram/fanout statistics for multi-column prefix/range costing in `crates/storage` + `crates/planner` + `crates/ralph-sqlite` (Agent codex) — persisted index stats now include per-prefix distinct-count vectors, stats-aware `IndexPrefixRange` costing now estimates eq-prefix fanout and range selectivity from prefix-level distributions, and write-path stats refresh now recomputes/persists prefix distinct counts; see `notes/planner-histogram-fanout-stats.md`
 
 Recommended next step:
-- Add histogram/fanout planner statistics (especially for multi-column prefix/range predicates) and feed them into cost estimation.
+- Add index-driven JOIN probe optimization for equality `ON` predicates to reduce nested-loop full scans.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-storage -p ralph-sqlite` (planner histogram/fanout stats): pass, 0 failed (191 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner histogram/fanout stats, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test --workspace` (LIKE operator fix): pass, 0 failed (282 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-executor` (LIKE operator fix): pass, 0 failed (22 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-sqlite` (LIKE operator fix): pass, 0 failed (95 tests).
@@ -218,6 +221,7 @@ Test pass rate:
 41. ~~Persisted planner statistics metadata~~ ✓
 42. ~~Planner stats selectivity/cost refinement~~ ✓
 43. ~~LIKE operator correctness fix~~ ✓
+44. ~~Planner histogram/fanout statistics for multi-column prefix/range cost estimation~~ ✓
 
 ## Completed Tasks
 

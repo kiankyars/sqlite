@@ -61,6 +61,7 @@ pub struct IndexStatsEntry {
     pub table_name: String,
     pub estimated_rows: usize,
     pub estimated_distinct_keys: usize,
+    pub prefix_distinct_counts: Vec<usize>,
 }
 
 const TABLE_STATS_PREFIX: &str = "table:";
@@ -69,6 +70,7 @@ const PLANNER_TABLE_STATS_SQL: &str = "planner_stats_table";
 const PLANNER_INDEX_STATS_SQL: &str = "planner_stats_index";
 const ESTIMATED_ROWS_FIELD: &str = "estimated_rows";
 const ESTIMATED_DISTINCT_KEYS_FIELD: &str = "estimated_distinct_keys";
+const PREFIX_DISTINCT_COUNTS_FIELD: &str = "prefix_distinct_counts";
 
 /// Manages the schema table.
 pub struct Schema;
@@ -234,6 +236,7 @@ impl Schema {
         table_name: &str,
         estimated_rows: usize,
         estimated_distinct_keys: usize,
+        prefix_distinct_counts: &[usize],
     ) -> io::Result<()> {
         let entry_name = index_stats_entry_name(index_name);
         let entry = SchemaEntry {
@@ -253,6 +256,11 @@ impl Schema {
                     name: ESTIMATED_DISTINCT_KEYS_FIELD.to_string(),
                     data_type: estimated_distinct_keys.to_string(),
                     index: 1,
+                },
+                ColumnInfo {
+                    name: PREFIX_DISTINCT_COUNTS_FIELD.to_string(),
+                    data_type: encode_usize_list(prefix_distinct_counts),
+                    index: 2,
                 },
             ],
         };
@@ -290,6 +298,12 @@ impl Schema {
             let estimated_rows = parse_usize_field(&entry.columns, ESTIMATED_ROWS_FIELD)?;
             let estimated_distinct_keys =
                 parse_usize_field(&entry.columns, ESTIMATED_DISTINCT_KEYS_FIELD)?;
+            let mut prefix_distinct_counts =
+                parse_optional_usize_list_field(&entry.columns, PREFIX_DISTINCT_COUNTS_FIELD)?
+                    .unwrap_or_default();
+            if prefix_distinct_counts.is_empty() && estimated_distinct_keys > 0 {
+                prefix_distinct_counts.push(estimated_distinct_keys);
+            }
             let index_name = entry
                 .name
                 .strip_prefix(INDEX_STATS_PREFIX)
@@ -300,6 +314,7 @@ impl Schema {
                 table_name: entry.table_name,
                 estimated_rows,
                 estimated_distinct_keys,
+                prefix_distinct_counts,
             });
         }
 
@@ -579,6 +594,44 @@ fn parse_usize_field(columns: &[ColumnInfo], field_name: &str) -> io::Result<usi
             ),
         )
     })
+}
+
+fn parse_optional_usize_list_field(
+    columns: &[ColumnInfo],
+    field_name: &str,
+) -> io::Result<Option<Vec<usize>>> {
+    let Some(raw) = columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(field_name))
+        .map(|column| column.data_type.as_str())
+    else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut out = Vec::new();
+    for segment in raw.split(',') {
+        let value = segment.trim().parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid planner stats value '{}' for field '{}'",
+                    segment, field_name
+                ),
+            )
+        })?;
+        out.push(value);
+    }
+    Ok(Some(out))
+}
+
+fn encode_usize_list(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn read_u16(data: &[u8], pos: &mut usize) -> io::Result<u16> {
@@ -893,8 +946,8 @@ mod tests {
 
             Schema::upsert_table_stats(&mut pager, "users", 7).unwrap();
             Schema::upsert_table_stats(&mut pager, "users", 9).unwrap();
-            Schema::upsert_index_stats(&mut pager, "idx_users_age", "users", 9, 3).unwrap();
-            Schema::upsert_index_stats(&mut pager, "idx_users_age", "users", 10, 4).unwrap();
+            Schema::upsert_index_stats(&mut pager, "idx_users_age", "users", 9, 3, &[3]).unwrap();
+            Schema::upsert_index_stats(&mut pager, "idx_users_age", "users", 10, 4, &[4]).unwrap();
 
             let table_stats = Schema::list_table_stats(&mut pager).unwrap();
             assert_eq!(table_stats.len(), 1);
@@ -907,6 +960,7 @@ mod tests {
             assert_eq!(index_stats[0].table_name, "users");
             assert_eq!(index_stats[0].estimated_rows, 10);
             assert_eq!(index_stats[0].estimated_distinct_keys, 4);
+            assert_eq!(index_stats[0].prefix_distinct_counts, vec![4]);
 
             pager.flush_all().unwrap();
         }
@@ -921,6 +975,7 @@ mod tests {
             assert_eq!(index_stats.len(), 1);
             assert_eq!(index_stats[0].estimated_rows, 10);
             assert_eq!(index_stats[0].estimated_distinct_keys, 4);
+            assert_eq!(index_stats[0].prefix_distinct_counts, vec![4]);
 
             assert!(Schema::drop_table_stats(&mut pager, "users").unwrap());
             assert!(!Schema::drop_table_stats(&mut pager, "users").unwrap());

@@ -76,10 +76,18 @@ struct GroupState {
     scalar_row_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedIndexStats {
     estimated_rows: usize,
     estimated_distinct_keys: usize,
+    prefix_distinct_counts: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexCardinalityStats {
+    estimated_rows: usize,
+    estimated_distinct_keys: usize,
+    prefix_distinct_counts: Vec<usize>,
 }
 
 pub struct Database {
@@ -1312,6 +1320,7 @@ impl Database {
                 index_name: planner_index.name.clone(),
                 estimated_rows: stats.estimated_rows,
                 estimated_distinct_keys: stats.estimated_distinct_keys,
+                prefix_distinct_counts: stats.prefix_distinct_counts.clone(),
             });
         }
 
@@ -1334,36 +1343,31 @@ impl Database {
         self.table_stats
             .insert(table_key.to_string(), estimated_table_rows);
 
-        let index_entries: Vec<(String, String, PageNum)> = self
+        let index_entries: Vec<(String, IndexMeta)> = self
             .indexes
             .iter()
             .filter(|(_, index_meta)| index_meta.table_key == table_key)
-            .map(|(index_key, index_meta)| {
-                (
-                    index_key.clone(),
-                    index_meta.table_name.clone(),
-                    index_meta.root_page,
-                )
-            })
+            .map(|(index_key, index_meta)| (index_key.clone(), index_meta.clone()))
             .collect();
 
-        for (index_key, index_table_name, index_root_page) in index_entries {
-            let (estimated_rows, estimated_distinct_keys) =
-                self.estimate_index_cardinality(index_root_page)?;
+        for (index_key, index_meta) in index_entries {
+            let stats = self.estimate_index_cardinality(&index_meta)?;
             Schema::upsert_index_stats(
                 &mut self.pager,
                 &index_key,
-                &index_table_name,
-                estimated_rows,
-                estimated_distinct_keys,
+                &index_meta.table_name,
+                stats.estimated_rows,
+                stats.estimated_distinct_keys,
+                &stats.prefix_distinct_counts,
             )
             .map_err(|e| format!("persist index planner stats '{}': {e}", index_key))?;
 
             self.index_stats.insert(
                 index_key,
                 PersistedIndexStats {
-                    estimated_rows,
-                    estimated_distinct_keys,
+                    estimated_rows: stats.estimated_rows,
+                    estimated_distinct_keys: stats.estimated_distinct_keys,
+                    prefix_distinct_counts: stats.prefix_distinct_counts,
                 },
             );
         }
@@ -1378,23 +1382,39 @@ impl Database {
             .map_err(|e| format!("scan tree rows: {e}"))
     }
 
-    fn estimate_index_cardinality(&mut self, root_page: PageNum) -> Result<(usize, usize), String> {
-        let mut tree = BTree::new(&mut self.pager, root_page);
+    fn estimate_index_cardinality(
+        &mut self,
+        index_meta: &IndexMeta,
+    ) -> Result<IndexCardinalityStats, String> {
+        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let entries = tree
             .scan_all()
             .map_err(|e| format!("scan index rows: {e}"))?;
 
+        let prefix_levels = index_meta.columns.len().max(1);
+        let mut prefix_sets: Vec<HashSet<Vec<u8>>> =
+            (0..prefix_levels).map(|_| HashSet::new()).collect();
         let mut estimated_rows = 0usize;
-        let mut estimated_distinct_keys = 0usize;
         for entry in entries {
             let buckets = decode_index_payload(&entry.payload).map_err(|e| e.to_string())?;
-            estimated_distinct_keys = estimated_distinct_keys.saturating_add(buckets.len());
             for bucket in buckets {
+                let bucket_values = decode_index_bucket_values(index_meta, &bucket.value)?;
+                for prefix_len in 1..=prefix_levels {
+                    let encoded_prefix = encode_index_value_tuple(&bucket_values[..prefix_len])?;
+                    prefix_sets[prefix_len - 1].insert(encoded_prefix);
+                }
                 estimated_rows = estimated_rows.saturating_add(bucket.rowids.len());
             }
         }
 
-        Ok((estimated_rows, estimated_distinct_keys))
+        let prefix_distinct_counts: Vec<usize> =
+            prefix_sets.into_iter().map(|set| set.len()).collect();
+        let estimated_distinct_keys = prefix_distinct_counts.last().copied().unwrap_or(0);
+        Ok(IndexCardinalityStats {
+            estimated_rows,
+            estimated_distinct_keys,
+            prefix_distinct_counts,
+        })
     }
 
     fn read_rows_for_select(
@@ -1564,8 +1584,7 @@ impl Database {
 
             // Nested-loop join with optional ON filter and outer-join null-extension.
             let mut new_rows = Vec::new();
-            let mut right_matched = if matches!(join.join_type, JoinType::Right | JoinType::Full)
-            {
+            let mut right_matched = if matches!(join.join_type, JoinType::Right | JoinType::Full) {
                 Some(vec![false; right_rows.len()])
             } else {
                 None
@@ -2087,6 +2106,7 @@ fn load_catalogs(
                 PersistedIndexStats {
                     estimated_rows: stats.estimated_rows,
                     estimated_distinct_keys: stats.estimated_distinct_keys,
+                    prefix_distinct_counts: stats.prefix_distinct_counts,
                 },
             );
         }
@@ -5038,10 +5058,11 @@ mod tests {
 
             assert_eq!(db.table_stats.get("users").copied(), Some(3));
             assert_eq!(
-                db.index_stats.get("idx_users_age").copied(),
+                db.index_stats.get("idx_users_age").cloned(),
                 Some(PersistedIndexStats {
                     estimated_rows: 3,
                     estimated_distinct_keys: 2,
+                    prefix_distinct_counts: vec![2],
                 })
             );
         }
@@ -5049,10 +5070,11 @@ mod tests {
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.table_stats.get("users").copied(), Some(3));
         assert_eq!(
-            reopened.index_stats.get("idx_users_age").copied(),
+            reopened.index_stats.get("idx_users_age").cloned(),
             Some(PersistedIndexStats {
                 estimated_rows: 3,
                 estimated_distinct_keys: 2,
+                prefix_distinct_counts: vec![2],
             })
         );
 
@@ -5076,10 +5098,11 @@ mod tests {
 
         assert_eq!(db.table_stats.get("users").copied(), Some(2));
         assert_eq!(
-            db.index_stats.get("idx_users_age").copied(),
+            db.index_stats.get("idx_users_age").cloned(),
             Some(PersistedIndexStats {
                 estimated_rows: 2,
                 estimated_distinct_keys: 1,
+                prefix_distinct_counts: vec![1],
             })
         );
 
@@ -5088,6 +5111,7 @@ mod tests {
         assert_eq!(index_stats[0].index_name, "idx_users_age");
         assert_eq!(index_stats[0].estimated_rows, 2);
         assert_eq!(index_stats[0].estimated_distinct_keys, 1);
+        assert_eq!(index_stats[0].prefix_distinct_counts, vec![1]);
 
         cleanup(&path);
     }
@@ -6597,10 +6621,8 @@ mod tests {
             .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
             .unwrap();
-        db.execute(
-            "INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (4, 'orphan-order');",
-        )
-        .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (4, 'orphan-order');")
+            .unwrap();
 
         let result = db
             .execute(
@@ -7034,10 +7056,7 @@ mod tests {
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(
-                    q.rows,
-                    vec![vec![Value::Text("banana".to_string())]]
-                );
+                assert_eq!(q.rows, vec![vec![Value::Text("banana".to_string())]]);
             }
             _ => panic!("expected SELECT result"),
         }
@@ -7048,10 +7067,7 @@ mod tests {
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(
-                    q.rows,
-                    vec![vec![Value::Text("apricot".to_string())]]
-                );
+                assert_eq!(q.rows, vec![vec![Value::Text("apricot".to_string())]]);
             }
             _ => panic!("expected SELECT result"),
         }
@@ -7062,10 +7078,7 @@ mod tests {
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(
-                    q.rows,
-                    vec![vec![Value::Text("apple".to_string())]]
-                );
+                assert_eq!(q.rows, vec![vec![Value::Text("apple".to_string())]]);
             }
             _ => panic!("expected SELECT result"),
         }
@@ -7076,10 +7089,7 @@ mod tests {
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(
-                    q.rows,
-                    vec![vec![Value::Text("apple".to_string())]]
-                );
+                assert_eq!(q.rows, vec![vec![Value::Text("apple".to_string())]]);
             }
             _ => panic!("expected SELECT result"),
         }
@@ -7102,10 +7112,7 @@ mod tests {
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(
-                    q.rows,
-                    vec![vec![Value::Text("def".to_string())]]
-                );
+                assert_eq!(q.rows, vec![vec![Value::Text("def".to_string())]]);
             }
             _ => panic!("expected SELECT result"),
         }

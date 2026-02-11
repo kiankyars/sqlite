@@ -49,6 +49,7 @@ pub struct IndexStats {
     pub index_name: String,
     pub estimated_rows: usize,
     pub estimated_distinct_keys: usize,
+    pub prefix_distinct_counts: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,6 +252,7 @@ fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> C
         }
         AccessPath::IndexPrefixRange {
             index_name,
+            eq_prefix_value_exprs,
             lower,
             upper,
             ..
@@ -260,8 +262,15 @@ fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> C
                 (true, false) | (false, true) => 0.20,
                 (false, false) => 0.35,
             };
-            let output_rows =
-                estimate_index_range_rows(stats, index_name, table_rows, fallback_selectivity);
+            let output_rows = estimate_index_prefix_range_rows(
+                stats,
+                index_name,
+                table_rows,
+                eq_prefix_value_exprs.len(),
+                lower.is_some(),
+                upper.is_some(),
+                fallback_selectivity,
+            );
             CostEstimate {
                 cost: 9.0 + output_rows * 0.75,
                 output_rows,
@@ -352,6 +361,84 @@ fn estimate_index_range_rows(
         .min(index_stats.estimated_rows as f64)
         .max(1.0)
         .min(table_rows)
+}
+
+fn estimate_index_prefix_range_rows(
+    stats: &PlannerStats,
+    index_name: &str,
+    table_rows: f64,
+    eq_prefix_len: usize,
+    has_lower: bool,
+    has_upper: bool,
+    fallback_selectivity: f64,
+) -> f64 {
+    let fallback = (table_rows * fallback_selectivity).max(1.0);
+    let Some(index_stats) = find_index_stats(stats, index_name) else {
+        return fallback.min(table_rows);
+    };
+    if index_stats.estimated_rows == 0 {
+        return 1.0;
+    }
+
+    let estimated_rows = index_stats.estimated_rows as f64;
+    let base_rows = if eq_prefix_len == 0 {
+        fallback.min(estimated_rows).max(1.0)
+    } else {
+        let distinct_prefixes = index_stats
+            .prefix_distinct_counts
+            .get(eq_prefix_len.saturating_sub(1))
+            .copied()
+            .filter(|count| *count > 0)
+            .unwrap_or(index_stats.estimated_distinct_keys.max(1));
+        (estimated_rows / distinct_prefixes as f64).max(1.0)
+    };
+
+    let mut output_rows = if has_lower || has_upper {
+        let range_selectivity =
+            estimate_prefix_range_selectivity(index_stats, eq_prefix_len, has_lower, has_upper);
+        (base_rows * range_selectivity).max(1.0)
+    } else {
+        base_rows
+    };
+
+    output_rows = output_rows.min(estimated_rows).min(table_rows);
+    output_rows.max(1.0)
+}
+
+fn estimate_prefix_range_selectivity(
+    index_stats: &IndexStats,
+    eq_prefix_len: usize,
+    has_lower: bool,
+    has_upper: bool,
+) -> f64 {
+    let default = if has_lower && has_upper { 0.25 } else { 0.5 };
+    if eq_prefix_len == 0 {
+        return default;
+    }
+
+    let Some(current_distinct) = index_stats
+        .prefix_distinct_counts
+        .get(eq_prefix_len.saturating_sub(1))
+        .copied()
+        .filter(|count| *count > 0)
+    else {
+        return default;
+    };
+    let Some(next_distinct) = index_stats
+        .prefix_distinct_counts
+        .get(eq_prefix_len)
+        .copied()
+        .filter(|count| *count > 0)
+    else {
+        return default;
+    };
+
+    let avg_next_distinct = (next_distinct as f64 / current_distinct as f64).max(1.0);
+    if has_lower && has_upper {
+        (2.0 / avg_next_distinct).clamp(0.05, 0.45)
+    } else {
+        (4.0 / avg_next_distinct).clamp(0.08, 0.70)
+    }
 }
 
 fn find_index_stats<'a>(stats: &'a PlannerStats, index_name: &str) -> Option<&'a IndexStats> {
@@ -1701,6 +1788,7 @@ mod tests {
                 index_name: "idx_t_score".to_string(),
                 estimated_rows: 10_000,
                 estimated_distinct_keys: 10_000,
+                prefix_distinct_counts: vec![10_000],
             }],
         };
         let path =
@@ -1720,6 +1808,7 @@ mod tests {
                 index_name: "idx_t_score".to_string(),
                 estimated_rows: 1_000,
                 estimated_distinct_keys: 1,
+                prefix_distinct_counts: vec![1],
             }],
         };
         let path =
@@ -1737,11 +1826,13 @@ mod tests {
                     index_name: "idx_t_age".to_string(),
                     estimated_rows: 1_000,
                     estimated_distinct_keys: 1_000,
+                    prefix_distinct_counts: vec![1_000],
                 },
                 IndexStats {
                     index_name: "idx_t_score".to_string(),
                     estimated_rows: 1_000,
                     estimated_distinct_keys: 1,
+                    prefix_distinct_counts: vec![1],
                 },
             ],
         };
@@ -1767,5 +1858,56 @@ mod tests {
     fn combine_and_selectivity_multiplies_probabilities() {
         let selectivity = combine_and_selectivity(&[0.5, 0.5, 0.5]);
         assert!((selectivity - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plan_where_with_stats_uses_prefix_fanout_for_composite_prefix_probe() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 9;");
+        let stats = PlannerStats {
+            estimated_table_rows: Some(1_000),
+            index_stats: vec![IndexStats {
+                index_name: "idx_t_score_age".to_string(),
+                estimated_rows: 1_000,
+                estimated_distinct_keys: 900,
+                prefix_distinct_counts: vec![500, 900],
+            }],
+        };
+        let path = plan_where_with_stats(
+            where_expr.as_ref(),
+            "t",
+            &composite_only_indexes(),
+            Some(&stats),
+        );
+        assert_eq!(
+            path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(9)],
+                lower: None,
+                upper: None,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_with_stats_avoids_unselective_composite_prefix_probe() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 9;");
+        let stats = PlannerStats {
+            estimated_table_rows: Some(20),
+            index_stats: vec![IndexStats {
+                index_name: "idx_t_score_age".to_string(),
+                estimated_rows: 20,
+                estimated_distinct_keys: 10,
+                prefix_distinct_counts: vec![1, 10],
+            }],
+        };
+        let path = plan_where_with_stats(
+            where_expr.as_ref(),
+            "t",
+            &composite_only_indexes(),
+            Some(&stats),
+        );
+        assert_eq!(path, AccessPath::TableScan);
     }
 }
