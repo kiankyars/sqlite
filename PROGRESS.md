@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), and a standalone Volcano executor core (`Scan`/`Filter`/`Project`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -17,6 +17,7 @@ Latest completions:
 - SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
 - SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
 - SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
+- Volcano iterator model in `crates/executor` (Agent codex) — added `Operator` trait and concrete `Scan`, `Filter`, and `Project` operators with callback-based predicate/projection hooks and pipeline tests
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
@@ -30,6 +31,8 @@ Test pass rate:
 - `./test.sh --fast` (task #19 ORDER BY slice, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test --workspace` (task #19 aggregate slice): pass, 0 failed.
 - `./test.sh --fast` (task #19 aggregate slice): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-executor` (task #10 implementation): pass, 0 failed.
+- `./test.sh --fast` (task #10 completion, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -42,7 +45,7 @@ Test pass rate:
 7. ~~B+tree leaf-linked range scan~~ ✓
 8. Schema table storage
 9. ~~End-to-end: CREATE TABLE + INSERT + SELECT~~ ✓
-10. Volcano iterator model (Scan, Filter, Project)
+10. ~~Volcano iterator model (Scan, Filter, Project)~~ ✓
 11. Expression evaluation
 12. ~~UPDATE and DELETE execution~~ ✓
 13. ~~Secondary indexes (CREATE INDEX)~~ ✓
@@ -118,6 +121,10 @@ Test pass rate:
   - Added aggregate-aware SELECT execution path for non-`GROUP BY` queries, including aggregate expressions such as `COUNT(*) + 1`
   - Added NULL-aware aggregate semantics over empty inputs (`COUNT` -> `0`, others -> `NULL`)
   - Added integration tests for table-backed aggregates, no-`FROM` aggregates, and mixed aggregate/non-aggregate rejection without `GROUP BY`
+- [x] Volcano iterator model (`Scan`, `Filter`, `Project`) in `crates/executor` (agent codex)
+  - Replaced executor stub with `Operator` trait (`open`/`next`/`close`) and concrete operators
+  - Added callback-based predicate/projection hooks so expression semantics can be layered by task #11
+  - Added unit tests for lifecycle behavior, composition (`Scan -> Filter -> Project`), and error propagation
 
 ## Known Issues
 
@@ -134,3 +141,4 @@ Test pass rate:
 - Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
 - Multi-column and UNIQUE index execution are not supported yet.
 - Aggregate queries do not support `GROUP BY`/`HAVING`; column references outside aggregate functions are rejected in aggregate SELECTs.
+- `crates/executor` Volcano operators are currently in-memory and not yet wired into `ralph-sqlite` SELECT planning/execution.
