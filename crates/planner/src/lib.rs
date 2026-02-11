@@ -44,6 +44,9 @@ pub enum AccessPath {
     IndexOr {
         branches: Vec<AccessPath>,
     },
+    IndexAnd {
+        branches: Vec<AccessPath>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,26 +70,48 @@ pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -
 }
 
 fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
-    if let Some(eq_path) = choose_index_eq_access(expr, table_name, indexes) {
-        return Some(eq_path);
-    }
-    if let Some(in_path) = choose_index_in_access(expr, table_name, indexes) {
-        return Some(in_path);
-    }
-
     match expr {
         Expr::Paren(inner) => choose_index_access(inner, table_name, indexes),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => choose_index_access(left, table_name, indexes)
-            .or_else(|| choose_index_access(right, table_name, indexes)),
+        } => {
+            let eq_path = choose_index_eq_access(expr, table_name, indexes);
+            let and_path = choose_index_and_access(expr, table_name, indexes);
+            choose_preferred_and_path(eq_path, and_path).or_else(|| {
+                choose_index_access(left, table_name, indexes)
+                    .or_else(|| choose_index_access(right, table_name, indexes))
+            })
+        }
         Expr::BinaryOp {
             op: BinaryOperator::Or,
             ..
         } => choose_index_or_access(expr, table_name, indexes),
-        _ => choose_index_range_access(expr, table_name, indexes),
+        _ => choose_index_eq_access(expr, table_name, indexes)
+            .or_else(|| choose_index_in_access(expr, table_name, indexes))
+            .or_else(|| choose_index_range_access(expr, table_name, indexes)),
+    }
+}
+
+fn choose_preferred_and_path(
+    eq_path: Option<AccessPath>,
+    and_path: Option<AccessPath>,
+) -> Option<AccessPath> {
+    match (eq_path, and_path) {
+        (Some(eq_path), Some(and_path)) => {
+            let prefers_eq = matches!(
+                &eq_path,
+                AccessPath::IndexEq { columns, .. } if columns.len() > 1
+            );
+            if prefers_eq {
+                Some(eq_path)
+            } else {
+                Some(and_path)
+            }
+        }
+        (_, Some(and_path)) => Some(and_path),
+        (eq_path, None) => eq_path,
     }
 }
 
@@ -240,6 +265,59 @@ fn choose_index_or_access(
     }
 
     Some(AccessPath::IndexOr { branches })
+}
+
+fn choose_index_and_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    let mut terms = Vec::new();
+    collect_and_terms(expr, &mut terms);
+    if terms.len() < 2 {
+        return None;
+    }
+
+    let mut branches = Vec::with_capacity(terms.len());
+    for term in terms {
+        let branch = choose_index_access(term, table_name, indexes);
+        match branch {
+            Some(AccessPath::IndexAnd { branches: nested }) => {
+                for nested_branch in nested {
+                    push_unique_branch(&mut branches, nested_branch);
+                }
+            }
+            Some(other) => push_unique_branch(&mut branches, other),
+            None => {}
+        }
+    }
+
+    if branches.len() < 2 {
+        return None;
+    }
+
+    Some(AccessPath::IndexAnd { branches })
+}
+
+fn push_unique_branch(out: &mut Vec<AccessPath>, branch: AccessPath) {
+    if !out.contains(&branch) {
+        out.push(branch);
+    }
+}
+
+fn collect_and_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Paren(inner) => collect_and_terms(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_and_terms(left, out);
+            collect_and_terms(right, out);
+        }
+        _ => out.push(expr),
+    }
 }
 
 fn collect_or_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -506,6 +584,21 @@ mod tests {
         ]
     }
 
+    fn single_column_indexes() -> Vec<IndexInfo> {
+        vec![
+            IndexInfo {
+                name: "idx_t_score".to_string(),
+                table: "t".to_string(),
+                columns: vec!["score".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_age".to_string(),
+                table: "t".to_string(),
+                columns: vec!["age".to_string()],
+            },
+        ]
+    }
+
     #[test]
     fn chooses_table_scan_without_where() {
         let stmt = SelectStmt {
@@ -560,10 +653,23 @@ mod tests {
         let plan = plan_select(&stmt, "t", &default_indexes());
         assert_eq!(
             plan.access_path,
-            AccessPath::IndexEq {
-                index_name: "idx_t_age".to_string(),
-                columns: vec!["age".to_string()],
-                value_exprs: vec![Expr::IntegerLiteral(9)],
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                    AccessPath::IndexRange {
+                        index_name: "idx_t_score".to_string(),
+                        column: "score".to_string(),
+                        lower: Some(RangeBound {
+                            value_expr: Expr::IntegerLiteral(1),
+                            inclusive: false,
+                        }),
+                        upper: None,
+                    },
+                ],
             }
         );
     }
@@ -578,6 +684,29 @@ mod tests {
                 index_name: "idx_t_score_age".to_string(),
                 columns: vec!["score".to_string(), "age".to_string()],
                 value_exprs: vec![Expr::IntegerLiteral(9), Expr::IntegerLiteral(42)],
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_index_and_for_multi_column_equality_without_composite_index() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 9 AND age = 42;");
+        let plan = plan_select(&stmt, "t", &single_column_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
+                    },
+                ],
             }
         );
     }
@@ -865,6 +994,33 @@ mod tests {
                         index_name: "idx_t_score".to_string(),
                         columns: vec!["score".to_string()],
                         value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_chooses_index_and_for_mixed_and_predicate() {
+        let where_expr = parse_where("SELECT * FROM t WHERE age = 9 AND score > 1;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                    AccessPath::IndexRange {
+                        index_name: "idx_t_score".to_string(),
+                        column: "score".to_string(),
+                        lower: Some(RangeBound {
+                            value_expr: Expr::IntegerLiteral(1),
+                            inclusive: false,
+                        }),
+                        upper: None,
                     },
                 ],
             }

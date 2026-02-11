@@ -966,6 +966,33 @@ impl Database {
                 entries.sort_by_key(|entry| entry.key);
                 Ok(entries)
             }
+            AccessPath::IndexAnd { branches } => {
+                let mut rowid_intersection: Option<HashSet<i64>> = None;
+                for branch in branches {
+                    let branch_entries = self.read_candidate_entries(meta, branch)?;
+                    let branch_rowids: HashSet<i64> =
+                        branch_entries.into_iter().map(|entry| entry.key).collect();
+                    rowid_intersection = Some(match rowid_intersection {
+                        Some(current) => current
+                            .intersection(&branch_rowids)
+                            .copied()
+                            .collect::<HashSet<i64>>(),
+                        None => branch_rowids,
+                    });
+                    if rowid_intersection
+                        .as_ref()
+                        .map(|rowids| rowids.is_empty())
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+                let rowids = rowid_intersection
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<i64>>();
+                self.lookup_table_entries_by_rowids(meta.root_page, rowids)
+            }
         }
     }
 
@@ -1116,6 +1143,7 @@ impl Database {
         let needs_materialized_candidate_read =
             matches!(access_path, AccessPath::IndexRange { .. })
                 || matches!(access_path, AccessPath::IndexOr { .. })
+                || matches!(access_path, AccessPath::IndexAnd { .. })
                 || matches!(
                     access_path,
                     AccessPath::IndexEq { columns, .. } if columns.len() != 1
@@ -1154,6 +1182,7 @@ impl Database {
             }
             AccessPath::IndexRange { .. } => unreachable!("handled above"),
             AccessPath::IndexOr { .. } => unreachable!("handled above"),
+            AccessPath::IndexAnd { .. } => unreachable!("handled above"),
         };
 
         let root_op: Box<dyn Operator + '_> = if let Some(expr) = where_clause {
@@ -5265,6 +5294,195 @@ mod tests {
         match selected {
             ExecuteResult::Select(q) => {
                 assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_supports_index_and_predicates() {
+        let path = temp_db_path("select_index_and");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 40), (3, 20, 40), (4, 10, 40);")
+            .unwrap();
+
+        let stmt = match ralph_parser::parse(
+            "SELECT id FROM users WHERE score = 10 AND age = 40 ORDER BY id;",
+        )
+        .unwrap()
+        {
+            Stmt::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
+        assert_eq!(
+            access_path,
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(10)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(40)],
+                    },
+                ],
+            }
+        );
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE score = 10 AND age = 40 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_index_for_and_predicate() {
+        let path = temp_db_path("update_index_and");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 20, 'a'), (2, 10, 40, 'b'), (3, 20, 40, 'c'), (4, 10, 40, 'd');",
+        )
+        .unwrap();
+
+        let where_expr = match ralph_parser::parse(
+            "UPDATE users SET label = 'hit' WHERE score = 10 AND age = 40;",
+        )
+        .unwrap()
+        {
+            Stmt::Update(stmt) => stmt.where_clause,
+            other => panic!("expected UPDATE statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_where(where_expr.as_ref(), "users", &planner_indexes);
+        assert_eq!(
+            access_path,
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(10)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(40)],
+                    },
+                ],
+            }
+        );
+
+        let updated = db
+            .execute("UPDATE users SET label = 'hit' WHERE score = 10 AND age = 40;")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a".to_string())],
+                        vec![Value::Integer(2), Value::Text("hit".to_string())],
+                        vec![Value::Integer(3), Value::Text("c".to_string())],
+                        vec![Value::Integer(4), Value::Text("hit".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_index_for_and_predicate() {
+        let path = temp_db_path("delete_index_and");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 40), (3, 20, 40), (4, 10, 40);")
+            .unwrap();
+
+        let where_expr = match ralph_parser::parse(
+            "DELETE FROM users WHERE score = 10 AND age = 40;",
+        )
+        .unwrap()
+        {
+            Stmt::Delete(stmt) => stmt.where_clause,
+            other => panic!("expected DELETE statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_where(where_expr.as_ref(), "users", &planner_indexes);
+        assert_eq!(
+            access_path,
+            AccessPath::IndexAnd {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(10)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_age".to_string(),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(40)],
+                    },
+                ],
+            }
+        );
+
+        let deleted = db
+            .execute("DELETE FROM users WHERE score = 10 AND age = 40;")
+            .unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 2 });
+
+        let selected = db.execute("SELECT id FROM users ORDER BY id;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+                );
             }
             _ => panic!("expected SELECT result"),
         }
