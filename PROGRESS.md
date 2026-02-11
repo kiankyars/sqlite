@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, WAL replay/checkpoint, and aggregate execution remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -15,6 +15,7 @@ Latest completions:
 - Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
 - WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
 - SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
+- SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
@@ -24,6 +25,8 @@ Test pass rate:
 - `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh --fast` (task #17 verification, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
+- `cargo test --workspace` (task #19 ORDER BY slice): pass, 0 failed.
+- `./test.sh --fast` (task #19 ORDER BY slice, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -45,7 +48,7 @@ Test pass rate:
 16. Checkpoint and crash recovery
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
 18. B+tree split/merge
-19. ORDER BY, LIMIT, aggregates
+19. ORDER BY, LIMIT, aggregates (partial: ORDER BY + LIMIT/OFFSET done; aggregates pending)
 
 ## Completed Tasks
 
@@ -123,3 +126,4 @@ Test pass rate:
 - Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
 - Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
 - Multi-column and UNIQUE index execution are not supported yet.
+- SELECT aggregate function execution (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) is not implemented yet.

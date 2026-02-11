@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
-    SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
+    OrderByItem, SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
 };
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
@@ -212,12 +212,8 @@ impl Database {
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
 
         let column = stmt.columns[0].clone();
-        let column_idx = find_column_index(&table_meta, &column).ok_or_else(|| {
-            format!(
-                "unknown column '{}' in table '{}'",
-                column, table_meta.name
-            )
-        })?;
+        let column_idx = find_column_index(&table_meta, &column)
+            .ok_or_else(|| format!("unknown column '{}' in table '{}'", column, table_meta.name))?;
 
         let root_page = BTree::create(&mut self.pager).map_err(|e| format!("create index: {e}"))?;
         let mut table_tree = BTree::new(&mut self.pager, table_meta.root_page);
@@ -278,7 +274,9 @@ impl Database {
 
         let rows_affected = evaluated_rows.len();
         let mut table_tree = BTree::new(&mut self.pager, meta.root_page);
-        let existing = table_tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let existing = table_tree
+            .scan_all()
+            .map_err(|e| format!("scan table: {e}"))?;
         let mut next_rowid = existing.last().map(|e| e.key + 1).unwrap_or(1);
         let mut inserted_rows = Vec::with_capacity(evaluated_rows.len());
 
@@ -312,7 +310,12 @@ impl Database {
             .collect()
     }
 
-    fn index_insert_row(&mut self, index_meta: &IndexMeta, rowid: i64, row: &[Value]) -> Result<(), String> {
+    fn index_insert_row(
+        &mut self,
+        index_meta: &IndexMeta,
+        rowid: i64,
+        row: &[Value],
+    ) -> Result<(), String> {
         let value = row.get(index_meta.column_idx).ok_or_else(|| {
             format!(
                 "row missing indexed column '{}' for index on '{}'",
@@ -322,7 +325,10 @@ impl Database {
 
         let key = index_key_for_value(value)?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
-        let mut buckets = match tree.lookup(key).map_err(|e| format!("lookup index entry: {e}"))? {
+        let mut buckets = match tree
+            .lookup(key)
+            .map_err(|e| format!("lookup index entry: {e}"))?
+        {
             Some(payload) => decode_index_payload(&payload)?,
             None => Vec::new(),
         };
@@ -418,30 +424,32 @@ impl Database {
     }
 
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
-        if !stmt.order_by.is_empty() {
-            return Err("ORDER BY is not supported yet".to_string());
-        }
-
-        let mut rows = if let Some(from) = &stmt.from {
+        let table_meta = if let Some(from) = &stmt.from {
             let table_key = normalize_identifier(&from.table);
-            let meta = self
-                .tables
-                .get(&table_key)
-                .cloned()
-                .ok_or_else(|| format!("no such table '{}'", from.table))?;
+            Some(
+                self.tables
+                    .get(&table_key)
+                    .cloned()
+                    .ok_or_else(|| format!("no such table '{}'", from.table))?,
+            )
+        } else {
+            None
+        };
+
+        let mut rows_with_order_keys = if let Some(meta) = table_meta.as_ref() {
             let mut tree = BTree::new(&mut self.pager, meta.root_page);
             let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
-
-            let mut projected_rows = Vec::new();
+            let mut rows = Vec::new();
             for entry in entries {
-                let decoded = decode_table_row(&meta, &entry.payload)?;
-                if !where_clause_matches(&meta, &decoded, stmt.where_clause.as_ref())? {
+                let decoded = decode_table_row(meta, &entry.payload)?;
+                if !where_clause_matches(meta, &decoded, stmt.where_clause.as_ref())? {
                     continue;
                 }
-
-                projected_rows.push(project_row(&stmt.columns, &meta, &decoded)?);
+                let projected = project_row(&stmt.columns, meta, &decoded)?;
+                let order_keys = evaluate_order_by_keys(&stmt.order_by, Some((meta, &decoded)))?;
+                rows.push((projected, order_keys));
             }
-            projected_rows
+            rows
         } else {
             if stmt
                 .columns
@@ -456,12 +464,29 @@ impl Database {
                 if !is_truthy(&predicate) {
                     Vec::new()
                 } else {
-                    vec![project_row_no_from(&stmt.columns)?]
+                    vec![(
+                        project_row_no_from(&stmt.columns)?,
+                        evaluate_order_by_keys(&stmt.order_by, None)?,
+                    )]
                 }
             } else {
-                vec![project_row_no_from(&stmt.columns)?]
+                vec![(
+                    project_row_no_from(&stmt.columns)?,
+                    evaluate_order_by_keys(&stmt.order_by, None)?,
+                )]
             }
         };
+
+        if !stmt.order_by.is_empty() {
+            rows_with_order_keys.sort_by(|(_, left_keys), (_, right_keys)| {
+                compare_order_keys(left_keys, right_keys, &stmt.order_by)
+            });
+        }
+
+        let mut rows: Vec<Vec<Value>> = rows_with_order_keys
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
 
         let offset = eval_optional_usize_expr(stmt.offset.as_ref())?;
         if offset > 0 {
@@ -476,16 +501,7 @@ impl Database {
             rows.truncate(limit);
         }
 
-        let columns = if let Some(from) = &stmt.from {
-            let table_key = normalize_identifier(&from.table);
-            let meta = self
-                .tables
-                .get(&table_key)
-                .ok_or_else(|| format!("no such table '{}'", from.table))?;
-            select_output_columns(&stmt.columns, Some(meta))
-        } else {
-            select_output_columns(&stmt.columns, None)
-        }?;
+        let columns = select_output_columns(&stmt.columns, table_meta.as_ref())?;
 
         Ok(ExecuteResult::Select(QueryResult { columns, rows }))
     }
@@ -586,6 +602,62 @@ fn project_row_no_from(columns: &[SelectColumn]) -> Result<Vec<Value>, String> {
         }
     }
     Ok(projected)
+}
+
+fn evaluate_order_by_keys(
+    order_by: &[OrderByItem],
+    row_ctx: Option<(&TableMeta, &[Value])>,
+) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        out.push(eval_expr(&item.expr, row_ctx)?);
+    }
+    Ok(out)
+}
+
+fn compare_order_keys(
+    left_keys: &[Value],
+    right_keys: &[Value],
+    order_by: &[OrderByItem],
+) -> std::cmp::Ordering {
+    debug_assert_eq!(left_keys.len(), order_by.len());
+    debug_assert_eq!(right_keys.len(), order_by.len());
+
+    for ((left, right), item) in left_keys.iter().zip(right_keys.iter()).zip(order_by.iter()) {
+        let mut ord = compare_sort_values(left, right);
+        if item.descending {
+            ord = ord.reverse();
+        }
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn compare_sort_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        _ if is_numeric(left) && is_numeric(right) => value_to_f64(left)
+            .and_then(|lv| {
+                value_to_f64(right)
+                    .map(|rv| lv.partial_cmp(&rv).unwrap_or(std::cmp::Ordering::Equal))
+            })
+            .unwrap_or(std::cmp::Ordering::Equal),
+        _ => sort_type_rank(left).cmp(&sort_type_rank(right)),
+    }
+}
+
+fn sort_type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Integer(_) | Value::Real(_) => 1,
+        Value::Text(_) => 2,
+    }
+}
+
+fn is_numeric(v: &Value) -> bool {
+    matches!(v, Value::Integer(_) | Value::Real(_))
 }
 
 fn select_output_columns(
@@ -1164,6 +1236,110 @@ mod tests {
     }
 
     #[test]
+    fn select_order_by_non_projected_column_desc() {
+        let path = temp_db_path("order_by_non_projected");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'bob'), (1, 'alice'), (3, 'cara');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT name FROM users ORDER BY id DESC;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("cara".to_string())],
+                        vec![Value::Text("bob".to_string())],
+                        vec![Value::Text("alice".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_order_by_expression_with_limit_and_offset() {
+        let path = temp_db_path("order_by_expr_limit_offset");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (3), (2), (5);")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT v FROM t ORDER BY v * 2 DESC LIMIT 2 OFFSET 1;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(3)], vec![Value::Integer(2)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_order_by_nulls_and_secondary_key() {
+        let path = temp_db_path("order_by_nulls");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL), (2, 10), (3, NULL), (4, 5);")
+            .unwrap();
+
+        let asc = db
+            .execute("SELECT id, score FROM t ORDER BY score ASC, id DESC;")
+            .unwrap();
+        match asc {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(3), Value::Null],
+                        vec![Value::Integer(1), Value::Null],
+                        vec![Value::Integer(4), Value::Integer(5)],
+                        vec![Value::Integer(2), Value::Integer(10)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        let desc = db
+            .execute("SELECT id, score FROM t ORDER BY score DESC, id ASC;")
+            .unwrap();
+        match desc {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(2), Value::Integer(10)],
+                        vec![Value::Integer(4), Value::Integer(5)],
+                        vec![Value::Integer(1), Value::Null],
+                        vec![Value::Integer(3), Value::Null],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn update_with_where_updates_matching_rows() {
         let path = temp_db_path("update_with_where");
         let mut db = Database::open(&path).unwrap();
@@ -1343,10 +1519,16 @@ mod tests {
         let path = temp_db_path("txn_rollback");
         let mut db = Database::open(&path).unwrap();
 
-        assert_eq!(db.execute("BEGIN TRANSACTION;").unwrap(), ExecuteResult::Begin);
+        assert_eq!(
+            db.execute("BEGIN TRANSACTION;").unwrap(),
+            ExecuteResult::Begin
+        );
         db.execute("CREATE TABLE t (id INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
-        assert_eq!(db.execute("ROLLBACK TRANSACTION;").unwrap(), ExecuteResult::Rollback);
+        assert_eq!(
+            db.execute("ROLLBACK TRANSACTION;").unwrap(),
+            ExecuteResult::Rollback
+        );
 
         let err = db.execute("SELECT * FROM t;").unwrap_err();
         assert!(err.contains("no such table"));
