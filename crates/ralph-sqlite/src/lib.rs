@@ -952,6 +952,39 @@ impl Database {
                 )?;
                 self.lookup_table_entries_by_rowids(meta.root_page, rowids)
             }
+            AccessPath::IndexPrefixRange {
+                index_name,
+                eq_prefix_value_exprs,
+                lower,
+                upper,
+                ..
+            } => {
+                let index_meta = self.resolve_index_meta(index_name)?;
+                let mut eq_prefix_values = Vec::with_capacity(eq_prefix_value_exprs.len());
+                for expr in eq_prefix_value_exprs {
+                    eq_prefix_values.push(eval_expr(expr, None)?);
+                }
+                let lower_bound = match lower {
+                    Some(bound) => Some((eval_expr(&bound.value_expr, None)?, bound.inclusive)),
+                    None => None,
+                };
+                let upper_bound = match upper {
+                    Some(bound) => Some((eval_expr(&bound.value_expr, None)?, bound.inclusive)),
+                    None => None,
+                };
+
+                let rowids = self.index_prefix_range_rowids(
+                    &index_meta,
+                    &eq_prefix_values,
+                    lower_bound
+                        .as_ref()
+                        .map(|(value, inclusive)| (value, *inclusive)),
+                    upper_bound
+                        .as_ref()
+                        .map(|(value, inclusive)| (value, *inclusive)),
+                )?;
+                self.lookup_table_entries_by_rowids(meta.root_page, rowids)
+            }
             AccessPath::IndexOr { branches } => {
                 let mut entries = Vec::new();
                 let mut seen_rowids = HashSet::new();
@@ -1095,6 +1128,82 @@ impl Database {
         Ok(rowids)
     }
 
+    fn index_prefix_range_rowids(
+        &mut self,
+        index_meta: &IndexMeta,
+        eq_prefix_values: &[Value],
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>, String> {
+        if eq_prefix_values.is_empty() {
+            return Err(format!(
+                "prefix index scan requires at least one equality value for '{}'",
+                index_meta.table_name
+            ));
+        }
+        if eq_prefix_values.len() >= index_meta.columns.len() {
+            return Err(format!(
+                "prefix index scan equality arity mismatch for '{}': expected fewer than {} value(s), got {}",
+                index_meta.table_name,
+                index_meta.columns.len(),
+                eq_prefix_values.len()
+            ));
+        }
+
+        let range_column_idx = eq_prefix_values.len();
+        let mut idx_tree = BTree::new(&mut self.pager, index_meta.root_page);
+        let index_entries = idx_tree
+            .scan_all()
+            .map_err(|e| format!("index scan: {e}"))?;
+
+        let mut rowids = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in index_entries {
+            let buckets = decode_index_payload(&entry.payload).map_err(|e| e.to_string())?;
+            for bucket in buckets {
+                let indexed_values = decode_index_bucket_values(index_meta, &bucket.value)?;
+                let prefix_matches = indexed_values
+                    .iter()
+                    .take(eq_prefix_values.len())
+                    .zip(eq_prefix_values.iter())
+                    .all(|(indexed, probe)| values_equal(indexed, probe));
+                if !prefix_matches {
+                    continue;
+                }
+
+                let range_value = &indexed_values[range_column_idx];
+                let lower_ok = if let Some((bound, inclusive)) = lower {
+                    let ordering = compare_values(range_value, bound)?;
+                    ordering == std::cmp::Ordering::Greater
+                        || (inclusive && ordering == std::cmp::Ordering::Equal)
+                } else {
+                    true
+                };
+                if !lower_ok {
+                    continue;
+                }
+
+                let upper_ok = if let Some((bound, inclusive)) = upper {
+                    let ordering = compare_values(range_value, bound)?;
+                    ordering == std::cmp::Ordering::Less
+                        || (inclusive && ordering == std::cmp::Ordering::Equal)
+                } else {
+                    true
+                };
+                if !upper_ok {
+                    continue;
+                }
+
+                for rowid in bucket.rowids {
+                    if seen.insert(rowid) {
+                        rowids.push(rowid);
+                    }
+                }
+            }
+        }
+        Ok(rowids)
+    }
+
     fn lookup_table_entries_by_rowids(
         &mut self,
         table_root: PageNum,
@@ -1142,6 +1251,7 @@ impl Database {
     ) -> Result<Vec<Vec<Value>>, String> {
         let needs_materialized_candidate_read =
             matches!(access_path, AccessPath::IndexRange { .. })
+                || matches!(access_path, AccessPath::IndexPrefixRange { .. })
                 || matches!(access_path, AccessPath::IndexOr { .. })
                 || matches!(access_path, AccessPath::IndexAnd { .. })
                 || matches!(
@@ -1180,6 +1290,7 @@ impl Database {
                     value,
                 ))
             }
+            AccessPath::IndexPrefixRange { .. } => unreachable!("handled above"),
             AccessPath::IndexRange { .. } => unreachable!("handled above"),
             AccessPath::IndexOr { .. } => unreachable!("handled above"),
             AccessPath::IndexAnd { .. } => unreachable!("handled above"),
@@ -3395,6 +3506,39 @@ fn index_key_and_bucket_value(indexed_values: &[Value]) -> Result<(i64, Value), 
     }
 }
 
+fn decode_index_bucket_values(
+    index_meta: &IndexMeta,
+    bucket_value: &Value,
+) -> Result<Vec<Value>, String> {
+    if index_meta.columns.len() == 1 {
+        return Ok(vec![bucket_value.clone()]);
+    }
+
+    let Value::Text(encoded) = bucket_value else {
+        return Err(format!(
+            "invalid multi-column index bucket value type for '{}'",
+            index_meta.table_name
+        ));
+    };
+    let hex = encoded.strip_prefix("__idx_tuple__:").ok_or_else(|| {
+        format!(
+            "invalid multi-column index bucket value encoding for '{}'",
+            index_meta.table_name
+        )
+    })?;
+    let bytes = hex_decode(hex)?;
+    let values = decode_row(&bytes).map_err(|e| e.to_string())?;
+    if values.len() != index_meta.columns.len() {
+        return Err(format!(
+            "decoded multi-column index bucket arity mismatch for '{}': expected {} value(s), got {}",
+            index_meta.table_name,
+            index_meta.columns.len(),
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
 fn encode_index_value_tuple(values: &[Value]) -> Result<Vec<u8>, String> {
     let value_count: u32 = values
         .len()
@@ -3416,6 +3560,21 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err("invalid hex length".to_string());
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut idx = 0;
+    while idx < text.len() {
+        let byte = u8::from_str_radix(&text[idx..idx + 2], 16)
+            .map_err(|_| "invalid hex byte".to_string())?;
+        out.push(byte);
+        idx += 2;
+    }
+    Ok(out)
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -4974,6 +5133,85 @@ mod tests {
     }
 
     #[test]
+    fn select_plans_multi_column_index_prefix_for_leading_equality() {
+        let path = temp_db_path("select_multi_column_prefix_plan");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 11, 20);")
+            .unwrap();
+
+        let stmt = match ralph_parser::parse("SELECT id FROM users WHERE score = 10 ORDER BY id;")
+            .unwrap()
+        {
+            Stmt::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
+        assert_eq!(
+            access_path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_users_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(10)],
+                lower: None,
+                upper: None,
+            }
+        );
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE score = 10 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_supports_multi_column_index_prefix_range_predicate() {
+        let path = temp_db_path("select_multi_column_prefix_range");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 10, 25), (4, 10, 30), (5, 11, 24);",
+        )
+        .unwrap();
+
+        let selected = db
+            .execute(
+                "SELECT id FROM users WHERE score = 10 AND age >= 21 AND age < 30 ORDER BY id;",
+            )
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn update_uses_multi_column_index_for_where_predicate() {
         let path = temp_db_path("update_multi_column_index_selection");
         let mut db = Database::open(&path).unwrap();
@@ -5002,6 +5240,46 @@ mod tests {
                     vec![
                         vec![Value::Integer(1), Value::Text("hit".to_string())],
                         vec![Value::Integer(2), Value::Text("b".to_string())],
+                        vec![Value::Integer(3), Value::Text("hit".to_string())],
+                        vec![Value::Integer(4), Value::Text("d".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_multi_column_index_prefix_range_for_where_predicate() {
+        let path = temp_db_path("update_multi_column_prefix_range");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, label TEXT, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'a', 10, 20), (2, 'b', 10, 22), (3, 'c', 10, 25), (4, 'd', 11, 22);",
+        )
+        .unwrap();
+
+        let result = db
+            .execute("UPDATE users SET label = 'hit' WHERE score = 10 AND age >= 22;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a".to_string())],
+                        vec![Value::Integer(2), Value::Text("hit".to_string())],
                         vec![Value::Integer(3), Value::Text("hit".to_string())],
                         vec![Value::Integer(4), Value::Text("d".to_string())],
                     ]
@@ -5532,6 +5810,41 @@ mod tests {
             ),
             vec![2]
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_multi_column_index_prefix_for_where_predicate() {
+        let path = temp_db_path("delete_multi_column_prefix");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 11, 20), (4, 10, 30);")
+            .unwrap();
+
+        let result = db.execute("DELETE FROM users WHERE score = 10;").unwrap();
+        assert_eq!(result, ExecuteResult::Delete { rows_affected: 3 });
+
+        let selected = db
+            .execute("SELECT id, score, age FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(3),
+                        Value::Integer(11),
+                        Value::Integer(20)
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

@@ -35,6 +35,13 @@ pub enum AccessPath {
         columns: Vec<String>,
         value_exprs: Vec<Expr>,
     },
+    IndexPrefixRange {
+        index_name: String,
+        columns: Vec<String>,
+        eq_prefix_value_exprs: Vec<Expr>,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    },
     IndexRange {
         index_name: String,
         column: String,
@@ -90,7 +97,8 @@ fn choose_index_access_raw(
             op: BinaryOperator::And,
             right,
         } => {
-            let eq_path = choose_index_eq_access(expr, table_name, indexes);
+            let eq_path = choose_index_eq_access(expr, table_name, indexes)
+                .or_else(|| choose_index_prefix_range_access(expr, table_name, indexes));
             let and_path = choose_index_and_access(expr, table_name, indexes);
             choose_preferred_and_path(eq_path, and_path).or_else(|| {
                 choose_index_access_raw(left, table_name, indexes)
@@ -103,6 +111,7 @@ fn choose_index_access_raw(
         } => choose_index_or_access(expr, table_name, indexes),
         _ => choose_index_eq_access(expr, table_name, indexes)
             .or_else(|| choose_index_in_access(expr, table_name, indexes))
+            .or_else(|| choose_index_prefix_range_access(expr, table_name, indexes))
             .or_else(|| choose_index_range_access(expr, table_name, indexes)),
     }
 }
@@ -150,7 +159,7 @@ fn choose_preferred_and_path(
             let prefers_eq = matches!(
                 &eq_path,
                 AccessPath::IndexEq { columns, .. } if columns.len() > 1
-            );
+            ) || matches!(&eq_path, AccessPath::IndexPrefixRange { .. });
             if prefers_eq {
                 Some(eq_path)
             } else {
@@ -380,6 +389,242 @@ fn collect_or_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         }
         _ => out.push(expr),
     }
+}
+
+fn collect_conjunctive_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Paren(inner) => collect_conjunctive_terms(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_conjunctive_terms(left, out);
+            collect_conjunctive_terms(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn choose_index_prefix_range_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    let mut terms = Vec::new();
+    collect_conjunctive_terms(expr, &mut terms);
+    if terms.is_empty() {
+        return None;
+    }
+
+    let mut eq_terms = Vec::new();
+    for term in &terms {
+        collect_indexable_eq_terms(term, table_name, &mut eq_terms);
+    }
+    if eq_terms.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(
+        &IndexInfo,
+        Vec<Expr>,
+        Option<RangeBound>,
+        Option<RangeBound>,
+    )> = None;
+    for index in indexes {
+        if !index.table.eq_ignore_ascii_case(table_name) || index.columns.len() < 2 {
+            continue;
+        }
+
+        let mut eq_prefix_value_exprs = Vec::new();
+        for column in &index.columns {
+            if let Some((_, expr)) = eq_terms
+                .iter()
+                .find(|(candidate_col, _)| candidate_col.eq_ignore_ascii_case(column))
+            {
+                eq_prefix_value_exprs.push(expr.clone());
+            } else {
+                break;
+            }
+        }
+        if eq_prefix_value_exprs.is_empty() || eq_prefix_value_exprs.len() >= index.columns.len() {
+            continue;
+        }
+
+        let range_column = &index.columns[eq_prefix_value_exprs.len()];
+        let (lower, upper) = collect_range_bounds_for_column(&terms, table_name, range_column);
+
+        let replace = match &best {
+            None => true,
+            Some((best_index, best_eq_prefix, best_lower, best_upper)) => {
+                let current_score =
+                    eq_prefix_value_exprs.len() + usize::from(lower.is_some() || upper.is_some());
+                let best_score = best_eq_prefix.len()
+                    + usize::from(best_lower.is_some() || best_upper.is_some());
+                current_score > best_score
+                    || (current_score == best_score
+                        && (eq_prefix_value_exprs.len() > best_eq_prefix.len()
+                            || (eq_prefix_value_exprs.len() == best_eq_prefix.len()
+                                && (index.columns.len() > best_index.columns.len()
+                                    || (index.columns.len() == best_index.columns.len()
+                                        && index.name < best_index.name)))))
+            }
+        };
+        if replace {
+            best = Some((index, eq_prefix_value_exprs, lower, upper));
+        }
+    }
+
+    best.map(
+        |(index, eq_prefix_value_exprs, lower, upper)| AccessPath::IndexPrefixRange {
+            index_name: index.name.clone(),
+            columns: index.columns.clone(),
+            eq_prefix_value_exprs,
+            lower,
+            upper,
+        },
+    )
+}
+
+fn collect_range_bounds_for_column(
+    terms: &[&Expr],
+    table_name: &str,
+    column: &str,
+) -> (Option<RangeBound>, Option<RangeBound>) {
+    let mut lower = None;
+    let mut upper = None;
+    for term in terms {
+        let Some((term_lower, term_upper)) =
+            extract_range_bounds_for_column(term, table_name, column)
+        else {
+            continue;
+        };
+        if lower.is_none() {
+            lower = term_lower;
+        }
+        if upper.is_none() {
+            upper = term_upper;
+        }
+        if lower.is_some() && upper.is_some() {
+            break;
+        }
+    }
+    (lower, upper)
+}
+
+fn extract_range_bounds_for_column(
+    expr: &Expr,
+    table_name: &str,
+    column: &str,
+) -> Option<(Option<RangeBound>, Option<RangeBound>)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            plan_column_range_binary(left, *op, right, table_name, column).or_else(|| {
+                invert_comparison(*op).and_then(|inverted| {
+                    plan_column_range_binary(right, inverted, left, table_name, column)
+                })
+            })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            if *negated {
+                return None;
+            }
+            let (col_table, col_name) = match expr.as_ref() {
+                Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if !col_name.eq_ignore_ascii_case(column) {
+                return None;
+            }
+            if let Some(qualifier) = col_table {
+                if !qualifier.eq_ignore_ascii_case(table_name) {
+                    return None;
+                }
+            }
+            if expr_contains_column_ref(low) || expr_contains_column_ref(high) {
+                return None;
+            }
+            Some((
+                Some(RangeBound {
+                    value_expr: low.as_ref().clone(),
+                    inclusive: true,
+                }),
+                Some(RangeBound {
+                    value_expr: high.as_ref().clone(),
+                    inclusive: true,
+                }),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn plan_column_range_binary(
+    lhs: &Expr,
+    op: BinaryOperator,
+    rhs: &Expr,
+    table_name: &str,
+    column: &str,
+) -> Option<(Option<RangeBound>, Option<RangeBound>)> {
+    match op {
+        BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq => {}
+        _ => return None,
+    }
+
+    let (col_table, col_name) = match lhs {
+        Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
+        _ => return None,
+    };
+    if !col_name.eq_ignore_ascii_case(column) {
+        return None;
+    }
+    if let Some(qualifier) = col_table {
+        if !qualifier.eq_ignore_ascii_case(table_name) {
+            return None;
+        }
+    }
+
+    if expr_contains_column_ref(rhs) {
+        return None;
+    }
+
+    let bounds = match op {
+        BinaryOperator::Gt => (
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: false,
+            }),
+            None,
+        ),
+        BinaryOperator::GtEq => (
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: true,
+            }),
+            None,
+        ),
+        BinaryOperator::Lt => (
+            None,
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: false,
+            }),
+        ),
+        BinaryOperator::LtEq => (
+            None,
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: true,
+            }),
+        ),
+        _ => return None,
+    };
+    Some(bounds)
 }
 
 fn plan_index_range_binary(
@@ -646,6 +891,14 @@ mod tests {
         ]
     }
 
+    fn composite_only_indexes() -> Vec<IndexInfo> {
+        vec![IndexInfo {
+            name: "idx_t_score_age".to_string(),
+            table: "t".to_string(),
+            columns: vec!["score".to_string(), "age".to_string()],
+        }]
+    }
+
     #[test]
     fn chooses_table_scan_without_where() {
         let stmt = SelectStmt {
@@ -754,6 +1007,44 @@ mod tests {
                         value_exprs: vec![Expr::IntegerLiteral(42)],
                     },
                 ],
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_multi_column_index_prefix_for_leading_equality() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 9;");
+        let plan = plan_select(&stmt, "t", &composite_only_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(9)],
+                lower: None,
+                upper: None,
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_multi_column_index_prefix_with_trailing_range() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 9 AND age >= 40 AND age < 50;");
+        let plan = plan_select(&stmt, "t", &composite_only_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(9)],
+                lower: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(40),
+                    inclusive: true,
+                }),
+                upper: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(50),
+                    inclusive: false,
+                }),
             }
         );
     }
@@ -972,6 +1263,25 @@ mod tests {
                 index_name: "idx_t_score_age".to_string(),
                 columns: vec!["score".to_string(), "age".to_string()],
                 value_exprs: vec![Expr::IntegerLiteral(100), Expr::IntegerLiteral(7)],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_chooses_multi_column_index_prefix_with_range() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 100 AND age > 7;");
+        let path = plan_where(where_expr.as_ref(), "t", &composite_only_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(100)],
+                lower: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(7),
+                    inclusive: false,
+                }),
+                upper: None,
             }
         );
     }
