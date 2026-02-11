@@ -54,11 +54,14 @@ Latest completions:
 - Multi-column prefix/range scan-reduction heuristics in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now penalizes weak `IndexPrefixRange` probes that imply full composite-index scans, falls back to `TableScan` for low-selectivity prefix-only forms, and retains bounded prefix/range usage; see `notes/multi-column-prefix-range-scan-reduction.md`
 - Planner statistics-driven cost model for table-scan vs index-path selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — added `plan_where_with_stats`/`plan_select_with_stats` plus runtime table/index cardinality hints from `ralph-sqlite`, with legacy static heuristics preserved when stats are absent; see `notes/planner-statistics-cost-model.md`
 - Persisted planner statistics metadata in `crates/storage` + `crates/ralph-sqlite` (Agent 4) — schema now persists table/index planner stats entries, planner stats now load from persisted metadata instead of per-query scans, and write paths refresh/drop stats metadata on CREATE/INSERT/UPDATE/DELETE/DROP; see `notes/persisted-planner-statistics.md`
+- Planner stats selectivity/cost refinement in `crates/planner` (Agent codex) — stats-aware `AND` path preference now compares candidate costs before picking `IndexAnd` vs simpler equality paths, and stats-based `IndexOr`/`IndexAnd` row estimation now combines branch selectivities using probability unions/intersections instead of sum/min heuristics; see `notes/planner-stats-selectivity-cost-refinement.md`
 
 Recommended next step:
 - Add histogram/fanout planner statistics (especially for multi-column prefix/range predicates) and feed them into cost estimation.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner stats selectivity/cost refinement): pass, 0 failed (38 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner stats selectivity/cost refinement, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT/FULL OUTER JOIN merged verification): pass, 0 failed (161 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (RIGHT/FULL OUTER JOIN merged verification, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-storage -p ralph-sqlite` (persisted planner statistics metadata): pass, 0 failed (146 tests).
@@ -208,6 +211,7 @@ Test pass rate:
 39. ~~RIGHT JOIN parser/execution support~~ ✓
 40. ~~FULL OUTER JOIN parser/execution support~~ ✓
 41. ~~Persisted planner statistics metadata~~ ✓
+42. ~~Planner stats selectivity/cost refinement~~ ✓
 
 ## Completed Tasks
 

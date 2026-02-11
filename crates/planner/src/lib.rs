@@ -139,7 +139,7 @@ fn choose_index_access_raw(
             let eq_path = choose_index_eq_access(expr, table_name, indexes)
                 .or_else(|| choose_index_prefix_range_access(expr, table_name, indexes));
             let and_path = choose_index_and_access(expr, table_name, indexes, stats);
-            choose_preferred_and_path(eq_path, and_path).or_else(|| {
+            choose_preferred_and_path(eq_path, and_path, stats).or_else(|| {
                 choose_index_access_raw(left, table_name, indexes, stats)
                     .or_else(|| choose_index_access_raw(right, table_name, indexes, stats))
             })
@@ -242,7 +242,8 @@ fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> C
             ..
         } => {
             let fallback_selectivity = if columns.len() > 1 { 0.04 } else { 0.12 };
-            let output_rows = estimate_index_eq_rows(stats, index_name, table_rows, fallback_selectivity);
+            let output_rows =
+                estimate_index_eq_rows(stats, index_name, table_rows, fallback_selectivity);
             CostEstimate {
                 cost: 8.0 + output_rows,
                 output_rows,
@@ -286,13 +287,13 @@ fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> C
         }
         AccessPath::IndexOr { branches } => {
             let mut branch_cost = 0.0;
-            let mut branch_rows_sum = 0.0;
+            let mut branch_selectivities = Vec::with_capacity(branches.len());
             for branch in branches {
                 let est = estimate_access_path_with_stats(branch, stats);
                 branch_cost += est.cost;
-                branch_rows_sum += est.output_rows;
+                branch_selectivities.push((est.output_rows / table_rows).clamp(0.0, 1.0));
             }
-            let output_rows = branch_rows_sum.min(table_rows).max(1.0);
+            let output_rows = (table_rows * combine_or_selectivity(&branch_selectivities)).max(1.0);
             CostEstimate {
                 cost: 5.0 + branch_cost + output_rows * 0.15,
                 output_rows,
@@ -300,16 +301,14 @@ fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> C
         }
         AccessPath::IndexAnd { branches } => {
             let mut branch_cost = 0.0;
-            let mut min_rows: Option<f64> = None;
+            let mut branch_selectivities = Vec::with_capacity(branches.len());
             for branch in branches {
                 let est = estimate_access_path_with_stats(branch, stats);
                 branch_cost += est.cost;
-                min_rows = Some(min_rows.map_or(est.output_rows, |cur| cur.min(est.output_rows)));
+                branch_selectivities.push((est.output_rows / table_rows).clamp(0.0, 1.0));
             }
-            let mut output_rows = min_rows.unwrap_or(table_rows);
-            if branches.len() > 1 {
-                output_rows = (output_rows / 2f64.powi((branches.len() - 1) as i32)).max(1.0);
-            }
+            let output_rows =
+                (table_rows * combine_and_selectivity(&branch_selectivities)).max(1.0);
             CostEstimate {
                 cost: 7.0 + branch_cost + output_rows * 0.3,
                 output_rows,
@@ -331,8 +330,8 @@ fn estimate_index_eq_rows(
     if index_stats.estimated_rows == 0 || index_stats.estimated_distinct_keys == 0 {
         return fallback.min(table_rows);
     }
-    let rows = (index_stats.estimated_rows as f64 / index_stats.estimated_distinct_keys as f64)
-        .max(1.0);
+    let rows =
+        (index_stats.estimated_rows as f64 / index_stats.estimated_distinct_keys as f64).max(1.0);
     rows.min(table_rows)
 }
 
@@ -349,7 +348,10 @@ fn estimate_index_range_rows(
     if index_stats.estimated_rows == 0 {
         return 1.0;
     }
-    fallback.min(index_stats.estimated_rows as f64).max(1.0).min(table_rows)
+    fallback
+        .min(index_stats.estimated_rows as f64)
+        .max(1.0)
+        .min(table_rows)
 }
 
 fn find_index_stats<'a>(stats: &'a PlannerStats, index_name: &str) -> Option<&'a IndexStats> {
@@ -362,9 +364,19 @@ fn find_index_stats<'a>(stats: &'a PlannerStats, index_name: &str) -> Option<&'a
 fn choose_preferred_and_path(
     eq_path: Option<AccessPath>,
     and_path: Option<AccessPath>,
+    stats: Option<&PlannerStats>,
 ) -> Option<AccessPath> {
     match (eq_path, and_path) {
         (Some(eq_path), Some(and_path)) => {
+            if stats.is_some() {
+                if estimated_access_path_cost(&eq_path, stats)
+                    <= estimated_access_path_cost(&and_path, stats)
+                {
+                    return Some(eq_path);
+                }
+                return Some(and_path);
+            }
+
             let prefers_eq = matches!(
                 &eq_path,
                 AccessPath::IndexEq { columns, .. } if columns.len() > 1
@@ -387,6 +399,26 @@ fn choose_preferred_and_path(
         (_, Some(and_path)) => Some(and_path),
         (eq_path, None) => eq_path,
     }
+}
+
+fn combine_or_selectivity(selectivities: &[f64]) -> f64 {
+    if selectivities.is_empty() {
+        return 1.0;
+    }
+    let miss_probability = selectivities
+        .iter()
+        .fold(1.0, |acc, value| acc * (1.0 - value.clamp(0.0, 1.0)));
+    (1.0 - miss_probability).clamp(0.0, 1.0)
+}
+
+fn combine_and_selectivity(selectivities: &[f64]) -> f64 {
+    if selectivities.is_empty() {
+        return 1.0;
+    }
+    selectivities
+        .iter()
+        .fold(1.0, |acc, value| acc * value.clamp(0.0, 1.0))
+        .clamp(0.0, 1.0)
 }
 
 fn choose_index_in_access(
@@ -1671,7 +1703,8 @@ mod tests {
                 estimated_distinct_keys: 10_000,
             }],
         };
-        let path = plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
+        let path =
+            plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
         assert!(matches!(
             path,
             AccessPath::IndexOr { branches } if branches.len() == 6
@@ -1689,7 +1722,50 @@ mod tests {
                 estimated_distinct_keys: 1,
             }],
         };
-        let path = plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
+        let path =
+            plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
         assert_eq!(path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn plan_where_with_stats_prefers_selective_eq_over_costly_and_intersection() {
+        let where_expr = parse_where("SELECT * FROM t WHERE age = 9 AND score > 1;");
+        let stats = PlannerStats {
+            estimated_table_rows: Some(1_000),
+            index_stats: vec![
+                IndexStats {
+                    index_name: "idx_t_age".to_string(),
+                    estimated_rows: 1_000,
+                    estimated_distinct_keys: 1_000,
+                },
+                IndexStats {
+                    index_name: "idx_t_score".to_string(),
+                    estimated_rows: 1_000,
+                    estimated_distinct_keys: 1,
+                },
+            ],
+        };
+        let path =
+            plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
+        assert_eq!(
+            path,
+            AccessPath::IndexEq {
+                index_name: "idx_t_age".to_string(),
+                columns: vec!["age".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(9)],
+            }
+        );
+    }
+
+    #[test]
+    fn combine_or_selectivity_uses_union_probability() {
+        let selectivity = combine_or_selectivity(&[0.5, 0.5]);
+        assert!((selectivity - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn combine_and_selectivity_multiplies_probabilities() {
+        let selectivity = combine_and_selectivity(&[0.5, 0.5, 0.5]);
+        assert!((selectivity - 0.125).abs() < 1e-9);
     }
 }
