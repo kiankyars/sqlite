@@ -54,6 +54,7 @@ struct IndexMeta {
     column: String,
     column_idx: usize,
     root_page: PageNum,
+    unique: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -221,9 +222,6 @@ impl Database {
         stmt: CreateIndexStmt,
         original_sql: &str,
     ) -> Result<ExecuteResult, String> {
-        if stmt.unique {
-            return Err("UNIQUE indexes are not supported yet".to_string());
-        }
         if stmt.columns.len() != 1 {
             return Err("only single-column indexes are supported yet".to_string());
         }
@@ -262,13 +260,7 @@ impl Database {
             .map_err(|e| format!("scan table for index build: {e}"))?;
         drop(table_tree);
 
-        let index_meta = IndexMeta {
-            table_key: table_key.clone(),
-            table_name: table_meta.name.clone(),
-            column,
-            column_idx,
-            root_page,
-        };
+        let mut decoded_rows = Vec::with_capacity(table_entries.len());
         for entry in table_entries {
             let row = decode_row(&entry.payload).map_err(|e| e.to_string())?;
             if row.len() != table_meta.columns.len() {
@@ -278,7 +270,28 @@ impl Database {
                     table_meta.columns.len()
                 ));
             }
-            self.index_insert_row(&index_meta, entry.key, &row)?;
+            decoded_rows.push((entry.key, row));
+        }
+
+        if stmt.unique {
+            validate_unique_index_backfill_rows(
+                &table_meta.name,
+                &column,
+                column_idx,
+                decoded_rows.iter().map(|(_, row)| row),
+            )?;
+        }
+
+        let index_meta = IndexMeta {
+            table_key: table_key.clone(),
+            table_name: table_meta.name.clone(),
+            column,
+            column_idx,
+            root_page,
+            unique: stmt.unique,
+        };
+        for (rowid, row) in decoded_rows {
+            self.index_insert_row(&index_meta, rowid, &row)?;
         }
 
         self.indexes.insert(index_key, index_meta);
@@ -390,6 +403,9 @@ impl Database {
             evaluated_rows.push(row);
         }
 
+        let table_indexes = self.indexes_for_table(&table_key);
+        self.validate_unique_constraints_for_insert_rows(&table_indexes, &evaluated_rows)?;
+
         let rows_affected = evaluated_rows.len();
         let mut table_tree = BTree::new(&mut self.pager, meta.root_page);
         let existing = table_tree
@@ -408,7 +424,6 @@ impl Database {
         }
         drop(table_tree);
 
-        let table_indexes = self.indexes_for_table(&table_key);
         for (rowid, row) in inserted_rows {
             for index_meta in &table_indexes {
                 self.index_insert_row(index_meta, rowid, &row)?;
@@ -452,6 +467,18 @@ impl Database {
         };
 
         if let Some(existing) = buckets.iter_mut().find(|b| values_equal(&b.value, value)) {
+            if index_meta.unique
+                && !matches!(value, Value::Null)
+                && existing
+                    .rowids
+                    .iter()
+                    .any(|existing_rowid| *existing_rowid != rowid)
+            {
+                return Err(unique_constraint_error(
+                    &index_meta.table_name,
+                    &index_meta.column,
+                ));
+            }
             if !existing.rowids.contains(&rowid) {
                 existing.rowids.push(rowid);
             }
@@ -523,7 +550,7 @@ impl Database {
         let planner_indexes = self.planner_indexes_for_table(&table_key);
         let access_path = plan_where(stmt.where_clause.as_ref(), &meta.name, &planner_indexes);
         let entries = self.read_candidate_entries(&meta, &access_path)?;
-        let mut rows_affected = 0usize;
+        let mut planned_updates = Vec::new();
 
         for entry in entries {
             let original_row = decode_table_row(&meta, &entry.payload)?;
@@ -543,22 +570,27 @@ impl Database {
                 updated_row[col_idx] = value;
             }
 
+            planned_updates.push((entry.key, original_row, updated_row));
+        }
+
+        self.validate_unique_constraints_for_updates(&table_indexes, &planned_updates)?;
+        let rows_affected = planned_updates.len();
+
+        for (rowid, original_row, updated_row) in planned_updates {
             for index_meta in &table_indexes {
-                self.index_delete_row(index_meta, entry.key, &original_row)?;
+                self.index_delete_row(index_meta, rowid, &original_row)?;
             }
 
             let encoded = encode_row(&updated_row)?;
             {
                 let mut tree = BTree::new(&mut self.pager, meta.root_page);
-                tree.insert(entry.key, &encoded)
+                tree.insert(rowid, &encoded)
                     .map_err(|e| format!("update row: {e}"))?;
             }
 
             for index_meta in &table_indexes {
-                self.index_insert_row(index_meta, entry.key, &updated_row)?;
+                self.index_insert_row(index_meta, rowid, &updated_row)?;
             }
-
-            rows_affected += 1;
         }
 
         self.commit_if_autocommit("update")?;
@@ -1105,6 +1137,156 @@ impl Database {
 
         Ok(rows)
     }
+
+    fn validate_unique_constraints_for_insert_rows(
+        &mut self,
+        table_indexes: &[IndexMeta],
+        rows: &[Vec<Value>],
+    ) -> Result<(), String> {
+        let excluded_rowids = HashSet::new();
+        let mut seen_by_index: HashMap<PageNum, Vec<Value>> = HashMap::new();
+        for row in rows {
+            for index_meta in table_indexes {
+                if !index_meta.unique {
+                    continue;
+                }
+                let value = row.get(index_meta.column_idx).ok_or_else(|| {
+                    format!(
+                        "row missing indexed column '{}' for index on '{}'",
+                        index_meta.column, index_meta.table_name
+                    )
+                })?;
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+
+                if self.unique_value_conflicts_with_existing(index_meta, value, &excluded_rowids)? {
+                    return Err(unique_constraint_error(
+                        &index_meta.table_name,
+                        &index_meta.column,
+                    ));
+                }
+
+                let seen_values = seen_by_index.entry(index_meta.root_page).or_default();
+                if seen_values
+                    .iter()
+                    .any(|seen_value| values_equal(seen_value, value))
+                {
+                    return Err(unique_constraint_error(
+                        &index_meta.table_name,
+                        &index_meta.column,
+                    ));
+                }
+                seen_values.push(value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_unique_constraints_for_updates(
+        &mut self,
+        table_indexes: &[IndexMeta],
+        updates: &[(i64, Vec<Value>, Vec<Value>)],
+    ) -> Result<(), String> {
+        let update_rowids: HashSet<i64> = updates.iter().map(|(rowid, _, _)| *rowid).collect();
+        let mut current_values_by_index: HashMap<PageNum, HashMap<i64, Value>> = HashMap::new();
+
+        for (rowid, original_row, _) in updates {
+            for index_meta in table_indexes {
+                if !index_meta.unique {
+                    continue;
+                }
+                let value = original_row.get(index_meta.column_idx).ok_or_else(|| {
+                    format!(
+                        "row missing indexed column '{}' for index on '{}'",
+                        index_meta.column, index_meta.table_name
+                    )
+                })?;
+                current_values_by_index
+                    .entry(index_meta.root_page)
+                    .or_default()
+                    .insert(*rowid, value.clone());
+            }
+        }
+
+        for (rowid, _original_row, updated_row) in updates {
+            for index_meta in table_indexes {
+                if !index_meta.unique {
+                    continue;
+                }
+                let value = updated_row.get(index_meta.column_idx).ok_or_else(|| {
+                    format!(
+                        "row missing indexed column '{}' for index on '{}'",
+                        index_meta.column, index_meta.table_name
+                    )
+                })?;
+
+                let current_values = current_values_by_index
+                    .entry(index_meta.root_page)
+                    .or_default();
+
+                if matches!(value, Value::Null) {
+                    current_values.insert(*rowid, Value::Null);
+                    continue;
+                }
+
+                if self.unique_value_conflicts_with_existing(index_meta, value, &update_rowids)? {
+                    return Err(unique_constraint_error(
+                        &index_meta.table_name,
+                        &index_meta.column,
+                    ));
+                }
+
+                if current_values
+                    .iter()
+                    .any(|(candidate_rowid, candidate_value)| {
+                        *candidate_rowid != *rowid
+                            && !matches!(candidate_value, Value::Null)
+                            && values_equal(candidate_value, value)
+                    })
+                {
+                    return Err(unique_constraint_error(
+                        &index_meta.table_name,
+                        &index_meta.column,
+                    ));
+                }
+
+                current_values.insert(*rowid, value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn unique_value_conflicts_with_existing(
+        &mut self,
+        index_meta: &IndexMeta,
+        value: &Value,
+        excluded_rowids: &HashSet<i64>,
+    ) -> Result<bool, String> {
+        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
+        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
+        let Some(payload) = tree
+            .lookup(key)
+            .map_err(|e| format!("lookup index entry: {e}"))?
+        else {
+            return Ok(false);
+        };
+
+        let buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
+        let Some(existing_bucket) = buckets
+            .iter()
+            .find(|bucket| values_equal(&bucket.value, value))
+        else {
+            return Ok(false);
+        };
+
+        Ok(existing_bucket
+            .rowids
+            .iter()
+            .any(|rowid| !excluded_rowids.contains(rowid)))
+    }
 }
 
 fn ordered_range_key_bounds(
@@ -1176,6 +1358,9 @@ fn load_catalogs(
                 )
             })?
         };
+        let unique = create_index_stmt_from_sql(&index.sql)
+            .map(|stmt| stmt.unique)
+            .unwrap_or(false);
 
         indexes.insert(
             index_key,
@@ -1185,11 +1370,48 @@ fn load_catalogs(
                 column: indexed_column.name.clone(),
                 column_idx,
                 root_page: index.root_page,
+                unique,
             },
         );
     }
 
     Ok((tables, indexes))
+}
+
+fn create_index_stmt_from_sql(sql: &str) -> Option<CreateIndexStmt> {
+    match ralph_parser::parse(sql) {
+        Ok(Stmt::CreateIndex(stmt)) => Some(stmt),
+        _ => None,
+    }
+}
+
+fn unique_constraint_error(table_name: &str, column: &str) -> String {
+    format!("UNIQUE constraint failed: {table_name}.{column}")
+}
+
+fn validate_unique_index_backfill_rows<'a>(
+    table_name: &str,
+    column: &str,
+    column_idx: usize,
+    rows: impl Iterator<Item = &'a Vec<Value>>,
+) -> Result<(), String> {
+    let mut seen_values = Vec::new();
+    for row in rows {
+        let value = row.get(column_idx).ok_or_else(|| {
+            format!("row missing indexed column '{column}' for index on '{table_name}'")
+        })?;
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        if seen_values
+            .iter()
+            .any(|seen_value| values_equal(seen_value, value))
+        {
+            return Err(unique_constraint_error(table_name, column));
+        }
+        seen_values.push(value.clone());
+    }
+    Ok(())
 }
 
 fn type_name_to_sql(type_name: Option<&TypeName>) -> String {
@@ -2732,6 +2954,204 @@ mod tests {
     }
 
     #[test]
+    fn create_unique_index_rejects_existing_duplicates() {
+        let path = temp_db_path("create_unique_index_duplicates");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@x'), (2, 'a@x');")
+            .unwrap();
+
+        let err = db
+            .execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.email"));
+        assert!(!db
+            .indexes
+            .contains_key(&normalize_identifier("ux_users_email")));
+
+        let selected = db
+            .execute("SELECT id, email FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a@x".to_string())],
+                        vec![Value::Integer(2), Value::Text("a@x".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_value_for_unique_index() {
+        let path = temp_db_path("insert_unique_violation");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@x');").unwrap();
+
+        let err = db
+            .execute("INSERT INTO users VALUES (2, 'a@x');")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.email"));
+
+        let selected = db
+            .execute("SELECT id, email FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1), Value::Text("a@x".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unique_index_allows_multiple_null_values() {
+        let path = temp_db_path("unique_allows_nulls");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, NULL), (2, NULL);")
+            .unwrap();
+
+        let selected = db
+            .execute("SELECT COUNT(*) FROM users WHERE email IS NULL;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => assert_eq!(q.rows, vec![vec![Value::Integer(2)]]),
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_rejects_duplicate_for_unique_index_without_partial_changes() {
+        let path = temp_db_path("update_unique_violation");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x');")
+            .unwrap();
+
+        let err = db
+            .execute("UPDATE users SET email = 'a@x' WHERE id = 2;")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.email"));
+
+        let selected = db
+            .execute("SELECT id, email FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a@x".to_string())],
+                        vec![Value::Integer(2), Value::Text("b@x".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_rejects_statement_that_creates_duplicate_unique_values() {
+        let path = temp_db_path("update_unique_statement_violation");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x');")
+            .unwrap();
+
+        let err = db.execute("UPDATE users SET email = 'z@x';").unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.email"));
+
+        let selected = db
+            .execute("SELECT id, email FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a@x".to_string())],
+                        vec![Value::Integer(2), Value::Text("b@x".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_allows_unique_value_handoff_when_prior_row_moves_away() {
+        let path = temp_db_path("update_unique_handoff");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, code INTEGER);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_code ON users(code);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 1), (2, 2);")
+            .unwrap();
+
+        let updated = db
+            .execute("UPDATE users SET code = code + (id = 1) * 2 - (id = 2);")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, code FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Integer(3)],
+                        vec![Value::Integer(2), Value::Integer(1)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn drop_table_removes_table_indexes_and_reclaims_pages() {
         let path = temp_db_path("drop_table_reclaim");
         let mut db = Database::open(&path).unwrap();
@@ -2905,6 +3325,40 @@ mod tests {
             indexed_rowids(&mut reopened, "idx_users_age", &Value::Integer(20)),
             vec![2]
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unique_index_constraint_persists_across_reopen() {
+        let path = temp_db_path("unique_index_reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER, email TEXT);")
+                .unwrap();
+            db.execute("CREATE UNIQUE INDEX ux_users_email ON users(email);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'a@x');").unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let err = reopened
+            .execute("INSERT INTO users VALUES (2, 'a@x');")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.email"));
+
+        let selected = reopened
+            .execute("SELECT id, email FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1), Value::Text("a@x".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

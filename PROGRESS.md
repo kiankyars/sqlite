@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column `UNIQUE` secondary index enforcement, SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -37,12 +37,16 @@ Latest completions:
 - SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
 - Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable
 - Ordered range index seeks for text bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — text index keys now use an order-preserving 8-byte prefix encoding so `IndexRange` plans can seek on text bounds (with value-level filtering retained for strict bound semantics)
+- Single-column `UNIQUE` index execution in `crates/ralph-sqlite` (Agent codex) — `CREATE UNIQUE INDEX` now builds/enforces unique secondary indexes, `INSERT`/`UPDATE` reject duplicate non-`NULL` keys with SQLite-style errors, and index uniqueness now persists across reopen via schema SQL parsing
 
 Recommended next step:
 - Improve text index key encoding beyond fixed 8-byte prefixes to reduce collision-heavy scans for long shared prefixes while preserving order.
 
 Test pass rate:
 - `cargo test -p ralph-executor -p ralph-sqlite` (ordered text range index seeks): pass, 0 failed (56 tests).
+- `cargo test --workspace` (single-column UNIQUE index execution): pass, 0 failed (188 tests).
+- `cargo test -p ralph-sqlite` (single-column UNIQUE index execution): pass, 0 failed (48 tests).
+- `./test.sh --fast` (single-column UNIQUE index execution, AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (ordered range index seek keying): pass, 0 failed (13 tests).
 - `cargo test -p ralph-planner` (post-range-seek sanity): pass, 0 failed (13 tests).
 - `cargo test -p ralph-sqlite` (ordered range index seeks): pass, 0 failed (41 tests).
@@ -129,6 +133,7 @@ Test pass rate:
 25. ~~Ordered range index seeks for index range predicates~~ ✓
 26. ~~B+tree interior occupancy rebalance~~ ✓
 27. ~~Ordered text range index seeks~~ ✓
+28. ~~Single-column UNIQUE index execution~~ ✓
 
 ## Completed Tasks
 
@@ -290,6 +295,11 @@ Test pass rate:
   - `ordered_index_key_for_value` now emits order-preserving keys for `TEXT` values via an 8-byte lexicographic prefix encoding
   - Existing `IndexRange` candidate reads now perform B+tree range seeks for text bounds, with value-level filtering retained for strict comparison semantics
   - Added executor and integration coverage; see `notes/ordered-text-range-index-seeks.md`
+- [x] Single-column UNIQUE index execution (agent codex)
+  - `CREATE UNIQUE INDEX` now executes for single-column indexes with duplicate backfill validation
+  - `INSERT`/`UPDATE` now enforce unique secondary index constraints for non-`NULL` values
+  - Unique-index enforcement now persists across reopen by parsing index schema SQL on catalog load
+  - Added integration coverage; see `notes/unique-index-execution.md`
 
 ## Known Issues
 
@@ -299,5 +309,5 @@ Test pass rate:
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text uses an 8-byte prefix key encoding, so long shared prefixes can still cause collision-heavy scans within matched key ranges.
 - No JOIN support (single-table FROM only)
 - No subquery support
-- Multi-column and UNIQUE index execution are not supported yet.
+- Multi-column secondary index execution is not supported yet; UNIQUE enforcement is currently limited to single-column indexes.
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

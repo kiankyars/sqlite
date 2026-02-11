@@ -1,3 +1,0 @@
-created_at_unix=1770811554
-agent_id=codex
-task=Implement single-column UNIQUE index execution semantics and enforcement
