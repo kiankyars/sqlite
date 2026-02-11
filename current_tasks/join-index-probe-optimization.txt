@@ -1,3 +1,0 @@
-created_at_unix=1770836500
-agent_id=opus
-task=join index probe optimization — index-driven nested-loop join for equality ON conditions

@@ -1,0 +1,3 @@
+created_at_unix=1770843858
+agent_id=codex-3
+task=Add planner histogram/fanout statistics (focus on multi-column prefix/range selectivity) and feed into cost estimation
