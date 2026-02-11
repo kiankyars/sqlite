@@ -26,6 +26,7 @@ Latest completions:
 - Checkpoint + crash recovery in `crates/storage` (Agent codex) — pager now replays committed WAL frames on open, reloads recovered header state, and exposes `Pager::checkpoint()` to truncate WAL after checkpointing committed frames
 - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
 - Schema persistence integration in `crates/storage` + `crates/ralph-sqlite` (Agent codex) — `Database::open` now loads persisted table/index catalogs from schema entries, `CREATE TABLE`/`CREATE INDEX` now persist metadata via `Schema`, and reopen retains both table and index catalogs
+- Transactional dirty-page eviction isolation in `crates/storage` (Agent codex) — dirty LRU victims now spill to an in-memory pending-dirty map instead of writing directly to the DB file; `flush_all` now commits both buffered and spilled dirty pages via WAL, preserving rollback correctness when eviction occurs before COMMIT
 
 Test pass rate:
 - `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
@@ -55,6 +56,9 @@ Test pass rate:
 - `cargo test --workspace` (task #16 implementation): pass, 0 failed.
 - `cargo test --workspace` (UPDATE/DELETE index selection): pass, 0 failed (131 tests).
 - `./test.sh` (full, UPDATE/DELETE index selection): 5/5 passed.
+- `cargo test -p ralph-storage` (dirty-eviction isolation): pass, 0 failed (47 tests).
+- `cargo test --workspace` (dirty-eviction isolation): pass, 0 failed.
+- `./test.sh --fast` (dirty-eviction isolation, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -77,6 +81,7 @@ Test pass rate:
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
 18. ~~B+tree split/merge~~ ✓
 19. ~~ORDER BY, LIMIT, aggregates~~ ✓
+20. ~~Transactional dirty-page eviction isolation~~ ✓
 
 ## Completed Tasks
 
@@ -188,12 +193,16 @@ Test pass rate:
   - Updated `execute_update` and `execute_delete` to call planner and use `read_candidate_entries` helper for index-driven row selection
   - Full WHERE predicate still re-applied after index probe for correctness
   - Added 3 planner tests and 3 integration tests; see `notes/update-delete-index-selection.md`
+- [x] Transactional dirty-page eviction isolation in pager (agent codex)
+  - Dirty pages evicted from a full buffer pool are now spilled into an in-memory pending-dirty map instead of being written directly to the DB file
+  - `ensure_loaded` now reloads spilled dirty pages before disk reads so uncommitted changes stay visible inside the current transaction
+  - `flush_all` now WAL-commits and applies both in-pool dirty pages and spilled dirty pages
+  - Added pager tests for dirty-page visibility after eviction and non-durability across reopen without commit; see `notes/wal-eviction-transactional-correctness.md`
 
 ## Known Issues
 
 - Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
-- Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
-- Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+- Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
 - UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.
 - Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.

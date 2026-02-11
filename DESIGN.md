@@ -90,9 +90,9 @@ ralph-sqlite (integration)
 ## Pager Strategy
 
 - **Buffer pool**: Fixed number of page-sized frames in memory.
-- **Eviction**: LRU with dirty-page tracking.
-- **Read path**: Check buffer pool → read from disk → insert into pool.
-- **Write path**: Mark page dirty in buffer pool → flush via WAL on commit.
+- **Eviction**: LRU with dirty-page tracking; dirty victims spill to an in-memory pending-dirty map (not directly to DB file).
+- **Read path**: Check buffer pool → check pending-dirty spill map → read from disk → insert into pool.
+- **Write path**: Mark page dirty in buffer pool; eviction preserves uncommitted dirty bytes in-memory; commit flushes buffered + spilled dirty pages via WAL then applies them to DB.
 - **Page allocation**: Reuse freelist pages first; extend file if freelist empty.
 
 ## B+tree Strategy

@@ -38,6 +38,8 @@ pub struct Pager {
     page_size: usize,
     /// Buffer pool: page_num -> frame.
     pool: HashMap<PageNum, Frame>,
+    /// Dirty pages evicted from the buffer pool but not yet committed.
+    spilled_dirty: HashMap<PageNum, Vec<u8>>,
     /// Maximum number of frames in the pool.
     max_frames: usize,
     /// Monotonically increasing access counter for LRU.
@@ -104,6 +106,7 @@ impl Pager {
             header_dirty: false,
             page_size,
             pool: HashMap::new(),
+            spilled_dirty: HashMap::new(),
             max_frames,
             access_counter: 0,
             next_txn_id: 1,
@@ -296,7 +299,9 @@ impl Pager {
             .filter(|(_, f)| f.dirty)
             .map(|(&pn, _)| pn)
             .collect();
+        dirty_pages.extend(self.spilled_dirty.keys().copied());
         dirty_pages.sort_unstable();
+        dirty_pages.dedup();
 
         if dirty_pages.is_empty() {
             self.file.sync_all()?;
@@ -305,12 +310,25 @@ impl Pager {
 
         let mut wal_pages = Vec::with_capacity(dirty_pages.len());
         for page_num in &dirty_pages {
-            let data = self
-                .pool
-                .get(page_num)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "page not in buffer pool"))?
-                .data
-                .clone();
+            let data = match self.pool.get(page_num) {
+                Some(frame) if frame.dirty => frame.data.clone(),
+                Some(_) => self
+                    .spilled_dirty
+                    .get(page_num)
+                    .cloned()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("dirty page {page_num} missing spill state"),
+                        )
+                    })?,
+                None => self.spilled_dirty.get(page_num).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("dirty page {page_num} missing from pool and spill"),
+                    )
+                })?,
+            };
             wal_pages.push((*page_num, data));
         }
 
@@ -326,24 +344,11 @@ impl Pager {
             if let Some(frame) = self.pool.get_mut(&page_num) {
                 frame.dirty = false;
             }
+            self.spilled_dirty.remove(&page_num);
         }
 
         self.file.sync_all()?;
         self.header_dirty = false;
-        Ok(())
-    }
-
-    /// Flush a single page to disk.
-    fn flush_page(&mut self, page_num: PageNum) -> io::Result<()> {
-        let frame = self
-            .pool
-            .get_mut(&page_num)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "page not in buffer pool"))?;
-
-        let offset = page_num as u64 * self.page_size as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&frame.data)?;
-        frame.dirty = false;
         Ok(())
     }
 
@@ -379,14 +384,19 @@ impl Pager {
 
         self.maybe_evict()?;
 
-        let mut data = vec![0u8; self.page_size];
-        let offset = page_num as u64 * self.page_size as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut data)?;
+        let (data, dirty) = if let Some(data) = self.spilled_dirty.remove(&page_num) {
+            (data, true)
+        } else {
+            let mut data = vec![0u8; self.page_size];
+            let offset = page_num as u64 * self.page_size as u64;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.read_exact(&mut data)?;
+            (data, false)
+        };
 
         let frame = Frame {
             data,
-            dirty: false,
+            dirty,
             pin_count: 0,
             last_access: self.next_access(),
         };
@@ -407,9 +417,10 @@ impl Pager {
 
             match victim {
                 Some(page_num) => {
-                    // Flush if dirty before evicting.
-                    if self.pool.get(&page_num).unwrap().dirty {
-                        self.flush_page(page_num)?;
+                    if let Some(frame) = self.pool.get(&page_num) {
+                        if frame.dirty {
+                            self.spilled_dirty.insert(page_num, frame.data.clone());
+                        }
                     }
                     self.pool.remove(&page_num);
                 }
@@ -623,7 +634,7 @@ mod tests {
             pager.allocate_page().unwrap();
         }
 
-        // Write something to each page so they're dirty and get flushed on eviction.
+        // Write something to each page so they're dirty and can spill on eviction.
         for pg in 1..=5 {
             let data = pager.write_page(pg).unwrap();
             data[0] = pg as u8;
@@ -639,6 +650,64 @@ mod tests {
         }
 
         pager.flush_all().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dirty_evicted_page_remains_visible_before_commit() {
+        let path = temp_db_path("dirty_evict_visible_before_commit.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open_with_pool_size(&path, 1).unwrap();
+        let page_num = pager.allocate_page().unwrap();
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page[0..4].copy_from_slice(b"temp");
+        }
+
+        // Force eviction of the dirty page by loading page 0 into a 1-frame pool.
+        let _ = pager.read_page(0).unwrap();
+
+        // Re-load page 1; it should come from spill state, not disk.
+        let page = pager.read_page(page_num).unwrap();
+        assert_eq!(&page[0..4], b"temp");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dirty_eviction_is_not_durable_without_commit() {
+        let path = temp_db_path("dirty_evict_not_durable_without_commit.db");
+        cleanup(&path);
+
+        {
+            let mut pager = Pager::open_with_pool_size(&path, 1).unwrap();
+            let page_num = pager.allocate_page().unwrap();
+            {
+                let page = pager.write_page(page_num).unwrap();
+                page[0..4].copy_from_slice(b"base");
+            }
+            pager.commit().unwrap();
+        }
+
+        {
+            let mut pager = Pager::open_with_pool_size(&path, 1).unwrap();
+            {
+                let page = pager.write_page(1).unwrap();
+                page[0..4].copy_from_slice(b"temp");
+            }
+            // Evict dirty page 1 without committing.
+            let _ = pager.read_page(0).unwrap();
+            let page = pager.read_page(1).unwrap();
+            assert_eq!(&page[0..4], b"temp");
+        }
+
+        {
+            let mut reopened = Pager::open(&path).unwrap();
+            let page = reopened.read_page(1).unwrap();
+            assert_eq!(&page[0..4], b"base");
+        }
+
         cleanup(&path);
     }
 
