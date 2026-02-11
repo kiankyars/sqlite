@@ -54,7 +54,7 @@ Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (LEFT JOIN parser/execution support): pass, 0 failed (140 tests).
 - `./test.sh --fast` (LEFT JOIN parser/execution support, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-planner` (`IN` multi-probe planner support): pass, 0 failed (24 tests).
-- `cargo test -p ralph-sqlite` (`IN` multi-probe integration coverage): pass, 0 failed (77 tests).
+- `cargo test -p ralph-sqlite` (`IN` multi-probe integration coverage): pass, 0 failed (79 tests).
 - `./test.sh --fast` (`IN` multi-probe verification, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-sqlite` (OR predicate index-union support): pass, 0 failed (88 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (OR predicate index-union support, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
