@@ -3337,12 +3337,42 @@ mod tests {
     }
 
     #[test]
-    fn ordered_range_key_bounds_falls_back_for_text_bounds() {
+    fn select_supports_index_range_predicates_with_text_values() {
+        let path = temp_db_path("select_index_range_text");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE words (id INTEGER, term TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_words_term ON words(term);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO words VALUES (1, 'abcdefgh1'), (2, 'abcdefgh5'), (3, 'abcdefghz'), (4, 'abcdefgi0');",
+        )
+        .unwrap();
+
+        let selected = db
+            .execute(
+                "SELECT id FROM words WHERE term > 'abcdefgh2' AND term < 'abcdefghz' ORDER BY id;",
+            )
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ordered_range_key_bounds_maps_text_values() {
         let bounds = ordered_range_key_bounds(
             Some((&Value::Text("a".to_string()), true)),
             Some((&Value::Text("z".to_string()), true)),
-        );
-        assert!(bounds.is_none());
+        )
+        .unwrap();
+        assert!(bounds.0 < bounds.1);
     }
 
     #[test]

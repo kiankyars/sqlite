@@ -35,12 +35,14 @@ Latest completions:
 - B+tree delete leaf occupancy rebalance in `crates/storage` (Agent codex) — delete underflow now triggers on low logical leaf occupancy (not only empty pages), with sibling merge when combined pages fit and sibling redistribution plus parent separator-key updates when they do not
 - B+tree delete interior occupancy rebalance in `crates/storage` (Agent codex) — interior delete underflow now triggers on low logical interior occupancy (not only empty pages), with sibling merge/redistribution and parent separator-key updates
 - SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
-- Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable (with scan-all fallback for non-orderable bounds such as text)
+- Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable
+- Ordered range index seeks for text bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — text index keys now use an order-preserving 8-byte prefix encoding so `IndexRange` plans can seek on text bounds (with value-level filtering retained for strict bound semantics)
 
 Recommended next step:
-- Move secondary-index keying for non-numeric values to an order-preserving encoding so range predicates can avoid full index scans for text-like bounds.
+- Improve text index key encoding beyond fixed 8-byte prefixes to reduce collision-heavy scans for long shared prefixes while preserving order.
 
 Test pass rate:
+- `cargo test -p ralph-executor -p ralph-sqlite` (ordered text range index seeks): pass, 0 failed (56 tests).
 - `cargo test -p ralph-executor` (ordered range index seek keying): pass, 0 failed (13 tests).
 - `cargo test -p ralph-planner` (post-range-seek sanity): pass, 0 failed (13 tests).
 - `cargo test -p ralph-sqlite` (ordered range index seeks): pass, 0 failed (41 tests).
@@ -126,6 +128,7 @@ Test pass rate:
 24. ~~SELECT `GROUP BY` / `HAVING` execution semantics~~ ✓
 25. ~~Ordered range index seeks for index range predicates~~ ✓
 26. ~~B+tree interior occupancy rebalance~~ ✓
+27. ~~Ordered text range index seeks~~ ✓
 
 ## Completed Tasks
 
@@ -283,13 +286,17 @@ Test pass rate:
   - `index_key_for_value` now emits order-preserving keys for numeric values while preserving hash-key fallback for non-orderable values
   - `IndexRange` candidate reads now use `BTree::scan_range` for orderable bounds, with full index scan fallback otherwise
   - Added executor and integration coverage; see `notes/ordered-range-index-seeks.md`
+- [x] Ordered text range index seeks (agent codex)
+  - `ordered_index_key_for_value` now emits order-preserving keys for `TEXT` values via an 8-byte lexicographic prefix encoding
+  - Existing `IndexRange` candidate reads now perform B+tree range seeks for text bounds, with value-level filtering retained for strict comparison semantics
+  - Added executor and integration coverage; see `notes/ordered-text-range-index-seeks.md`
 
 ## Known Issues
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
-- Range index planning now uses ordered key-range scans for numeric bounds and falls back to full index-bucket scans for non-orderable bounds (for example text), because those values still use hash keys.
+- Range index planning now uses ordered key-range scans for numeric and text bounds; text uses an 8-byte prefix key encoding, so long shared prefixes can still cause collision-heavy scans within matched key ranges.
 - No JOIN support (single-table FROM only)
 - No subquery support
 - Multi-column and UNIQUE index execution are not supported yet.

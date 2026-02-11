@@ -645,6 +645,7 @@ pub fn ordered_index_key_for_value(value: &Value) -> Option<i64> {
     match value {
         Value::Integer(i) => Some(ordered_numeric_key(*i as f64)),
         Value::Real(f) if !f.is_nan() => Some(ordered_numeric_key(*f)),
+        Value::Text(text) => Some(ordered_text_key(text)),
         _ => None,
     }
 }
@@ -692,6 +693,23 @@ fn ordered_numeric_key(value: f64) -> i64 {
     } else {
         bits ^ (1u64 << 63)
     };
+    sortable_u64_to_i64(sortable_u64)
+}
+
+fn ordered_text_key(value: &str) -> i64 {
+    // Use an 8-byte lexicographic prefix key. This preserves order for
+    // differently-prefixed strings and is non-decreasing for all strings.
+    // Longer strings sharing the same first 8 bytes intentionally collide and
+    // are disambiguated by value-level bucket filtering at read time.
+    let mut prefix = [0u8; 8];
+    let bytes = value.as_bytes();
+    let copy_len = bytes.len().min(prefix.len());
+    prefix[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    let sortable_u64 = u64::from_be_bytes(prefix);
+    sortable_u64_to_i64(sortable_u64)
+}
+
+fn sortable_u64_to_i64(sortable_u64: u64) -> i64 {
     let sortable_i64 = sortable_u64 ^ (1u64 << 63);
     i64::from_be_bytes(sortable_i64.to_be_bytes())
 }
@@ -918,7 +936,18 @@ mod tests {
     }
 
     #[test]
-    fn ordered_index_key_ignores_text_values() {
-        assert!(ordered_index_key_for_value(&Value::Text("x".to_string())).is_none());
+    fn ordered_index_key_is_monotonic_for_text_values() {
+        let ka = ordered_index_key_for_value(&Value::Text("apple".to_string())).unwrap();
+        let kb = ordered_index_key_for_value(&Value::Text("banana".to_string())).unwrap();
+        let kc = ordered_index_key_for_value(&Value::Text("banana~".to_string())).unwrap();
+        assert!(ka < kb);
+        assert!(kb < kc);
+    }
+
+    #[test]
+    fn ordered_index_key_collides_for_text_prefixes_longer_than_eight_bytes() {
+        let k1 = ordered_index_key_for_value(&Value::Text("abcdefgh".to_string())).unwrap();
+        let k2 = ordered_index_key_for_value(&Value::Text("abcdefgh_suffix".to_string())).unwrap();
+        assert_eq!(k1, k2);
     }
 }
