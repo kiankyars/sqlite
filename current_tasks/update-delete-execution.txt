@@ -1,3 +1,0 @@
-created_at_unix=1770787636
-agent_id=3
-task=UPDATE and DELETE execution

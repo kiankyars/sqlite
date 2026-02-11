@@ -10,10 +10,12 @@ Latest completions:
 - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
 - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
 - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+- B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
 
 Test pass rate:
 - `cargo test --workspace`: passing.
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
+- `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
 
 ## Prioritized Task Backlog
@@ -73,10 +75,15 @@ Test pass rate:
   - Supports `SELECT *`, projected expressions, simple `WHERE`, and `LIMIT/OFFSET` (no `ORDER BY` yet)
   - 3 new integration-focused unit tests in `crates/ralph-sqlite/src/lib.rs`
   - See `notes/end-to-end-create-insert-select.md` for implementation details and limitations
+- [x] B+tree delete primitive (agent 3)
+  - Added `BTree::delete(key) -> io::Result<bool>` to remove keys from the target leaf
+  - Traverses interior nodes to locate the leaf; returns `false` when key is absent
+  - Added tests for deleting existing/missing keys and deleting after leaf splits
 
 ## Known Issues
 
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
+- B+tree delete currently does not rebalance/merge underflowing nodes (deferred to task #18).
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support

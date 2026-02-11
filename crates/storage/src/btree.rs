@@ -115,6 +115,14 @@ impl<'a> BTree<'a> {
         self.lookup_in(self.root_page, key)
     }
 
+    /// Delete a key from the tree. Returns true if a row was deleted.
+    ///
+    /// This currently removes keys from the target leaf only; it does not
+    /// rebalance or merge underflowing nodes.
+    pub fn delete(&mut self, key: i64) -> io::Result<bool> {
+        self.delete_from(self.root_page, key)
+    }
+
     /// Return all entries in key order via leaf-linked scan.
     pub fn scan_all(&mut self) -> io::Result<Vec<Entry>> {
         // Find the leftmost leaf.
@@ -393,6 +401,39 @@ impl<'a> BTree<'a> {
                     find_child(page, key)
                 };
                 self.lookup_in(child, key)
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown page type: {}", other),
+            )),
+        }
+    }
+
+    fn delete_from(&mut self, page_num: PageNum, key: i64) -> io::Result<bool> {
+        let page = self.pager.read_page(page_num)?;
+        let page_type = page[0];
+
+        match page_type {
+            PAGE_TYPE_LEAF => {
+                let idx = {
+                    let page = self.pager.read_page(page_num)?;
+                    find_cell_by_key_leaf(page, key)
+                };
+                if let Some(idx) = idx {
+                    let page_size = self.pager.page_size();
+                    let page = self.pager.write_page(page_num)?;
+                    delete_leaf_cell(page, page_size, idx);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            PAGE_TYPE_INTERIOR => {
+                let child = {
+                    let page = self.pager.read_page(page_num)?;
+                    find_child(page, key)
+                };
+                self.delete_from(child, key)
             }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -938,6 +979,67 @@ mod tests {
         let entries = tree.scan_range(50, 120).unwrap();
         let keys: Vec<i64> = entries.iter().map(|e| e.key).collect();
         assert_eq!(keys, vec![50, 60, 70, 80, 90, 100, 110, 120]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_existing_and_missing_keys() {
+        let path = temp_db_path("btree_delete.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let mut tree = BTree::new(&mut pager, root);
+
+        tree.insert(10, b"ten").unwrap();
+        tree.insert(20, b"twenty").unwrap();
+        tree.insert(30, b"thirty").unwrap();
+
+        assert!(tree.delete(20).unwrap());
+        assert_eq!(tree.lookup(20).unwrap(), None);
+        assert!(!tree.delete(20).unwrap());
+
+        assert_eq!(tree.lookup(10).unwrap(), Some(b"ten".to_vec()));
+        assert_eq!(tree.lookup(30).unwrap(), Some(b"thirty".to_vec()));
+
+        let keys: Vec<i64> = tree.scan_all().unwrap().into_iter().map(|e| e.key).collect();
+        assert_eq!(keys, vec![10, 30]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_after_leaf_splits() {
+        let path = temp_db_path("btree_delete_split.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let mut tree = BTree::new(&mut pager, root);
+
+        let payload = vec![0xAA; 80];
+        for i in 0..80 {
+            tree.insert(i, &payload).unwrap();
+        }
+
+        for key in [0_i64, 1, 10, 39, 40, 79] {
+            assert!(tree.delete(key).unwrap(), "expected key {} to be deleted", key);
+            assert_eq!(tree.lookup(key).unwrap(), None);
+        }
+
+        for key in [2_i64, 11, 41, 78] {
+            assert_eq!(tree.lookup(key).unwrap(), Some(payload.clone()));
+        }
+
+        let keys: Vec<i64> = tree.scan_all().unwrap().into_iter().map(|e| e.key).collect();
+        assert_eq!(keys.len(), 74);
+        assert!(!keys.contains(&0));
+        assert!(!keys.contains(&1));
+        assert!(!keys.contains(&10));
+        assert!(!keys.contains(&39));
+        assert!(!keys.contains(&40));
+        assert!(!keys.contains(&79));
 
         cleanup(&path);
     }
