@@ -41,6 +41,9 @@ pub enum AccessPath {
         lower: Option<RangeBound>,
         upper: Option<RangeBound>,
     },
+    IndexOr {
+        branches: Vec<AccessPath>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,8 +67,21 @@ pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -
 }
 
 fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
-    choose_index_eq_access(expr, table_name, indexes)
-        .or_else(|| choose_index_range_access(expr, table_name, indexes))
+    match expr {
+        Expr::Paren(inner) => choose_index_access(inner, table_name, indexes),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => choose_index_access(left, table_name, indexes)
+            .or_else(|| choose_index_access(right, table_name, indexes)),
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        } => choose_index_or_access(expr, table_name, indexes),
+        _ => choose_index_eq_access(expr, table_name, indexes)
+            .or_else(|| choose_index_range_access(expr, table_name, indexes)),
+    }
 }
 
 fn choose_index_eq_access(
@@ -74,12 +90,6 @@ fn choose_index_eq_access(
     indexes: &[IndexInfo],
 ) -> Option<AccessPath> {
     match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => choose_index_eq_access(left, table_name, indexes)
-            .or_else(|| choose_index_eq_access(right, table_name, indexes)),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
@@ -96,12 +106,6 @@ fn choose_index_range_access(
     indexes: &[IndexInfo],
 ) -> Option<AccessPath> {
     match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => choose_index_range_access(left, table_name, indexes)
-            .or_else(|| choose_index_range_access(right, table_name, indexes)),
         Expr::BinaryOp { left, op, right } => {
             plan_index_range_binary(left, *op, right, table_name, indexes).or_else(|| {
                 invert_comparison(*op).and_then(|inverted| {
@@ -145,6 +149,48 @@ fn choose_index_range_access(
             })
         }
         _ => None,
+    }
+}
+
+fn choose_index_or_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    let mut terms = Vec::new();
+    collect_or_terms(expr, &mut terms);
+    if terms.len() < 2 {
+        return None;
+    }
+
+    let mut branches = Vec::with_capacity(terms.len());
+    for term in terms {
+        let branch = choose_index_access(term, table_name, indexes)?;
+        match branch {
+            AccessPath::IndexOr { branches: nested } => branches.extend(nested),
+            other => branches.push(other),
+        }
+    }
+
+    if branches.len() < 2 {
+        return None;
+    }
+
+    Some(AccessPath::IndexOr { branches })
+}
+
+fn collect_or_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Paren(inner) => collect_or_terms(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            collect_or_terms(left, out);
+            collect_or_terms(right, out);
+        }
+        _ => out.push(expr),
     }
 }
 
@@ -440,6 +486,63 @@ mod tests {
     }
 
     #[test]
+    fn chooses_index_or_for_or_equality_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 42 OR age = 9;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        column: "score".to_string(),
+                        value_expr: Expr::IntegerLiteral(42),
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_age".to_string(),
+                        column: "age".to_string(),
+                        value_expr: Expr::IntegerLiteral(9),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_index_or_for_mixed_or_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 42 OR age > 9;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        column: "score".to_string(),
+                        value_expr: Expr::IntegerLiteral(42),
+                    },
+                    AccessPath::IndexRange {
+                        index_name: "idx_t_age".to_string(),
+                        column: "age".to_string(),
+                        lower: Some(RangeBound {
+                            value_expr: Expr::IntegerLiteral(9),
+                            inclusive: false,
+                        }),
+                        upper: None,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn falls_back_when_or_branch_has_no_index() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 42 OR id = 1;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(plan.access_path, AccessPath::TableScan);
+    }
+
+    #[test]
     fn falls_back_when_rhs_uses_columns() {
         let stmt = parse_select("SELECT * FROM t WHERE score = age;");
         let plan = plan_select(&stmt, "t", &default_indexes());
@@ -499,6 +602,29 @@ mod tests {
                     value_expr: Expr::IntegerLiteral(99),
                     inclusive: true,
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_chooses_index_or_for_or_predicate() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 42 OR age = 9;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        column: "score".to_string(),
+                        value_expr: Expr::IntegerLiteral(42),
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_age".to_string(),
+                        column: "age".to_string(),
+                        value_expr: Expr::IntegerLiteral(9),
+                    },
+                ],
             }
         );
     }

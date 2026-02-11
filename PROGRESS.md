@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + range + OR unions) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -42,11 +42,14 @@ Latest completions:
 - INNER JOIN / CROSS JOIN execution in `crates/parser` + `crates/ralph-sqlite` (Agent opus) — parser now supports `JOIN`, `INNER JOIN`, `CROSS JOIN`, and comma cross join syntax with ON conditions and table aliases; execution performs nested-loop cross-product joins with ON/WHERE filtering, qualified column resolution, and full ORDER BY/LIMIT support
 - Multi-column secondary index execution in `crates/ralph-sqlite` + `crates/storage` (Agent codex) — `CREATE INDEX`/`CREATE UNIQUE INDEX` now execute for multi-column definitions with tuple-based backfill + INSERT/UPDATE/DELETE maintenance and tuple UNIQUE enforcement (`NULL`-tolerant), with schema reload preserving behavior across reopen
 - JOIN `GROUP BY` / `HAVING` aggregate execution in `crates/ralph-sqlite` (Agent codex) — join SELECT path now supports grouped and aggregate evaluation with HAVING/ORDER BY/LIMIT/OFFSET semantics, including aggregate HAVING without GROUP BY and SQLite-style bare-column aggregate errors; see `notes/join-group-by-having-execution.md`
+- OR predicate index-union planning/execution in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits `IndexOr` when all OR branches are indexable (including mixed equality/range branches), and SELECT/UPDATE/DELETE candidate reads now union + deduplicate branch rowids before residual WHERE filtering; see `notes/query-planner-range-selection.md`
 
 Recommended next step:
 - Add planner/execution support to use multi-column indexes for matching multi-column predicates.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-sqlite` (OR predicate index-union support): pass, 0 failed (88 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (OR predicate index-union support, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' cargo test -p ralph-sqlite` (JOIN `GROUP BY` / `HAVING` execution): pass, 0 failed (68 tests).
 - `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' ./test.sh --fast` (JOIN `GROUP BY` / `HAVING` execution, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (text index overlap key encoding): pass, 0 failed (15 tests).
@@ -154,6 +157,7 @@ Test pass rate:
 29. ~~INNER JOIN / CROSS JOIN execution~~ ✓
 30. ~~Text index overlap key encoding for long shared prefixes~~ ✓
 31. ~~JOIN `GROUP BY` / `HAVING` aggregate execution~~ ✓
+32. ~~OR predicate index-union planning/execution~~ ✓
 
 ## Completed Tasks
 
@@ -268,6 +272,10 @@ Test pass rate:
   - Added `ralph-sqlite` range-candidate row reads for planner-driven SELECT/UPDATE/DELETE paths
   - Added planner unit tests plus integration coverage for SELECT and UPDATE range predicates
   - See `notes/query-planner-range-selection.md` for implementation details and current hash-index limitation
+- [x] OR predicate index-union planning/execution (agent codex)
+  - Added `AccessPath::IndexOr` planning for OR predicates when all OR branches are individually indexable
+  - Added execution union/dedup candidate reads for OR branches with residual WHERE filtering preserved
+  - Added planner tests and integration coverage for SELECT/UPDATE/DELETE OR predicates; see `notes/query-planner-range-selection.md`
 - [x] Expression evaluation in `crates/executor` (agent codex)
   - Added `eval_expr(&Expr, row_ctx)` support for literals, column refs, unary/binary ops, `IS NULL`, `BETWEEN`, and `IN (...)`
   - Added `Filter::from_expr(...)` and `Project::from_exprs(...)` helpers to evaluate parser AST expressions in execution pipelines
@@ -344,7 +352,7 @@ Test pass rate:
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
-- Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
+- Query planning currently supports single-table equality/range predicates and OR unions on single-column secondary indexes; multi-index AND-intersection and cost-based planning are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support is limited to INNER JOIN and CROSS JOIN; LEFT/RIGHT/FULL OUTER JOIN not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support

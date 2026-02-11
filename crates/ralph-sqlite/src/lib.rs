@@ -949,6 +949,20 @@ impl Database {
                 )?;
                 self.lookup_table_entries_by_rowids(meta.root_page, rowids)
             }
+            AccessPath::IndexOr { branches } => {
+                let mut entries = Vec::new();
+                let mut seen_rowids = HashSet::new();
+                for branch in branches {
+                    let branch_entries = self.read_candidate_entries(meta, branch)?;
+                    for entry in branch_entries {
+                        if seen_rowids.insert(entry.key) {
+                            entries.push(entry);
+                        }
+                    }
+                }
+                entries.sort_by_key(|entry| entry.key);
+                Ok(entries)
+            }
         }
     }
 
@@ -1081,7 +1095,10 @@ impl Database {
         where_clause: Option<&Expr>,
         access_path: &AccessPath,
     ) -> Result<Vec<Vec<Value>>, String> {
-        if let AccessPath::IndexRange { .. } = access_path {
+        if matches!(
+            access_path,
+            AccessPath::IndexRange { .. } | AccessPath::IndexOr { .. }
+        ) {
             let entries = self.read_candidate_entries(meta, access_path)?;
             let mut rows = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -1116,6 +1133,7 @@ impl Database {
                 ))
             }
             AccessPath::IndexRange { .. } => unreachable!("handled above"),
+            AccessPath::IndexOr { .. } => unreachable!("handled above"),
         };
 
         let root_op: Box<dyn Operator + '_> = if let Some(expr) = where_clause {
@@ -4879,6 +4897,115 @@ mod tests {
             indexed_rowids(&mut db, "idx_users_score", &Value::Integer(20)),
             vec![2]
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_supports_index_or_predicates() {
+        let path = temp_db_path("select_index_or");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 20), (2, 20, 30), (3, 10, 40), (4, 30, 45), (5, 20, 50);",
+        )
+        .unwrap();
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE score = 10 OR age > 35 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1)],
+                        vec![Value::Integer(3)],
+                        vec![Value::Integer(4)],
+                        vec![Value::Integer(5)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_index_for_or_predicate() {
+        let path = temp_db_path("update_index_or");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 20, 'a'), (2, 20, 30, 'b'), (3, 10, 40, 'c'), (4, 30, 40, 'd');",
+        )
+        .unwrap();
+
+        let updated = db
+            .execute("UPDATE users SET label = 'hit' WHERE score = 10 OR age = 40;")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 3 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("hit".to_string())],
+                        vec![Value::Integer(2), Value::Text("b".to_string())],
+                        vec![Value::Integer(3), Value::Text("hit".to_string())],
+                        vec![Value::Integer(4), Value::Text("hit".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_index_for_or_predicate() {
+        let path = temp_db_path("delete_index_or");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 20, 30), (3, 10, 40), (4, 30, 40);")
+            .unwrap();
+
+        let deleted = db
+            .execute("DELETE FROM users WHERE score = 10 OR age = 40;")
+            .unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 3 });
+
+        let selected = db.execute("SELECT id FROM users;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

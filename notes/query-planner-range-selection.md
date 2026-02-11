@@ -39,3 +39,14 @@ Secondary index keys are hash-based (`fnv1a`), not value-ordered. Because of tha
 1. Add OR/IN multi-probe planning for indexed equality terms.
 2. Move secondary index keying from hash-only to order-preserving encoded keys to enable true ordered range seeks.
 3. Add simple cost heuristics to choose between table scan and index-range candidate scan.
+
+## Follow-up completed: OR predicate index unions
+
+Planner and execution now support `OR` index unions for single-table/single-column index predicates:
+
+- Planner adds `AccessPath::IndexOr { branches }`.
+- OR paths are planned only when all OR branches are independently indexable.
+- Branches can mix equality and range paths.
+- Execution unions and deduplicates branch-selected rowids, then reapplies full WHERE filtering.
+
+This closes the OR-planning gap from this note's suggested next steps while preserving correctness for mixed predicates.
