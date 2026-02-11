@@ -509,6 +509,7 @@ impl<'a> BTree<'a> {
             let child_bytes = self.pager.read_page(only_child)?.to_vec();
             let root = self.pager.write_page(self.root_page)?;
             root.copy_from_slice(&child_bytes);
+            self.pager.free_page(only_child)?;
         }
 
         Ok(())
@@ -564,6 +565,7 @@ impl<'a> BTree<'a> {
 
             parent.keys.remove(0);
             parent.children.remove(1);
+            self.pager.free_page(right_sibling_page_num)?;
         } else {
             let left_sibling_page_num = parent.children[child_idx - 1];
             let child_page_num = parent.children[child_idx];
@@ -576,6 +578,7 @@ impl<'a> BTree<'a> {
 
             parent.keys.remove(child_idx - 1);
             parent.children.remove(child_idx);
+            self.pager.free_page(child_page_num)?;
         }
 
         let page = self.pager.write_page(parent_page_num)?;
@@ -614,6 +617,7 @@ impl<'a> BTree<'a> {
         parent.children[child_idx] = only_grandchild;
         let page = self.pager.write_page(parent_page_num)?;
         write_interior_node(page, page_size, &parent);
+        self.pager.free_page(child_page_num)?;
         Ok(())
     }
 
@@ -1367,6 +1371,35 @@ mod tests {
             page[0]
         };
         assert_eq!(root_type, PAGE_TYPE_LEAF);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_compaction_reclaims_pages_to_freelist() {
+        let path = temp_db_path("btree_delete_reclaim_freelist.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        {
+            let mut tree = BTree::new(&mut pager, root);
+            let payload = vec![0xC7; 80];
+            for i in 0..300 {
+                tree.insert(i, &payload).unwrap();
+            }
+            for key in 0..299 {
+                assert!(tree.delete(key).unwrap());
+            }
+        }
+
+        let reclaimed = pager.header().freelist_count;
+        assert!(reclaimed > 0);
+        let page_count_before = pager.page_count();
+        for _ in 0..reclaimed {
+            pager.allocate_page().unwrap();
+        }
+        assert_eq!(pager.page_count(), page_count_before);
 
         cleanup(&path);
     }

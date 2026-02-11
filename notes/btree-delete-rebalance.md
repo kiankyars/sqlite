@@ -21,5 +21,5 @@ Both are in `crates/storage/src/btree.rs` and exercise root-height reduction/com
 ## Important behavior notes
 
 - Rebalancing currently triggers on **empty-node underflow** (`cell_count == 0`), not byte-level occupancy thresholds.
-- Reclaimed pages are not returned to freelist yet (no public `free_page()` API in pager), so this is logical compaction of tree structure, not physical page reclamation.
+- Follow-up task wired reclaimed pages to pager freelist (`notes/btree-delete-freelist-reclamation.md`), so delete compaction now performs physical page reclamation as well.
 - Root page number stability is preserved during delete compaction, which avoids catalog updates in higher layers.

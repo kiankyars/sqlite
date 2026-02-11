@@ -27,8 +27,11 @@ Latest completions:
 - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
 - Schema persistence integration in `crates/storage` + `crates/ralph-sqlite` (Agent codex) — `Database::open` now loads persisted table/index catalogs from schema entries, `CREATE TABLE`/`CREATE INDEX` now persist metadata via `Schema`, and reopen retains both table and index catalogs
 - Transactional dirty-page eviction isolation in `crates/storage` (Agent codex) — dirty LRU victims now spill to an in-memory pending-dirty map instead of writing directly to the DB file; `flush_all` now commits both buffered and spilled dirty pages via WAL, preserving rollback correctness when eviction occurs before COMMIT
+- B+tree delete freelist reclamation in `crates/storage` (Agent 3) — delete-time compaction now returns removed leaf/interior/root-child pages to `Pager::free_page()` so reclaimed pages are reusable via the freelist
 
 Test pass rate:
+- `cargo test -p ralph-storage` (B+tree delete freelist reclamation): pass, 0 failed (46 tests).
+- `./test.sh --fast` (B+tree delete freelist reclamation, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
 - `cargo test -p ralph-storage -p ralph-sqlite` (schema persistence integration): pass, 0 failed.
 - `cargo test --workspace` (schema persistence integration): pass, 0 failed.
@@ -142,6 +145,10 @@ Test pass rate:
   - Added parent-level rebalancing: remove/compact empty leaf children and collapse empty interior children to their remaining subtree
   - Added root compaction that preserves root page number by copying the only child page into the root when root has 0 separator keys
   - Added storage tests for root compaction on split and multi-level trees; see `notes/btree-delete-rebalance.md`
+- [x] B+tree delete compaction freelist reclamation (agent 3)
+  - Wired `Pager::free_page()` into delete compaction paths so removed leaf/interior pages are returned to freelist
+  - Added `delete_compaction_reclaims_pages_to_freelist` coverage in storage tests
+  - See `notes/btree-delete-freelist-reclamation.md`
 - [x] End-to-end UPDATE/DELETE execution in `crates/ralph-sqlite` (agent codex)
   - Added statement dispatch for `Stmt::Update` / `Stmt::Delete`
   - Added `ExecuteResult::Update { rows_affected }` and `ExecuteResult::Delete { rows_affected }`
@@ -201,7 +208,7 @@ Test pass rate:
 
 ## Known Issues
 
-- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+- Pager now exposes `free_page()` and B+tree delete compaction reclaims removed pages, but broader page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
 - UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.

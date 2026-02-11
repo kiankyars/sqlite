@@ -1,3 +1,0 @@
-created_at_unix=1770808506
-agent_id=3
-task=Return B+tree pages reclaimed during delete compaction to pager freelist
