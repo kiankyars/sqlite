@@ -1,3 +1,0 @@
-created_at_unix=1770787500
-agent_id=1
-task=Volcano iterator model, expression evaluator, and basic planner
