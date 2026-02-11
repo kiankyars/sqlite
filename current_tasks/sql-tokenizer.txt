@@ -1,3 +1,0 @@
-created_at_unix=1770786580
-agent_id=3
-task=SQL tokenizer (lexer) in ralph-parser
