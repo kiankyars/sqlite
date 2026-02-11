@@ -47,7 +47,7 @@ Recommended next step:
 - Add planner/execution support to use multi-column indexes for matching multi-column predicates.
 
 Test pass rate:
-- `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' cargo test -p ralph-sqlite` (JOIN `GROUP BY` / `HAVING` execution): pass, 0 failed (62 tests).
+- `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' cargo test -p ralph-sqlite` (JOIN `GROUP BY` / `HAVING` execution): pass, 0 failed (68 tests).
 - `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' ./test.sh --fast` (JOIN `GROUP BY` / `HAVING` execution, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (text index overlap key encoding): pass, 0 failed (15 tests).
 - `cargo test -p ralph-sqlite` (text index overlap key encoding): pass, 0 failed (59 tests).
