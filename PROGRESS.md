@@ -18,11 +18,13 @@ Latest completions:
 - SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
 - SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
 - Volcano iterator model in `crates/executor` (Agent codex) — added `Operator` trait and concrete `Scan`, `Filter`, and `Project` operators with callback-based predicate/projection hooks and pipeline tests
+- B+tree delete rebalance/merge for empty-node underflow with root compaction in `crates/storage` (Agent codex)
 
 Test pass rate:
-- `cargo test --workspace` (task #12 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+- `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+- `cargo test -p ralph-storage` (task #18 implementation): pass, 0 failed (29 tests).
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh --fast` (task #17 verification, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
@@ -53,7 +55,7 @@ Test pass rate:
 15. ~~WAL write path and commit~~ ✓
 16. Checkpoint and crash recovery
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
-18. B+tree split/merge
+18. ~~B+tree split/merge~~ ✓
 19. ~~ORDER BY, LIMIT, aggregates~~ ✓
 
 ## Completed Tasks
@@ -95,6 +97,11 @@ Test pass rate:
   - Added `BTree::delete(key) -> io::Result<bool>` to remove keys from the target leaf
   - Traverses interior nodes to locate the leaf; returns `false` when key is absent
   - Added tests for deleting existing/missing keys and deleting after leaf splits
+- [x] B+tree delete rebalance/merge for empty-node underflow (agent codex)
+  - Added recursive delete underflow propagation for leaf and interior pages
+  - Added parent-level rebalancing: remove/compact empty leaf children and collapse empty interior children to their remaining subtree
+  - Added root compaction that preserves root page number by copying the only child page into the root when root has 0 separator keys
+  - Added storage tests for root compaction on split and multi-level trees; see `notes/btree-delete-rebalance.md`
 - [x] End-to-end UPDATE/DELETE execution in `crates/ralph-sqlite` (agent codex)
   - Added statement dispatch for `Stmt::Update` / `Stmt::Delete`
   - Added `ExecuteResult::Update { rows_affected }` and `ExecuteResult::Delete { rows_affected }`
@@ -129,10 +136,10 @@ Test pass rate:
 ## Known Issues
 
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
-- B+tree delete currently does not rebalance/merge underflowing nodes (deferred to task #18).
 - WAL replay and checkpoint are not implemented yet (deferred to task #16).
 - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
 - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+- B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
 - UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)

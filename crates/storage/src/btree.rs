@@ -92,7 +92,11 @@ impl<'a> BTree<'a> {
     /// Insert a key-value pair. If the key already exists, the payload is updated.
     pub fn insert(&mut self, key: i64, payload: &[u8]) -> io::Result<()> {
         let result = self.insert_into(self.root_page, key, payload)?;
-        if let InsertResult::Split { median_key, new_page } = result {
+        if let InsertResult::Split {
+            median_key,
+            new_page,
+        } = result
+        {
             // Root was split — create a new root.
             let page_size = self.pager.page_size();
             let new_root = self.pager.allocate_page()?;
@@ -116,11 +120,12 @@ impl<'a> BTree<'a> {
     }
 
     /// Delete a key from the tree. Returns true if a row was deleted.
-    ///
-    /// This currently removes keys from the target leaf only; it does not
-    /// rebalance or merge underflowing nodes.
     pub fn delete(&mut self, key: i64) -> io::Result<bool> {
-        self.delete_from(self.root_page, key)
+        let result = self.delete_from(self.root_page, key, true)?;
+        if result.deleted {
+            self.compact_root_if_possible()?;
+        }
+        Ok(result.deleted)
     }
 
     /// Return all entries in key order via leaf-linked scan.
@@ -221,7 +226,10 @@ impl<'a> BTree<'a> {
 
         match result {
             InsertResult::Ok => Ok(InsertResult::Ok),
-            InsertResult::Split { median_key, new_page } => {
+            InsertResult::Split {
+                median_key,
+                new_page,
+            } => {
                 let page_size = self.pager.page_size();
 
                 let has_room = {
@@ -315,7 +323,10 @@ impl<'a> BTree<'a> {
         // Insert the new entry: (new_key, new_child) means new_child is the
         // right sibling of the child whose split produced new_key.
         // We need to find where new_key fits and adjust child pointers.
-        let insert_pos = entries.iter().position(|(k, _)| *k > new_key).unwrap_or(entries.len());
+        let insert_pos = entries
+            .iter()
+            .position(|(k, _)| *k > new_key)
+            .unwrap_or(entries.len());
 
         // The new_child becomes the right pointer for new_key's cell.
         // The left pointer is the previous right pointer at that position.
@@ -409,7 +420,12 @@ impl<'a> BTree<'a> {
         }
     }
 
-    fn delete_from(&mut self, page_num: PageNum, key: i64) -> io::Result<bool> {
+    fn delete_from(
+        &mut self,
+        page_num: PageNum,
+        key: i64,
+        is_root: bool,
+    ) -> io::Result<DeleteResult> {
         let page = self.pager.read_page(page_num)?;
         let page_type = page[0];
 
@@ -423,23 +439,182 @@ impl<'a> BTree<'a> {
                     let page_size = self.pager.page_size();
                     let page = self.pager.write_page(page_num)?;
                     delete_leaf_cell(page, page_size, idx);
-                    Ok(true)
+                    let underflow = !is_root && get_cell_count(page) == 0;
+                    Ok(DeleteResult {
+                        deleted: true,
+                        underflow,
+                    })
                 } else {
-                    Ok(false)
+                    Ok(DeleteResult {
+                        deleted: false,
+                        underflow: false,
+                    })
                 }
             }
             PAGE_TYPE_INTERIOR => {
+                let child_idx = {
+                    let page = self.pager.read_page(page_num)?;
+                    find_child_index(page, key)
+                };
                 let child = {
                     let page = self.pager.read_page(page_num)?;
-                    find_child(page, key)
+                    get_child_at_index(page, child_idx)
                 };
-                self.delete_from(child, key)
+
+                let child_result = self.delete_from(child, key, false)?;
+                if !child_result.deleted {
+                    return Ok(DeleteResult {
+                        deleted: false,
+                        underflow: false,
+                    });
+                }
+
+                if child_result.underflow {
+                    self.rebalance_underflowing_child(page_num, child_idx)?;
+                }
+
+                let underflow = if is_root {
+                    false
+                } else {
+                    let page = self.pager.read_page(page_num)?;
+                    get_cell_count(page) == 0
+                };
+
+                Ok(DeleteResult {
+                    deleted: true,
+                    underflow,
+                })
             }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown page type: {}", other),
             )),
         }
+    }
+
+    /// If the root is an interior page with no separator keys, copy its only
+    /// child into the root page. This preserves the externally-visible root
+    /// page number even when the tree height shrinks.
+    fn compact_root_if_possible(&mut self) -> io::Result<()> {
+        loop {
+            let (page_type, cell_count, only_child) = {
+                let root = self.pager.read_page(self.root_page)?;
+                (root[0], get_cell_count(root), get_right_child(root))
+            };
+
+            if page_type != PAGE_TYPE_INTERIOR || cell_count > 0 || only_child == 0 {
+                break;
+            }
+
+            let child_bytes = self.pager.read_page(only_child)?.to_vec();
+            let root = self.pager.write_page(self.root_page)?;
+            root.copy_from_slice(&child_bytes);
+        }
+
+        Ok(())
+    }
+
+    fn rebalance_underflowing_child(
+        &mut self,
+        parent_page_num: PageNum,
+        child_idx: usize,
+    ) -> io::Result<()> {
+        let child_page_num = {
+            let parent = self.pager.read_page(parent_page_num)?;
+            get_child_at_index(parent, child_idx)
+        };
+
+        let child_page_type = {
+            let child = self.pager.read_page(child_page_num)?;
+            child[0]
+        };
+
+        match child_page_type {
+            PAGE_TYPE_LEAF => self.rebalance_empty_leaf_child(parent_page_num, child_idx),
+            PAGE_TYPE_INTERIOR => self.rebalance_empty_interior_child(parent_page_num, child_idx),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown page type for underflowed child: {}", other),
+            )),
+        }
+    }
+
+    fn rebalance_empty_leaf_child(
+        &mut self,
+        parent_page_num: PageNum,
+        child_idx: usize,
+    ) -> io::Result<()> {
+        let page_size = self.pager.page_size();
+        let mut parent = {
+            let page = self.pager.read_page(parent_page_num)?;
+            read_interior_node(page)
+        };
+
+        if parent.children.len() <= 1 {
+            return Ok(());
+        }
+
+        if child_idx == 0 {
+            // Keep the leftmost child page number stable by copying the right sibling into it.
+            let child_page_num = parent.children[0];
+            let right_sibling_page_num = parent.children[1];
+            let right_sibling_bytes = self.pager.read_page(right_sibling_page_num)?.to_vec();
+            let child_page = self.pager.write_page(child_page_num)?;
+            child_page.copy_from_slice(&right_sibling_bytes);
+
+            parent.keys.remove(0);
+            parent.children.remove(1);
+        } else {
+            let left_sibling_page_num = parent.children[child_idx - 1];
+            let child_page_num = parent.children[child_idx];
+            let next_leaf = {
+                let child_page = self.pager.read_page(child_page_num)?;
+                get_next_leaf(child_page)
+            };
+            let left_page = self.pager.write_page(left_sibling_page_num)?;
+            set_next_leaf(left_page, next_leaf);
+
+            parent.keys.remove(child_idx - 1);
+            parent.children.remove(child_idx);
+        }
+
+        let page = self.pager.write_page(parent_page_num)?;
+        write_interior_node(page, page_size, &parent);
+        Ok(())
+    }
+
+    fn rebalance_empty_interior_child(
+        &mut self,
+        parent_page_num: PageNum,
+        child_idx: usize,
+    ) -> io::Result<()> {
+        let page_size = self.pager.page_size();
+        let mut parent = {
+            let page = self.pager.read_page(parent_page_num)?;
+            read_interior_node(page)
+        };
+        let child_page_num = parent.children[child_idx];
+        let only_grandchild = {
+            let child = self.pager.read_page(child_page_num)?;
+            if get_cell_count(child) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected underflowed interior child to have zero keys",
+                ));
+            }
+            get_right_child(child)
+        };
+        if only_grandchild == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "underflowed interior child had no remaining subtree",
+            ));
+        }
+
+        parent.children[child_idx] = only_grandchild;
+        let page = self.pager.write_page(parent_page_num)?;
+        write_interior_node(page, page_size, &parent);
+        Ok(())
     }
 
     fn find_leftmost_leaf(&mut self, page_num: PageNum) -> io::Result<PageNum> {
@@ -521,10 +696,18 @@ impl<'a> BTree<'a> {
 
 enum InsertResult {
     Ok,
-    Split {
-        median_key: i64,
-        new_page: PageNum,
-    },
+    Split { median_key: i64, new_page: PageNum },
+}
+
+struct DeleteResult {
+    deleted: bool,
+    underflow: bool,
+}
+
+#[derive(Debug)]
+struct InteriorNodeData {
+    keys: Vec<i64>,
+    children: Vec<PageNum>,
 }
 
 // ─── Page-level helpers ──────────────────────────────────────────────────────
@@ -781,19 +964,58 @@ fn read_all_interior_entries(page: &[u8]) -> Vec<(i64, PageNum)> {
     entries
 }
 
-/// Find which child page to descend into for a given key.
-fn find_child(page: &[u8], key: i64) -> PageNum {
+fn read_interior_node(page: &[u8]) -> InteriorNodeData {
+    let entries = read_all_interior_entries(page);
+    let mut keys = Vec::with_capacity(entries.len());
+    let mut children = Vec::with_capacity(entries.len() + 1);
+    for (key, left_child) in entries {
+        keys.push(key);
+        children.push(left_child);
+    }
+    children.push(get_right_child(page));
+    InteriorNodeData { keys, children }
+}
+
+fn write_interior_node(page: &mut [u8], page_size: usize, node: &InteriorNodeData) {
+    debug_assert_eq!(node.keys.len() + 1, node.children.len());
+
+    init_interior(page, page_size);
+    if node.children.is_empty() {
+        return;
+    }
+    set_right_child(page, *node.children.last().unwrap());
+    for i in 0..node.keys.len() {
+        insert_interior_cell(page, page_size, node.children[i], node.keys[i]);
+    }
+    set_right_child(page, *node.children.last().unwrap());
+}
+
+fn find_child_index(page: &[u8], key: i64) -> usize {
     let cell_count = get_cell_count(page);
     for i in 0..cell_count {
         let offset = get_cell_offset(page, i);
         let cell_key = i64::from_be_bytes(page[offset + 4..offset + 12].try_into().unwrap());
         if key < cell_key {
-            // Go to left child of this cell.
-            return u32::from_be_bytes(page[offset..offset + 4].try_into().unwrap());
+            return i;
         }
     }
-    // Key >= all keys: go to right child.
-    get_right_child(page)
+    cell_count
+}
+
+fn get_child_at_index(page: &[u8], idx: usize) -> PageNum {
+    let cell_count = get_cell_count(page);
+    if idx < cell_count {
+        let offset = get_cell_offset(page, idx);
+        u32::from_be_bytes(page[offset..offset + 4].try_into().unwrap())
+    } else {
+        get_right_child(page)
+    }
+}
+
+/// Find which child page to descend into for a given key.
+fn find_child(page: &[u8], key: i64) -> PageNum {
+    let idx = find_child_index(page, key);
+    get_child_at_index(page, idx)
 }
 
 // ─── Byte helpers ─────────────────────────────────────────────────────────────
@@ -950,7 +1172,12 @@ mod tests {
         // All entries should still be findable.
         for i in 0..50 {
             let result = tree.lookup(i).unwrap();
-            assert_eq!(result, Some(payload.clone()), "key {} not found after split", i);
+            assert_eq!(
+                result,
+                Some(payload.clone()),
+                "key {} not found after split",
+                i
+            );
         }
 
         // Scan should return all entries in order.
@@ -1003,7 +1230,12 @@ mod tests {
         assert_eq!(tree.lookup(10).unwrap(), Some(b"ten".to_vec()));
         assert_eq!(tree.lookup(30).unwrap(), Some(b"thirty".to_vec()));
 
-        let keys: Vec<i64> = tree.scan_all().unwrap().into_iter().map(|e| e.key).collect();
+        let keys: Vec<i64> = tree
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
         assert_eq!(keys, vec![10, 30]);
 
         cleanup(&path);
@@ -1024,7 +1256,11 @@ mod tests {
         }
 
         for key in [0_i64, 1, 10, 39, 40, 79] {
-            assert!(tree.delete(key).unwrap(), "expected key {} to be deleted", key);
+            assert!(
+                tree.delete(key).unwrap(),
+                "expected key {} to be deleted",
+                key
+            );
             assert_eq!(tree.lookup(key).unwrap(), None);
         }
 
@@ -1032,7 +1268,12 @@ mod tests {
             assert_eq!(tree.lookup(key).unwrap(), Some(payload.clone()));
         }
 
-        let keys: Vec<i64> = tree.scan_all().unwrap().into_iter().map(|e| e.key).collect();
+        let keys: Vec<i64> = tree
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
         assert_eq!(keys.len(), 74);
         assert!(!keys.contains(&0));
         assert!(!keys.contains(&1));
@@ -1040,6 +1281,92 @@ mod tests {
         assert!(!keys.contains(&39));
         assert!(!keys.contains(&40));
         assert!(!keys.contains(&79));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_compacts_root_after_leftmost_leaf_becomes_empty() {
+        let path = temp_db_path("btree_delete_compact_root.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let mut tree = BTree::new(&mut pager, root);
+
+        let payload = vec![0xA5; 100];
+        for i in 0..40 {
+            tree.insert(i, &payload).unwrap();
+        }
+
+        let initial_root_page = tree.root_page();
+        let initial_root_type = {
+            let page = tree.pager.read_page(initial_root_page).unwrap();
+            page[0]
+        };
+        assert_eq!(initial_root_type, PAGE_TYPE_INTERIOR);
+
+        for key in 0..26 {
+            assert!(
+                tree.delete(key).unwrap(),
+                "expected key {} to be deleted",
+                key
+            );
+        }
+
+        let root_type_after = {
+            let page = tree.pager.read_page(initial_root_page).unwrap();
+            page[0]
+        };
+        assert_eq!(root_type_after, PAGE_TYPE_LEAF);
+
+        let keys: Vec<i64> = tree
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, (26..40).map(|k| k as i64).collect::<Vec<_>>());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_compacts_multi_level_tree_to_single_leaf() {
+        let path = temp_db_path("btree_delete_multi_level_compact.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let mut tree = BTree::new(&mut pager, root);
+
+        let payload = vec![0xB6; 80];
+        for i in 0..300 {
+            tree.insert(i, &payload).unwrap();
+        }
+
+        for key in 0..299 {
+            assert!(
+                tree.delete(key).unwrap(),
+                "expected key {} to be deleted",
+                key
+            );
+        }
+
+        assert_eq!(tree.lookup(299).unwrap(), Some(payload.clone()));
+        let keys: Vec<i64> = tree
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, vec![299]);
+
+        let root_type = {
+            let page = tree.pager.read_page(tree.root_page()).unwrap();
+            page[0]
+        };
+        assert_eq!(root_type, PAGE_TYPE_LEAF);
 
         cleanup(&path);
     }
