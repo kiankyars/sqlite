@@ -914,12 +914,15 @@ impl Database {
             }
             AccessPath::IndexEq {
                 index_name,
-                value_expr,
+                value_exprs,
                 ..
             } => {
                 let index_meta = self.resolve_index_meta(index_name)?;
-                let value = eval_expr(value_expr, None)?;
-                let rowids = self.index_eq_rowids(index_meta.root_page, &value)?;
+                let mut values = Vec::with_capacity(value_exprs.len());
+                for value_expr in value_exprs {
+                    values.push(eval_expr(value_expr, None)?);
+                }
+                let rowids = self.index_eq_rowids(&index_meta, &values)?;
                 self.lookup_table_entries_by_rowids(meta.root_page, rowids)
             }
             AccessPath::IndexRange {
@@ -974,9 +977,21 @@ impl Database {
             .ok_or_else(|| format!("index '{}' not found", index_name))
     }
 
-    fn index_eq_rowids(&mut self, index_root: PageNum, value: &Value) -> Result<Vec<i64>, String> {
-        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
-        let mut idx_tree = BTree::new(&mut self.pager, index_root);
+    fn index_eq_rowids(
+        &mut self,
+        index_meta: &IndexMeta,
+        values: &[Value],
+    ) -> Result<Vec<i64>, String> {
+        if values.len() != index_meta.columns.len() {
+            return Err(format!(
+                "index equality arity mismatch for '{}': expected {} value(s), got {}",
+                index_meta.table_name,
+                index_meta.columns.len(),
+                values.len()
+            ));
+        }
+        let (key, bucket_value) = index_key_and_bucket_value(values)?;
+        let mut idx_tree = BTree::new(&mut self.pager, index_meta.root_page);
         match idx_tree
             .lookup(key)
             .map_err(|e| format!("index lookup: {e}"))?
@@ -985,7 +1000,7 @@ impl Database {
                 let buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
                 Ok(buckets
                     .into_iter()
-                    .filter(|b| values_equal(&b.value, value))
+                    .filter(|b| values_equal(&b.value, &bucket_value))
                     .flat_map(|b| b.rowids)
                     .collect::<Vec<i64>>())
             }
@@ -1078,15 +1093,18 @@ impl Database {
     }
 
     fn planner_indexes_for_table(&self, table_key: &str) -> Vec<IndexInfo> {
-        self.indexes
+        let mut planner_indexes: Vec<IndexInfo> = self
+            .indexes
             .iter()
-            .filter(|(_, idx)| idx.table_key == table_key && idx.columns.len() == 1)
+            .filter(|(_, idx)| idx.table_key == table_key)
             .map(|(name, idx)| IndexInfo {
                 name: name.clone(),
                 table: idx.table_name.clone(),
-                column: idx.columns[0].clone(),
+                columns: idx.columns.clone(),
             })
-            .collect()
+            .collect();
+        planner_indexes.sort_by(|left, right| left.name.cmp(&right.name));
+        planner_indexes
     }
 
     fn read_rows_for_select(
@@ -1095,25 +1113,21 @@ impl Database {
         where_clause: Option<&Expr>,
         access_path: &AccessPath,
     ) -> Result<Vec<Vec<Value>>, String> {
-        if matches!(
-            access_path,
-            AccessPath::IndexRange { .. } | AccessPath::IndexOr { .. }
-        ) {
-            let entries = self.read_candidate_entries(meta, access_path)?;
-            let mut rows = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let row = decode_table_row(meta, &entry.payload)?;
-                if where_clause_matches(meta, &row, where_clause)? {
-                    rows.push(row);
-                }
-            }
-            return Ok(rows);
+        let needs_materialized_candidate_read =
+            matches!(access_path, AccessPath::IndexRange { .. })
+                || matches!(access_path, AccessPath::IndexOr { .. })
+                || matches!(
+                    access_path,
+                    AccessPath::IndexEq { columns, .. } if columns.len() != 1
+                );
+        if needs_materialized_candidate_read {
+            return self.read_rows_via_candidates(meta, where_clause, access_path);
         }
         let scan_op: Box<dyn Operator + '_> = match access_path {
             AccessPath::TableScan => Box::new(TableScan::new(&mut self.pager, meta.root_page)),
             AccessPath::IndexEq {
                 index_name,
-                value_expr,
+                value_exprs,
                 ..
             } => {
                 let idx_key = normalize_identifier(index_name);
@@ -1123,6 +1137,12 @@ impl Database {
                     .cloned()
                     .ok_or_else(|| format!("index '{}' not found", index_name))?;
 
+                let [value_expr] = value_exprs.as_slice() else {
+                    return Err(format!(
+                        "expected exactly one equality expression for index '{}'",
+                        index_name
+                    ));
+                };
                 let value = eval_expr(value_expr, None)?;
 
                 Box::new(IndexEqScan::new(
@@ -1165,6 +1185,23 @@ impl Database {
             }
         }
 
+        Ok(rows)
+    }
+
+    fn read_rows_via_candidates(
+        &mut self,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        access_path: &AccessPath,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let entries = self.read_candidate_entries(meta, access_path)?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let row = decode_table_row(meta, &entry.payload)?;
+            if where_clause_matches(meta, &row, where_clause)? {
+                rows.push(row);
+            }
+        }
         Ok(rows)
     }
 
@@ -4852,6 +4889,93 @@ mod tests {
     }
 
     #[test]
+    fn select_plans_multi_column_index_for_matching_equalities() {
+        let path = temp_db_path("select_multi_column_index_selection");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 10, 20), (4, 11, 20);")
+            .unwrap();
+
+        let stmt = match ralph_parser::parse(
+            "SELECT id FROM users WHERE age = 20 AND score = 10 ORDER BY id;",
+        )
+        .unwrap()
+        {
+            Stmt::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
+        assert_eq!(
+            access_path,
+            AccessPath::IndexEq {
+                index_name: "idx_users_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(10), Expr::IntegerLiteral(20)],
+            }
+        );
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE age = 20 AND score = 10 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_multi_column_index_for_where_predicate() {
+        let path = temp_db_path("update_multi_column_index_selection");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, label TEXT, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'a', 10, 20), (2, 'b', 10, 21), (3, 'c', 10, 20), (4, 'd', 11, 20);",
+        )
+        .unwrap();
+
+        let result = db
+            .execute("UPDATE users SET label = 'hit' WHERE age = 20 AND score = 10;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("hit".to_string())],
+                        vec![Value::Integer(2), Value::Text("b".to_string())],
+                        vec![Value::Integer(3), Value::Text("hit".to_string())],
+                        vec![Value::Integer(4), Value::Text("d".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn delete_uses_index_for_where_predicate() {
         let path = temp_db_path("delete_index_selection");
         let mut db = Database::open(&path).unwrap();
@@ -5006,6 +5130,52 @@ mod tests {
             }
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_multi_column_index_for_where_predicate() {
+        let path = temp_db_path("delete_multi_column_index_selection");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score_age ON users(score, age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 10, 20), (4, 11, 20);")
+            .unwrap();
+
+        let result = db
+            .execute("DELETE FROM users WHERE age = 20 AND score = 10;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Delete { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, score, age FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(2), Value::Integer(10), Value::Integer(21)],
+                        vec![Value::Integer(4), Value::Integer(11), Value::Integer(20)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Remaining tuple still present in the composite index.
+        assert_eq!(
+            indexed_rowids_for_values(
+                &mut db,
+                "idx_users_score_age",
+                &[Value::Integer(10), Value::Integer(21)]
+            ),
+            vec![2]
+        );
 
         cleanup(&path);
     }

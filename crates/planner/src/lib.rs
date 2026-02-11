@@ -24,7 +24,7 @@ pub fn plan_where(
 pub struct IndexInfo {
     pub name: String,
     pub table: String,
-    pub column: String,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,8 +32,8 @@ pub enum AccessPath {
     TableScan,
     IndexEq {
         index_name: String,
-        column: String,
-        value_expr: Expr,
+        columns: Vec<String>,
+        value_exprs: Vec<Expr>,
     },
     IndexRange {
         index_name: String,
@@ -67,6 +67,10 @@ pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -
 }
 
 fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
+    if let Some(eq_path) = choose_index_eq_access(expr, table_name, indexes) {
+        return Some(eq_path);
+    }
+
     match expr {
         Expr::Paren(inner) => choose_index_access(inner, table_name, indexes),
         Expr::BinaryOp {
@@ -79,8 +83,7 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
             op: BinaryOperator::Or,
             ..
         } => choose_index_or_access(expr, table_name, indexes),
-        _ => choose_index_eq_access(expr, table_name, indexes)
-            .or_else(|| choose_index_range_access(expr, table_name, indexes)),
+        _ => choose_index_range_access(expr, table_name, indexes),
     }
 }
 
@@ -89,15 +92,12 @@ fn choose_index_eq_access(
     table_name: &str,
     indexes: &[IndexInfo],
 ) -> Option<AccessPath> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => plan_index_eq(left, right, table_name, indexes)
-            .or_else(|| plan_index_eq(right, left, table_name, indexes)),
-        _ => None,
+    let mut eq_terms = Vec::new();
+    collect_indexable_eq_terms(expr, table_name, &mut eq_terms);
+    if eq_terms.is_empty() {
+        return None;
     }
+    choose_best_eq_index(table_name, indexes, &eq_terms)
 }
 
 fn choose_index_range_access(
@@ -134,10 +134,10 @@ fn choose_index_range_access(
             if expr_contains_column_ref(low) || expr_contains_column_ref(high) {
                 return None;
             }
-            let index = find_matching_index(table_name, col_name, indexes)?;
+            let index = find_matching_single_column_index(table_name, col_name, indexes)?;
             Some(AccessPath::IndexRange {
                 index_name: index.name.clone(),
-                column: index.column.clone(),
+                column: index.columns[0].clone(),
                 lower: Some(RangeBound {
                     value_expr: low.as_ref().clone(),
                     inclusive: true,
@@ -221,7 +221,7 @@ fn plan_index_range_binary(
         return None;
     }
 
-    let index = find_matching_index(table_name, col_name, indexes)?;
+    let index = find_matching_single_column_index(table_name, col_name, indexes)?;
 
     let (lower, upper) = match op {
         BinaryOperator::Gt => (
@@ -257,18 +257,48 @@ fn plan_index_range_binary(
 
     Some(AccessPath::IndexRange {
         index_name: index.name.clone(),
-        column: index.column.clone(),
+        column: index.columns[0].clone(),
         lower,
         upper,
     })
 }
 
-fn plan_index_eq(
+fn collect_indexable_eq_terms(expr: &Expr, table_name: &str, out: &mut Vec<(String, Expr)>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_indexable_eq_terms(left, table_name, out);
+            collect_indexable_eq_terms(right, table_name, out);
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if let Some((col_name, value_expr)) =
+                extract_column_const_equality(left, right, table_name)
+                    .or_else(|| extract_column_const_equality(right, left, table_name))
+            {
+                if !out
+                    .iter()
+                    .any(|(existing_col, _)| existing_col.eq_ignore_ascii_case(&col_name))
+                {
+                    out.push((col_name, value_expr));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_column_const_equality(
     lhs: &Expr,
     rhs: &Expr,
     table_name: &str,
-    indexes: &[IndexInfo],
-) -> Option<AccessPath> {
+) -> Option<(String, Expr)> {
     let (col_table, col_name) = match lhs {
         Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
         _ => return None,
@@ -279,27 +309,69 @@ fn plan_index_eq(
             return None;
         }
     }
-
     if expr_contains_column_ref(rhs) {
         return None;
     }
+    Some((col_name.to_string(), rhs.clone()))
+}
 
-    let index = find_matching_index(table_name, col_name, indexes)?;
+fn choose_best_eq_index(
+    table_name: &str,
+    indexes: &[IndexInfo],
+    eq_terms: &[(String, Expr)],
+) -> Option<AccessPath> {
+    let mut best: Option<(&IndexInfo, Vec<Expr>)> = None;
+    for index in indexes {
+        if !index.table.eq_ignore_ascii_case(table_name) || index.columns.is_empty() {
+            continue;
+        }
 
-    Some(AccessPath::IndexEq {
+        let mut value_exprs = Vec::with_capacity(index.columns.len());
+        let mut all_columns_matched = true;
+        for column in &index.columns {
+            if let Some((_, expr)) = eq_terms
+                .iter()
+                .find(|(candidate_col, _)| candidate_col.eq_ignore_ascii_case(column))
+            {
+                value_exprs.push(expr.clone());
+            } else {
+                all_columns_matched = false;
+                break;
+            }
+        }
+        if !all_columns_matched {
+            continue;
+        }
+
+        let replace = match best {
+            None => true,
+            Some((current_best, _)) => {
+                index.columns.len() > current_best.columns.len()
+                    || (index.columns.len() == current_best.columns.len()
+                        && index.name < current_best.name)
+            }
+        };
+        if replace {
+            best = Some((index, value_exprs));
+        }
+    }
+
+    best.map(|(index, value_exprs)| AccessPath::IndexEq {
         index_name: index.name.clone(),
-        column: index.column.clone(),
-        value_expr: rhs.clone(),
+        columns: index.columns.clone(),
+        value_exprs,
     })
 }
 
-fn find_matching_index<'a>(
+fn find_matching_single_column_index<'a>(
     table_name: &str,
     col_name: &str,
     indexes: &'a [IndexInfo],
 ) -> Option<&'a IndexInfo> {
     indexes.iter().find(|idx| {
-        idx.table.eq_ignore_ascii_case(table_name) && idx.column.eq_ignore_ascii_case(col_name)
+        idx.table.eq_ignore_ascii_case(table_name)
+            && idx.columns.len() == 1
+            && idx.columns[0].eq_ignore_ascii_case(col_name)
     })
 }
 
@@ -356,12 +428,17 @@ mod tests {
             IndexInfo {
                 name: "idx_t_score".to_string(),
                 table: "t".to_string(),
-                column: "score".to_string(),
+                columns: vec!["score".to_string()],
             },
             IndexInfo {
                 name: "idx_t_age".to_string(),
                 table: "t".to_string(),
-                column: "age".to_string(),
+                columns: vec!["age".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_score_age".to_string(),
+                table: "t".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
             },
         ]
     }
@@ -394,8 +471,8 @@ mod tests {
             plan.access_path,
             AccessPath::IndexEq {
                 index_name: "idx_t_score".to_string(),
-                column: "score".to_string(),
-                value_expr: Expr::IntegerLiteral(42),
+                columns: vec!["score".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(42)],
             }
         );
     }
@@ -408,8 +485,8 @@ mod tests {
             plan.access_path,
             AccessPath::IndexEq {
                 index_name: "idx_t_score".to_string(),
-                column: "score".to_string(),
-                value_expr: Expr::IntegerLiteral(42),
+                columns: vec!["score".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(42)],
             }
         );
     }
@@ -422,8 +499,22 @@ mod tests {
             plan.access_path,
             AccessPath::IndexEq {
                 index_name: "idx_t_age".to_string(),
-                column: "age".to_string(),
-                value_expr: Expr::IntegerLiteral(9),
+                columns: vec!["age".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(9)],
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_multi_column_index_for_matching_equalities() {
+        let stmt = parse_select("SELECT * FROM t WHERE score = 9 AND age = 42;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexEq {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(9), Expr::IntegerLiteral(42)],
             }
         );
     }
@@ -495,13 +586,13 @@ mod tests {
                 branches: vec![
                     AccessPath::IndexEq {
                         index_name: "idx_t_score".to_string(),
-                        column: "score".to_string(),
-                        value_expr: Expr::IntegerLiteral(42),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
                     },
                     AccessPath::IndexEq {
                         index_name: "idx_t_age".to_string(),
-                        column: "age".to_string(),
-                        value_expr: Expr::IntegerLiteral(9),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
                     },
                 ],
             }
@@ -518,8 +609,8 @@ mod tests {
                 branches: vec![
                     AccessPath::IndexEq {
                         index_name: "idx_t_score".to_string(),
-                        column: "score".to_string(),
-                        value_expr: Expr::IntegerLiteral(42),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
                     },
                     AccessPath::IndexRange {
                         index_name: "idx_t_age".to_string(),
@@ -575,8 +666,22 @@ mod tests {
             path,
             AccessPath::IndexEq {
                 index_name: "idx_t_score".to_string(),
-                column: "score".to_string(),
-                value_expr: Expr::IntegerLiteral(42),
+                columns: vec!["score".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(42)],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_chooses_multi_column_index_for_matching_equalities() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 100 AND age = 7;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexEq {
+                index_name: "idx_t_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(100), Expr::IntegerLiteral(7)],
             }
         );
     }
@@ -616,13 +721,13 @@ mod tests {
                 branches: vec![
                     AccessPath::IndexEq {
                         index_name: "idx_t_score".to_string(),
-                        column: "score".to_string(),
-                        value_expr: Expr::IntegerLiteral(42),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
                     },
                     AccessPath::IndexEq {
                         index_name: "idx_t_age".to_string(),
-                        column: "age".to_string(),
-                        value_expr: Expr::IntegerLiteral(9),
+                        columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
                     },
                 ],
             }
