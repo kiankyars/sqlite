@@ -1481,11 +1481,17 @@ impl Database {
                 root_page: 0,
             };
 
-            // Nested-loop join with optional ON filter and LEFT null-extension.
+            // Nested-loop join with optional ON filter and outer-join null-extension.
             let mut new_rows = Vec::new();
+            let mut matched_right = if join.join_type == JoinType::Right {
+                vec![false; right_rows.len()]
+            } else {
+                Vec::new()
+            };
+            let left_col_count = synthetic_meta.columns.len() - right_meta.columns.len();
             for left_row in &current_rows {
                 let mut matched = false;
-                for right_row in &right_rows {
+                for (right_idx, right_row) in right_rows.iter().enumerate() {
                     let mut combined: Vec<Value> =
                         Vec::with_capacity(left_row.len() + right_row.len());
                     combined.extend_from_slice(left_row);
@@ -1499,6 +1505,9 @@ impl Database {
                         }
                     }
                     matched = true;
+                    if join.join_type == JoinType::Right {
+                        matched_right[right_idx] = true;
+                    }
                     new_rows.push(combined);
                 }
                 if join.join_type == JoinType::Left && !matched {
@@ -1506,6 +1515,18 @@ impl Database {
                         Vec::with_capacity(left_row.len() + right_meta.columns.len());
                     combined.extend_from_slice(left_row);
                     combined.extend((0..right_meta.columns.len()).map(|_| Value::Null));
+                    new_rows.push(combined);
+                }
+            }
+
+            if join.join_type == JoinType::Right {
+                for (right_idx, right_row) in right_rows.iter().enumerate() {
+                    if matched_right[right_idx] {
+                        continue;
+                    }
+                    let mut combined = Vec::with_capacity(left_col_count + right_row.len());
+                    combined.extend((0..left_col_count).map(|_| Value::Null));
+                    combined.extend_from_slice(right_row);
                     new_rows.push(combined);
                 }
             }
@@ -6292,6 +6313,79 @@ mod tests {
         match result {
             ExecuteResult::Select(q) => {
                 assert_eq!(q.rows, vec![vec![Value::Text("charlie".into())]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_right_join_preserves_unmatched_right_rows() {
+        let path = temp_db_path("right_join_unmatched");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (2, 'sprocket'), (4, 'orphan');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.name, o.product \
+                 FROM users AS u RIGHT JOIN orders AS o ON u.id = o.user_id \
+                 ORDER BY o.user_id, o.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("alice".into()), Value::Text("gadget".into())],
+                        vec![Value::Text("alice".into()), Value::Text("widget".into())],
+                        vec![Value::Text("bob".into()), Value::Text("sprocket".into())],
+                        vec![Value::Null, Value::Text("orphan".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_right_join_where_can_match_null_extended_rows() {
+        let path = temp_db_path("right_join_where_null_extended");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (3, 'orphan');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT o.product \
+                 FROM users AS u RIGHT OUTER JOIN orders AS o ON u.id = o.user_id \
+                 WHERE u.name IS NULL \
+                 ORDER BY o.user_id;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Text("orphan".into())]]);
             }
             _ => panic!("expected SELECT result"),
         }

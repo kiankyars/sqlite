@@ -228,6 +228,7 @@ impl Parser {
             Token::Keyword(Keyword::Inner) => Some(JoinType::Inner),
             Token::Keyword(Keyword::Cross) => Some(JoinType::Cross),
             Token::Keyword(Keyword::Left) => Some(JoinType::Left),
+            Token::Keyword(Keyword::Right) => Some(JoinType::Right),
             _ => None,
         }
     }
@@ -249,6 +250,14 @@ impl Parser {
                 Ok(())
             }
             Token::Keyword(Keyword::Left) => {
+                self.advance();
+                if self.at_keyword(Keyword::Outer) {
+                    self.advance();
+                }
+                self.expect_keyword(Keyword::Join)?;
+                Ok(())
+            }
+            Token::Keyword(Keyword::Right) => {
                 self.advance();
                 if self.at_keyword(Keyword::Outer) {
                     self.advance();
@@ -1611,6 +1620,38 @@ mod tests {
                 assert_eq!(from.table, "a");
                 assert_eq!(from.joins.len(), 1);
                 assert_eq!(from.joins[0].join_type, JoinType::Left);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_right_join_on() {
+        let stmt = parse("SELECT * FROM a RIGHT JOIN b ON a.id = b.id;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Right);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_right_outer_join_on() {
+        let stmt = parse("SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.id;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Right);
                 assert_eq!(from.joins[0].table, "b");
                 assert!(from.joins[0].condition.is_some());
             }

@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection for table-scan vs index paths for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection for table-scan vs index paths for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -45,6 +45,7 @@ Latest completions:
 - OR predicate index-union planning/execution in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits `IndexOr` when all OR branches are indexable (including mixed equality/range branches), and SELECT/UPDATE/DELETE candidate reads now union + deduplicate branch rowids before residual WHERE filtering; see `notes/query-planner-range-selection.md`
 - Multi-column predicate planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits composite `IndexEq` access paths when all indexed columns have equality predicates, and SELECT/UPDATE/DELETE now evaluate multi-expression probes against tuple index keys; see `notes/multi-column-index-planner-selection.md`
 - LEFT JOIN parser/execution support in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `LEFT JOIN` and `LEFT OUTER JOIN`, and join execution now preserves unmatched left rows via right-side NULL extension; see `notes/left-join-execution.md`
+- RIGHT JOIN parser/execution support in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `RIGHT JOIN` and `RIGHT OUTER JOIN`, and join execution now preserves unmatched right rows via left-side NULL extension; see `notes/right-join-execution.md`
 - `IN` multi-probe planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now maps indexable `col IN (...)` predicates to deduplicated equality probe unions (`IndexEq`/`IndexOr`), and SELECT/UPDATE/DELETE reuse existing candidate-row union/dedup paths for index-driven execution; see `notes/in-multi-probe-planner-execution.md`
 - Multi-index `AND`-intersection planning/execution in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits `IndexAnd` for multi-term indexable conjunctions, execution now intersects branch-selected rowids before table lookup for SELECT/UPDATE/DELETE candidate reads, and composite equality indexes remain preferred when available; see `notes/multi-index-and-intersection-selection.md`
 - Planner cost heuristics for table-scan vs index-path selection in `crates/planner` (Agent 3) — planner now estimates static access-path costs and falls back to `TableScan` for high-fanout `IndexOr`/`IndexAnd` shapes while keeping small fanout index probes; see `notes/planner-cost-heuristics-selection.md`
@@ -53,9 +54,11 @@ Latest completions:
 - Planner statistics-driven cost model for table-scan vs index-path selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — added `plan_where_with_stats`/`plan_select_with_stats` plus runtime table/index cardinality hints from `ralph-sqlite`, with legacy static heuristics preserved when stats are absent; see `notes/planner-statistics-cost-model.md`
 
 Recommended next step:
-- Improve cost-based planning with data/statistics-driven estimates (cardinality/selectivity aware index-vs-table decisions).
+- Add persisted planner statistics (histogram/fanout metadata) to improve selectivity and cost estimates beyond runtime cardinality hints.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT JOIN parser/execution support): pass, 0 failed (157 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (RIGHT JOIN parser/execution support, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (multi-column prefix/range scan-reduction heuristics): pass, 0 failed (33 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner/execution compatibility for prefix/range scan-reduction): pass, 0 failed (86 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test --workspace` (full regression after prefix/range scan-reduction): pass, 0 failed (256 tests).
@@ -194,6 +197,7 @@ Test pass rate:
 36. ~~Simple planner cost heuristics for table scan vs index path selection~~ ✓
 37. ~~Planner/execution support for multi-column index left-prefix/range predicates~~ ✓
 38. ~~Planner statistics-driven cost model for table scan vs index path selection~~ ✓
+39. ~~RIGHT JOIN parser/execution support~~ ✓
 
 ## Completed Tasks
 
@@ -377,6 +381,10 @@ Test pass rate:
   - Added `LEFT` / `OUTER` parser keywords and `JoinType::Left` for `LEFT JOIN` and `LEFT OUTER JOIN`
   - Join execution now preserves unmatched left rows by NULL-extending right columns when ON predicates find no matches
   - Added parser + integration coverage; see `notes/left-join-execution.md`
+- [x] RIGHT JOIN parser/execution support (agent codex)
+  - Added `RIGHT` parser keyword and `JoinType::Right` for `RIGHT JOIN` and `RIGHT OUTER JOIN`
+  - Join execution now preserves unmatched right rows by NULL-extending the left-side columns when ON predicates find no matches
+  - Added parser + integration coverage; see `notes/right-join-execution.md`
 - [x] Multi-column secondary index execution (agent codex)
   - `CREATE INDEX` / `CREATE UNIQUE INDEX` execution now supports ordered multi-column definitions with schema persistence
   - Index maintenance now writes/removes tuple index entries for INSERT/UPDATE/DELETE
@@ -416,6 +424,6 @@ Test pass rate:
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection; persisted histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
-- JOIN support includes INNER JOIN, CROSS JOIN, and LEFT JOIN; RIGHT/FULL OUTER JOIN are not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
+- JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, and RIGHT JOIN; FULL OUTER JOIN is not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

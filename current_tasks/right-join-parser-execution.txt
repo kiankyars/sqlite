@@ -1,3 +1,0 @@
-created_at_unix=1770830077
-agent_id=4
-task=right join parser/execution support
