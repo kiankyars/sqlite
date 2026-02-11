@@ -125,20 +125,58 @@ impl Pager {
     /// If the freelist has pages, pops one from the freelist.
     /// Otherwise, extends the file by one page.
     pub fn allocate_page(&mut self) -> io::Result<PageNum> {
-        // For now, always extend the file (freelist reuse comes later).
-        let page_num = self.header.page_count;
-        self.header.page_count += 1;
+        let page_num = if self.header.freelist_head != 0 {
+            let page_num = self.header.freelist_head;
+            if page_num >= self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "freelist head {} out of range (page_count={})",
+                        page_num, self.header.page_count
+                    ),
+                ));
+            }
 
-        // Create a zeroed page in the pool.
-        let data = vec![0u8; self.page_size];
-        let frame = Frame {
-            data,
-            dirty: true,
-            pin_count: 0,
-            last_access: self.next_access(),
+            self.ensure_loaded(page_num)?;
+            let next_head = {
+                let frame = self.pool.get(&page_num).unwrap();
+                u32::from_be_bytes(frame.data[0..4].try_into().unwrap())
+            };
+            if next_head != 0 && next_head >= self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "freelist next pointer {} out of range (page_count={})",
+                        next_head, self.header.page_count
+                    ),
+                ));
+            }
+
+            self.header.freelist_head = next_head;
+            self.header.freelist_count = self.header.freelist_count.saturating_sub(1);
+
+            let ts = self.next_access();
+            let frame = self.pool.get_mut(&page_num).unwrap();
+            frame.data.fill(0);
+            frame.dirty = true;
+            frame.last_access = ts;
+            page_num
+        } else {
+            let page_num = self.header.page_count;
+            self.header.page_count += 1;
+
+            // Create a zeroed page in the pool.
+            let data = vec![0u8; self.page_size];
+            let frame = Frame {
+                data,
+                dirty: true,
+                pin_count: 0,
+                last_access: self.next_access(),
+            };
+            self.maybe_evict()?;
+            self.pool.insert(page_num, frame);
+            page_num
         };
-        self.maybe_evict()?;
-        self.pool.insert(page_num, frame);
 
         // Update the header on disk.
         self.flush_header()?;
@@ -180,9 +218,10 @@ impl Pager {
 
     /// Flush a single page to disk.
     fn flush_page(&mut self, page_num: PageNum) -> io::Result<()> {
-        let frame = self.pool.get_mut(&page_num).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "page not in buffer pool")
-        })?;
+        let frame = self
+            .pool
+            .get_mut(&page_num)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "page not in buffer pool"))?;
 
         let offset = page_num as u64 * self.page_size as u64;
         self.file.seek(SeekFrom::Start(offset))?;
@@ -219,7 +258,10 @@ impl Pager {
         if page_num >= self.header.page_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("page {} out of range (page_count={})", page_num, self.header.page_count),
+                format!(
+                    "page {} out of range (page_count={})",
+                    page_num, self.header.page_count
+                ),
             ));
         }
 
@@ -481,6 +523,75 @@ mod tests {
             assert_eq!(pager.header().schema_root, 7);
             assert_eq!(pager.page_count(), 3);
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn allocate_reuses_freelist_before_extension() {
+        let path = temp_db_path("freelist_reuse.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let p1 = pager.allocate_page().unwrap();
+        let p2 = pager.allocate_page().unwrap();
+        let p3 = pager.allocate_page().unwrap();
+        assert_eq!((p1, p2, p3), (1, 2, 3));
+        assert_eq!(pager.page_count(), 4);
+
+        {
+            let page2 = pager.write_page(2).unwrap();
+            page2[0..4].copy_from_slice(&3u32.to_be_bytes());
+        }
+        {
+            let page3 = pager.write_page(3).unwrap();
+            page3[0..4].copy_from_slice(&0u32.to_be_bytes());
+        }
+        pager.header_mut().freelist_head = 2;
+        pager.header_mut().freelist_count = 2;
+        pager.flush_all().unwrap();
+
+        let reused_2 = pager.allocate_page().unwrap();
+        assert_eq!(reused_2, 2);
+        assert_eq!(pager.page_count(), 4);
+        assert_eq!(pager.header().freelist_head, 3);
+        assert_eq!(pager.header().freelist_count, 1);
+
+        let reused_3 = pager.allocate_page().unwrap();
+        assert_eq!(reused_3, 3);
+        assert_eq!(pager.page_count(), 4);
+        assert_eq!(pager.header().freelist_head, 0);
+        assert_eq!(pager.header().freelist_count, 0);
+
+        let extended = pager.allocate_page().unwrap();
+        assert_eq!(extended, 4);
+        assert_eq!(pager.page_count(), 5);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn allocate_zeroes_reused_freelist_page() {
+        let path = temp_db_path("freelist_zeroed.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page_num = pager.allocate_page().unwrap();
+        assert_eq!(page_num, 1);
+
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page.fill(0xAA);
+            page[0..4].copy_from_slice(&0u32.to_be_bytes());
+        }
+        pager.header_mut().freelist_head = page_num;
+        pager.header_mut().freelist_count = 1;
+        pager.flush_all().unwrap();
+
+        let reused = pager.allocate_page().unwrap();
+        assert_eq!(reused, 1);
+        let page = pager.read_page(reused).unwrap();
+        assert!(page.iter().all(|b| *b == 0));
 
         cleanup(&path);
     }

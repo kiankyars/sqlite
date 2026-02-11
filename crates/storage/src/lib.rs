@@ -3,7 +3,7 @@
 //! This crate provides:
 //! - File header management (magic, page size, page count, etc.)
 //! - Page cache / buffer pool with LRU eviction (pager)
-//! - Page allocation (extend file; freelist reuse planned)
+//! - Page allocation (freelist-pop reuse with file extension fallback)
 //!
 //! Future additions:
 //! - B+tree implementation for tables and indexes
