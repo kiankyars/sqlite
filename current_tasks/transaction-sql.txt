@@ -1,3 +1,0 @@
-created_at_unix=1770789962
-agent_id=codex
-task=BEGIN/COMMIT/ROLLBACK SQL

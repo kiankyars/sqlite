@@ -10,6 +10,9 @@ pub enum Stmt {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     DropTable(DropTableStmt),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]

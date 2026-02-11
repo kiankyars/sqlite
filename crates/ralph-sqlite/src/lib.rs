@@ -4,7 +4,7 @@
 /// statements and executes a small supported subset against pager + B+tree
 /// storage.
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
@@ -29,6 +29,9 @@ pub struct QueryResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecuteResult {
+    Begin,
+    Commit,
+    Rollback,
     CreateTable,
     CreateIndex,
     Insert { rows_affected: usize },
@@ -59,25 +62,41 @@ struct IndexBucket {
     rowids: Vec<i64>,
 }
 
-pub struct Database {
-    pager: Pager,
+#[derive(Debug, Clone)]
+struct TransactionSnapshot {
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
 }
 
+pub struct Database {
+    db_path: PathBuf,
+    pager: Pager,
+    tables: HashMap<String, TableMeta>,
+    indexes: HashMap<String, IndexMeta>,
+    in_explicit_txn: bool,
+    tx_snapshot: Option<TransactionSnapshot>,
+}
+
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let pager = Pager::open(path).map_err(|e| format!("open database: {e}"))?;
+        let db_path = path.as_ref().to_path_buf();
+        let pager = Pager::open(&db_path).map_err(|e| format!("open database: {e}"))?;
         Ok(Self {
+            db_path,
             pager,
             tables: HashMap::new(),
             indexes: HashMap::new(),
+            in_explicit_txn: false,
+            tx_snapshot: None,
         })
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<ExecuteResult, String> {
         let stmt = ralph_parser::parse(sql).map_err(|e| format!("parse error: {e}"))?;
         match stmt {
+            Stmt::Begin => self.execute_begin(),
+            Stmt::Commit => self.execute_commit(),
+            Stmt::Rollback => self.execute_rollback(),
             Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt),
             Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
@@ -86,6 +105,60 @@ impl Database {
             Stmt::Select(select_stmt) => self.execute_select(select_stmt),
             other => Err(format!("statement not supported yet: {other:?}")),
         }
+    }
+
+    fn execute_begin(&mut self) -> Result<ExecuteResult, String> {
+        if self.in_explicit_txn {
+            return Err("cannot BEGIN: transaction already active".to_string());
+        }
+        self.tx_snapshot = Some(TransactionSnapshot {
+            tables: self.tables.clone(),
+            indexes: self.indexes.clone(),
+        });
+        self.in_explicit_txn = true;
+        Ok(ExecuteResult::Begin)
+    }
+
+    fn execute_commit(&mut self) -> Result<ExecuteResult, String> {
+        if !self.in_explicit_txn {
+            return Err("cannot COMMIT: no active transaction".to_string());
+        }
+        self.pager
+            .commit()
+            .map_err(|e| format!("commit transaction: {e}"))?;
+        self.in_explicit_txn = false;
+        self.tx_snapshot = None;
+        Ok(ExecuteResult::Commit)
+    }
+
+    fn execute_rollback(&mut self) -> Result<ExecuteResult, String> {
+        if !self.in_explicit_txn {
+            return Err("cannot ROLLBACK: no active transaction".to_string());
+        }
+
+        let snapshot = self
+            .tx_snapshot
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "cannot ROLLBACK: transaction snapshot missing".to_string())?;
+        let reopened = Pager::open(&self.db_path)
+            .map_err(|e| format!("rollback transaction: reopen pager: {e}"))?;
+
+        self.pager = reopened;
+        self.tables = snapshot.tables;
+        self.indexes = snapshot.indexes;
+        self.in_explicit_txn = false;
+        self.tx_snapshot = None;
+        Ok(ExecuteResult::Rollback)
+    }
+
+    fn commit_if_autocommit(&mut self, context: &str) -> Result<(), String> {
+        if self.in_explicit_txn {
+            return Ok(());
+        }
+        self.pager
+            .commit()
+            .map_err(|e| format!("commit {context}: {e}"))
     }
 
     fn execute_create_table(&mut self, stmt: CreateTableStmt) -> Result<ExecuteResult, String> {
@@ -111,9 +184,7 @@ impl Database {
                 root_page,
             },
         );
-        self.pager
-            .commit()
-            .map_err(|e| format!("commit create table: {e}"))?;
+        self.commit_if_autocommit("create table")?;
         Ok(ExecuteResult::CreateTable)
     }
 
@@ -175,9 +246,7 @@ impl Database {
         }
 
         self.indexes.insert(index_key, index_meta);
-        self.pager
-            .flush_all()
-            .map_err(|e| format!("flush create index: {e}"))?;
+        self.commit_if_autocommit("create index")?;
         Ok(ExecuteResult::CreateIndex)
     }
 
@@ -230,9 +299,7 @@ impl Database {
             }
         }
 
-        self.pager
-            .commit()
-            .map_err(|e| format!("commit insert: {e}"))?;
+        self.commit_if_autocommit("insert")?;
 
         Ok(ExecuteResult::Insert { rows_affected })
     }
@@ -314,9 +381,7 @@ impl Database {
             rows_affected += 1;
         }
 
-        self.pager
-            .commit()
-            .map_err(|e| format!("commit update: {e}"))?;
+        self.commit_if_autocommit("update")?;
 
         Ok(ExecuteResult::Update { rows_affected })
     }
@@ -347,9 +412,7 @@ impl Database {
             }
         }
 
-        self.pager
-            .commit()
-            .map_err(|e| format!("commit delete: {e}"))?;
+        self.commit_if_autocommit("delete")?;
 
         Ok(ExecuteResult::Delete { rows_affected })
     }
@@ -975,8 +1038,9 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("ralph_sqlite_tests");
@@ -991,6 +1055,13 @@ mod tests {
 
     fn cleanup(path: &Path) {
         fs::remove_file(path).ok();
+        fs::remove_file(wal_path(path)).ok();
+    }
+
+    fn wal_path(path: &Path) -> PathBuf {
+        let mut wal_name: OsString = path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        PathBuf::from(wal_name)
     }
 
     fn indexed_rowids(db: &mut Database, index_name: &str, value: &Value) -> Vec<i64> {
@@ -1231,6 +1302,72 @@ mod tests {
             ExecuteResult::Select(q) => assert!(q.rows.is_empty()),
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn explicit_transaction_delays_wal_until_commit() {
+        let path = temp_db_path("txn_delay_wal");
+        let mut db = Database::open(&path).unwrap();
+
+        let wal_len_before = fs::metadata(wal_path(&path)).unwrap().len();
+
+        assert_eq!(db.execute("BEGIN;").unwrap(), ExecuteResult::Begin);
+        assert_eq!(
+            db.execute("CREATE TABLE t (id INTEGER);").unwrap(),
+            ExecuteResult::CreateTable
+        );
+        assert_eq!(
+            db.execute("INSERT INTO t VALUES (1);").unwrap(),
+            ExecuteResult::Insert { rows_affected: 1 }
+        );
+        let wal_len_during_txn = fs::metadata(wal_path(&path)).unwrap().len();
+        assert_eq!(wal_len_during_txn, wal_len_before);
+
+        assert_eq!(db.execute("COMMIT;").unwrap(), ExecuteResult::Commit);
+        let wal_len_after_commit = fs::metadata(wal_path(&path)).unwrap().len();
+        assert!(wal_len_after_commit > wal_len_before);
+
+        let rows = db.execute("SELECT id FROM t;").unwrap();
+        match rows {
+            ExecuteResult::Select(q) => assert_eq!(q.rows, vec![vec![Value::Integer(1)]]),
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rollback_discards_uncommitted_transaction_changes() {
+        let path = temp_db_path("txn_rollback");
+        let mut db = Database::open(&path).unwrap();
+
+        assert_eq!(db.execute("BEGIN TRANSACTION;").unwrap(), ExecuteResult::Begin);
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+        assert_eq!(db.execute("ROLLBACK TRANSACTION;").unwrap(), ExecuteResult::Rollback);
+
+        let err = db.execute("SELECT * FROM t;").unwrap_err();
+        assert!(err.contains("no such table"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn transaction_state_errors_are_reported() {
+        let path = temp_db_path("txn_state_errors");
+        let mut db = Database::open(&path).unwrap();
+
+        let commit_err = db.execute("COMMIT;").unwrap_err();
+        assert!(commit_err.contains("no active transaction"));
+
+        let rollback_err = db.execute("ROLLBACK;").unwrap_err();
+        assert!(rollback_err.contains("no active transaction"));
+
+        assert_eq!(db.execute("BEGIN;").unwrap(), ExecuteResult::Begin);
+        let nested_begin_err = db.execute("BEGIN;").unwrap_err();
+        assert!(nested_begin_err.contains("already active"));
 
         cleanup(&path);
     }

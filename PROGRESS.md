@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, and WAL write-ahead commit path are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -14,12 +14,15 @@ Latest completions:
 - End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
 - Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
 - WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
+- SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+- `cargo test --workspace` (task #17 implementation): pass, 0 failed.
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
+- `./test.sh --fast` (task #17 verification, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
 
 ## Prioritized Task Backlog
@@ -40,7 +43,7 @@ Test pass rate:
 14. Query planner (index selection)
 15. ~~WAL write path and commit~~ ✓
 16. Checkpoint and crash recovery
-17. BEGIN/COMMIT/ROLLBACK SQL
+17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
 18. B+tree split/merge
 19. ORDER BY, LIMIT, aggregates
 
@@ -100,6 +103,11 @@ Test pass rate:
   - Updated `Pager::flush_all()` to write dirty pages to WAL and `fsync` WAL before applying to DB file
   - Added `Pager::commit()` and used it in SQL write statement execution paths
   - Added storage tests for WAL frame format/checksums and multi-commit WAL append behavior
+- [x] BEGIN/COMMIT/ROLLBACK SQL (agent codex)
+  - Added parser support for `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, and `ROLLBACK [TRANSACTION]`
+  - Added `Database` execution support with explicit transaction state tracking and autocommit gating for write statements
+  - `ROLLBACK` restores connection-local table/index catalogs from a BEGIN snapshot and reopens the pager to drop uncommitted in-memory page changes
+  - Added parser tests and integration tests for deferred WAL writes, rollback behavior, and transaction state errors
 
 ## Known Issues
 
@@ -107,6 +115,7 @@ Test pass rate:
 - B+tree delete currently does not rebalance/merge underflowing nodes (deferred to task #18).
 - WAL replay and checkpoint are not implemented yet (deferred to task #16).
 - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+- Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
 - UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)

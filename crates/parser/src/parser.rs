@@ -21,6 +21,9 @@ impl Parser {
             Token::Keyword(Keyword::Update) => Stmt::Update(self.parse_update()?),
             Token::Keyword(Keyword::Delete) => Stmt::Delete(self.parse_delete()?),
             Token::Keyword(Keyword::Drop) => self.parse_drop()?,
+            Token::Keyword(Keyword::Begin) => self.parse_begin()?,
+            Token::Keyword(Keyword::Commit) => self.parse_commit()?,
+            Token::Keyword(Keyword::Rollback) => self.parse_rollback()?,
             other => return Err(format!("expected statement, found {:?}", other)),
         };
         // Consume optional trailing semicolon
@@ -464,6 +467,32 @@ impl Parser {
         };
         let table = self.expect_ident()?;
         Ok(DropTableStmt { if_exists, table })
+    }
+
+    // ── Transaction control ─────────────────────────────────────────────
+
+    fn parse_begin(&mut self) -> Result<Stmt, String> {
+        self.expect_keyword(Keyword::Begin)?;
+        if self.at_keyword(Keyword::Transaction) {
+            self.advance();
+        }
+        Ok(Stmt::Begin)
+    }
+
+    fn parse_commit(&mut self) -> Result<Stmt, String> {
+        self.expect_keyword(Keyword::Commit)?;
+        if self.at_keyword(Keyword::Transaction) {
+            self.advance();
+        }
+        Ok(Stmt::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Stmt, String> {
+        self.expect_keyword(Keyword::Rollback)?;
+        if self.at_keyword(Keyword::Transaction) {
+            self.advance();
+        }
+        Ok(Stmt::Rollback)
     }
 
     // ── Expression parsing (precedence climbing) ─────────────────────
@@ -1083,6 +1112,24 @@ mod tests {
             }
             _ => panic!("expected DropTable"),
         }
+    }
+
+    #[test]
+    fn test_begin_transaction() {
+        let stmt = parse("BEGIN TRANSACTION;");
+        assert_eq!(stmt, Stmt::Begin);
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let stmt = parse("COMMIT TRANSACTION;");
+        assert_eq!(stmt, Stmt::Commit);
+    }
+
+    #[test]
+    fn test_rollback_transaction() {
+        let stmt = parse("ROLLBACK;");
+        assert_eq!(stmt, Stmt::Rollback);
     }
 
     #[test]

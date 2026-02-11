@@ -116,6 +116,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_begin() {
+        let stmt = parse("BEGIN;").unwrap();
+        assert_eq!(stmt, Stmt::Begin);
+    }
+
+    #[test]
+    fn test_parse_commit_transaction() {
+        let stmt = parse("COMMIT TRANSACTION;").unwrap();
+        assert_eq!(stmt, Stmt::Commit);
+    }
+
+    #[test]
+    fn test_parse_rollback() {
+        let stmt = parse("ROLLBACK;").unwrap();
+        assert_eq!(stmt, Stmt::Rollback);
+    }
+
+    #[test]
     fn test_roundtrip_complex() {
         // A more complex query to verify end-to-end parsing
         let stmt = parse(
