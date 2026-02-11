@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ralph-parser = { path = "../parser" }
 ralph-planner = { path = "../planner" }
 ralph-storage = { path = "../storage" }

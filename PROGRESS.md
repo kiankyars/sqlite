@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`), and basic query planner index selection are implemented; schema persistence and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented; schema persistence and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -18,6 +18,7 @@ Latest completions:
 - SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
 - SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
 - Volcano iterator model in `crates/executor` (Agent codex) — added `Operator` trait and concrete `Scan`, `Filter`, and `Project` operators with callback-based predicate/projection hooks and pipeline tests
+- Expression evaluation in `crates/executor` (Agent codex) — added parser-AST expression evaluation plus expression-backed `Filter`/`Project` constructors for row predicates and projection materialization
 - B+tree delete rebalance/merge for empty-node underflow with root compaction in `crates/storage` (Agent codex)
 - Query planner index selection in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now selects index equality access paths for simple `WHERE` predicates, SELECT execution consumes planner output for indexed rowid lookup, and UPDATE/DELETE maintain secondary index entries
 
@@ -38,6 +39,9 @@ Test pass rate:
 - `./test.sh --fast` (task #10 completion, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-planner -p ralph-sqlite` (task #14 implementation): pass, 0 failed.
 - `./test.sh --fast` (task #14 verification): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-executor` (task #11 implementation): pass, 0 failed (11 tests).
+- `cargo test --workspace` (task #11 implementation): pass, 0 failed.
+- `./test.sh --fast` (task #11 verification, AGENT_ID=11): pass, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -51,7 +55,7 @@ Test pass rate:
 8. Schema table storage
 9. ~~End-to-end: CREATE TABLE + INSERT + SELECT~~ ✓
 10. ~~Volcano iterator model (Scan, Filter, Project)~~ ✓
-11. Expression evaluation
+11. ~~Expression evaluation~~ ✓
 12. ~~UPDATE and DELETE execution~~ ✓
 13. ~~Secondary indexes (CREATE INDEX)~~ ✓
 14. ~~Query planner (index selection)~~ ✓
@@ -141,6 +145,10 @@ Test pass rate:
   - SELECT execution now requests planner output and performs index rowid lookups when planned
   - Added UPDATE/DELETE index maintenance so secondary indexes remain consistent when indexed column values change or rows are removed
   - Added planner unit tests and integration tests for update/delete index maintenance; see `notes/query-planner-index-selection.md`
+- [x] Expression evaluation in `crates/executor` (agent codex)
+  - Added `eval_expr(&Expr, row_ctx)` support for literals, column refs, unary/binary ops, `IS NULL`, `BETWEEN`, and `IN (...)`
+  - Added `Filter::from_expr(...)` and `Project::from_exprs(...)` helpers to evaluate parser AST expressions in execution pipelines
+  - Added executor tests for arithmetic/boolean evaluation, row-context column resolution, expression-backed filter/project, and unknown-column errors
 
 ## Known Issues
 
