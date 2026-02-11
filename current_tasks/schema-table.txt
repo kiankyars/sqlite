@@ -1,3 +1,0 @@
-created_at_unix=1770791162
-agent_id=codex
-task=Schema table storage (sqlite_master equivalent)

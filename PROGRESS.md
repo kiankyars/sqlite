@@ -2,13 +2,14 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented; schema persistence remains.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented.
 
 Latest completions:
-- Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
+- Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
 - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
 - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
 - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+- Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
 - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
 - B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
 - End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
@@ -55,7 +56,7 @@ Test pass rate:
 5. ~~Page allocator with freelist stub~~ ✓
 6. ~~B+tree insert and point lookup~~ ✓
 7. ~~B+tree leaf-linked range scan~~ ✓
-8. Schema table storage
+8. ~~Schema table storage~~ ✓
 9. ~~End-to-end: CREATE TABLE + INSERT + SELECT~~ ✓
 10. ~~Volcano iterator model (Scan, Filter, Project)~~ ✓
 11. ~~Expression evaluation~~ ✓
@@ -97,6 +98,12 @@ Test pass rate:
   - Update (delete + re-insert) for existing keys
   - Tested with up to 200 entries (multi-level splits), reverse-order inserts, persistence after flush
   - 10 B+tree unit tests
+- [x] Schema table storage — sqlite_master equivalent (agent 2)
+  - SchemaEntry: object type, name, root_page, SQL text, column definitions
+  - Binary serialization/deserialization of schema entries
+  - Schema::initialize, create_table, find_table, list_tables
+  - Duplicate table detection, persistence across close/reopen
+  - 6 schema unit tests
 - [x] End-to-end SQL execution path for `CREATE TABLE`, `INSERT`, and `SELECT` in `crates/ralph-sqlite` (agent 4)
   - Added `Database` API with SQL parsing + statement dispatch
   - Rows are encoded into B+tree payloads with typed value tags (`NULL`, `INTEGER`, `REAL`, `TEXT`)
