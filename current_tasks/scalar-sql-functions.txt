@@ -1,3 +1,0 @@
-created_at_unix=1770844263
-agent_id=4
-task=Implement core scalar SQL functions in expression evaluation (start with LENGTH/UPPER/LOWER/ABS/COALESCE/IFNULL/NULLIF/SUBSTR/INSTR/TRIM)

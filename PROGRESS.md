@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality + prefix fanout metadata for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, core scalar SQL function execution, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality + prefix fanout metadata for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -57,6 +57,7 @@ Latest completions:
 - Planner stats selectivity/cost refinement in `crates/planner` (Agent codex) — stats-aware `AND` path preference now compares candidate costs before picking `IndexAnd` vs simpler equality paths, and stats-based `IndexOr`/`IndexAnd` row estimation now combines branch selectivities using probability unions/intersections instead of sum/min heuristics; see `notes/planner-stats-selectivity-cost-refinement.md`
 - LIKE operator fix in `crates/executor` + `crates/ralph-sqlite` (Agent opus) — replaced naive `String::contains` LIKE implementation with correct SQL pattern matching: `%` matches zero-or-more chars, `_` matches one char, case-insensitive ASCII matching per SQLite defaults, and NULL operand propagation; see `notes/like-operator-fix.md`
 - Planner histogram/fanout statistics for multi-column prefix/range costing in `crates/storage` + `crates/planner` + `crates/ralph-sqlite` (Agent codex) — persisted index stats now include per-prefix distinct-count vectors, stats-aware `IndexPrefixRange` costing now estimates eq-prefix fanout and range selectivity from prefix-level distributions, and write-path stats refresh now recomputes/persists prefix distinct counts; see `notes/planner-histogram-fanout-stats.md`
+- Scalar SQL function execution in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — added core scalar functions (`LENGTH`/`UPPER`/`LOWER`/`TYPEOF`/`ABS`/`COALESCE`/`IFNULL`/`NULLIF`/`SUBSTR`/`INSTR`/`REPLACE`/`TRIM`/`LTRIM`/`RTRIM`) and wired scalar-call evaluation across regular/join/grouped/aggregate expression paths; scalar wrappers over aggregate calls now evaluate correctly (for example `COALESCE(MAX(v), 0)`); see `notes/scalar-sql-functions.md`
 
 Recommended next step:
 - Add index-driven JOIN probe optimization for equality `ON` predicates to reduce nested-loop full scans.
@@ -64,6 +65,9 @@ Recommended next step:
 Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-storage -p ralph-sqlite` (planner histogram/fanout stats): pass, 0 failed (191 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner histogram/fanout stats, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (scalar SQL function execution, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-executor` (scalar SQL function execution): pass, 0 failed (24 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (scalar SQL function integration): pass, 0 failed (97 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test --workspace` (LIKE operator fix): pass, 0 failed (282 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-executor` (LIKE operator fix): pass, 0 failed (22 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-sqlite` (LIKE operator fix): pass, 0 failed (95 tests).
@@ -222,6 +226,7 @@ Test pass rate:
 42. ~~Planner stats selectivity/cost refinement~~ ✓
 43. ~~LIKE operator correctness fix~~ ✓
 44. ~~Planner histogram/fanout statistics for multi-column prefix/range cost estimation~~ ✓
+45. ~~Core scalar SQL function execution~~ ✓
 
 ## Completed Tasks
 
@@ -456,6 +461,11 @@ Test pass rate:
   - Added case-insensitive ASCII matching per SQLite default behavior
   - Added NULL operand propagation (LIKE with NULL returns NULL)
   - Added 7 executor unit tests and 3 integration tests; see `notes/like-operator-fix.md`
+- [x] Core scalar SQL function execution (agent codex)
+  - Added shared scalar evaluator in `crates/executor` for `LENGTH`, `UPPER`, `LOWER`, `TYPEOF`, `ABS`, `COALESCE`, `IFNULL`, `NULLIF`, `SUBSTR`, `INSTR`, `REPLACE`, `TRIM`, `LTRIM`, and `RTRIM`
+  - Wired `Expr::FunctionCall` evaluation through regular/join/grouped/aggregate paths in `crates/ralph-sqlite`
+  - Added scalar-wrapper-over-aggregate support (for example `COALESCE(MAX(v), 0)`)
+  - Added executor + integration tests; see `notes/scalar-sql-functions.md`
 
 ## Known Issues
 
@@ -464,5 +474,6 @@ Test pass rate:
 - Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection with persisted row/distinct metadata; histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. Join execution uses nested-loop cross products with no index-driven optimization.
+- Core scalar SQL functions are implemented, but scalar multi-argument `MIN`/`MAX` and SQLite `HEX`/`QUOTE` behaviors are not yet implemented.
 - No subquery support
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

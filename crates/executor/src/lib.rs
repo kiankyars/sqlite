@@ -415,7 +415,9 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
         Expr::IsNull { expr, negated } => {
             let value = eval_expr(expr, row_ctx)?;
             let is_null = matches!(value, Value::Null);
-            Ok(Value::Integer((if *negated { !is_null } else { is_null }) as i64))
+            Ok(Value::Integer(
+                (if *negated { !is_null } else { is_null }) as i64,
+            ))
         }
         Expr::Between {
             expr,
@@ -426,12 +428,14 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
             let value = eval_expr(expr, row_ctx)?;
             let low_value = eval_expr(low, row_ctx)?;
             let high_value = eval_expr(high, row_ctx)?;
-            let ge_low = compare_values(&value, &low_value)
-                .map(|ord| ord >= std::cmp::Ordering::Equal)?;
-            let le_high = compare_values(&value, &high_value)
-                .map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let ge_low =
+                compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&value, &high_value).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
-            Ok(Value::Integer((if *negated { !between } else { between }) as i64))
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
         }
         Expr::InList {
             expr,
@@ -447,12 +451,264 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
                     break;
                 }
             }
-            Ok(Value::Integer((if *negated { !found } else { found }) as i64))
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
         }
-        Expr::FunctionCall { name, .. } => Err(ExecutorError::new(format!(
-            "function '{name}' is not supported yet"
-        ))),
+        Expr::FunctionCall { name, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval_expr(arg, row_ctx)?);
+            }
+            eval_scalar_function(name, &values)
+        }
     }
+}
+
+pub fn eval_scalar_function(name: &str, args: &[Value]) -> ExecResult<Value> {
+    if name.eq_ignore_ascii_case("LENGTH") {
+        expect_arg_count(name, args, 1)?;
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Integer(
+            value_to_string(&args[0]).chars().count() as i64
+        ));
+    }
+
+    if name.eq_ignore_ascii_case("UPPER") {
+        expect_arg_count(name, args, 1)?;
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Text(value_to_string(&args[0]).to_ascii_uppercase()));
+    }
+
+    if name.eq_ignore_ascii_case("LOWER") {
+        expect_arg_count(name, args, 1)?;
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Text(value_to_string(&args[0]).to_ascii_lowercase()));
+    }
+
+    if name.eq_ignore_ascii_case("TYPEOF") {
+        expect_arg_count(name, args, 1)?;
+        let kind = match args[0] {
+            Value::Null => "null",
+            Value::Integer(_) => "integer",
+            Value::Real(_) => "real",
+            Value::Text(_) => "text",
+        };
+        return Ok(Value::Text(kind.to_string()));
+    }
+
+    if name.eq_ignore_ascii_case("ABS") {
+        expect_arg_count(name, args, 1)?;
+        return match args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Integer(i) => i
+                .checked_abs()
+                .map(Value::Integer)
+                .ok_or_else(|| ExecutorError::new("integer overflow in ABS()")),
+            Value::Real(f) => Ok(Value::Real(f.abs())),
+            Value::Text(_) => Err(ExecutorError::new("ABS() expects a numeric value")),
+        };
+    }
+
+    if name.eq_ignore_ascii_case("COALESCE") {
+        if args.is_empty() {
+            return Err(ExecutorError::new(
+                "COALESCE() expects at least one argument",
+            ));
+        }
+        for arg in args {
+            if !matches!(arg, Value::Null) {
+                return Ok(arg.clone());
+            }
+        }
+        return Ok(Value::Null);
+    }
+
+    if name.eq_ignore_ascii_case("IFNULL") {
+        expect_arg_count(name, args, 2)?;
+        if matches!(args[0], Value::Null) {
+            return Ok(args[1].clone());
+        }
+        return Ok(args[0].clone());
+    }
+
+    if name.eq_ignore_ascii_case("NULLIF") {
+        expect_arg_count(name, args, 2)?;
+        if values_equal(&args[0], &args[1]) {
+            return Ok(Value::Null);
+        }
+        return Ok(args[0].clone());
+    }
+
+    if name.eq_ignore_ascii_case("SUBSTR") {
+        if args.len() != 2 && args.len() != 3 {
+            return Err(ExecutorError::new(
+                "SUBSTR() expects exactly two or three arguments",
+            ));
+        }
+        if matches!(args[0], Value::Null)
+            || matches!(args[1], Value::Null)
+            || (args.len() == 3 && matches!(args[2], Value::Null))
+        {
+            return Ok(Value::Null);
+        }
+        let source = value_to_string(&args[0]);
+        let start = value_to_i64(&args[1])?;
+        let length = if args.len() == 3 {
+            Some(value_to_i64(&args[2])?)
+        } else {
+            None
+        };
+        return Ok(Value::Text(sql_substr(&source, start, length)));
+    }
+
+    if name.eq_ignore_ascii_case("INSTR") {
+        expect_arg_count(name, args, 2)?;
+        if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let haystack = value_to_string(&args[0]);
+        let needle = value_to_string(&args[1]);
+        if needle.is_empty() {
+            return Ok(Value::Integer(1));
+        }
+        if let Some(byte_idx) = haystack.find(&needle) {
+            return Ok(Value::Integer(
+                haystack[..byte_idx].chars().count() as i64 + 1,
+            ));
+        }
+        return Ok(Value::Integer(0));
+    }
+
+    if name.eq_ignore_ascii_case("REPLACE") {
+        expect_arg_count(name, args, 3)?;
+        if matches!(args[0], Value::Null)
+            || matches!(args[1], Value::Null)
+            || matches!(args[2], Value::Null)
+        {
+            return Ok(Value::Null);
+        }
+        let source = value_to_string(&args[0]);
+        let from = value_to_string(&args[1]);
+        let to = value_to_string(&args[2]);
+        if from.is_empty() {
+            return Ok(Value::Text(source));
+        }
+        return Ok(Value::Text(source.replace(&from, &to)));
+    }
+
+    if name.eq_ignore_ascii_case("TRIM") {
+        return eval_trim_function(name, args, TrimDirection::Both);
+    }
+    if name.eq_ignore_ascii_case("LTRIM") {
+        return eval_trim_function(name, args, TrimDirection::Left);
+    }
+    if name.eq_ignore_ascii_case("RTRIM") {
+        return eval_trim_function(name, args, TrimDirection::Right);
+    }
+
+    Err(ExecutorError::new(format!(
+        "function '{name}' is not supported yet"
+    )))
+}
+
+#[derive(Clone, Copy)]
+enum TrimDirection {
+    Left,
+    Right,
+    Both,
+}
+
+fn eval_trim_function(name: &str, args: &[Value], direction: TrimDirection) -> ExecResult<Value> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(ExecutorError::new(format!(
+            "{name}() expects one or two arguments"
+        )));
+    }
+    if matches!(args[0], Value::Null) || (args.len() == 2 && matches!(args[1], Value::Null)) {
+        return Ok(Value::Null);
+    }
+
+    let source = value_to_string(&args[0]);
+    let trim_chars: Vec<char> = if args.len() == 2 {
+        value_to_string(&args[1]).chars().collect()
+    } else {
+        vec![' ']
+    };
+    let input: Vec<char> = source.chars().collect();
+    let mut start = 0usize;
+    let mut end = input.len();
+
+    if matches!(direction, TrimDirection::Left | TrimDirection::Both) {
+        while start < end && trim_chars.contains(&input[start]) {
+            start += 1;
+        }
+    }
+    if matches!(direction, TrimDirection::Right | TrimDirection::Both) {
+        while end > start && trim_chars.contains(&input[end - 1]) {
+            end -= 1;
+        }
+    }
+
+    Ok(Value::Text(input[start..end].iter().collect()))
+}
+
+fn expect_arg_count(name: &str, args: &[Value], expected: usize) -> ExecResult<()> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(ExecutorError::new(format!(
+            "{name}() expects exactly {expected} argument{}",
+            if expected == 1 { "" } else { "s" }
+        )))
+    }
+}
+
+fn value_to_i64(value: &Value) -> ExecResult<i64> {
+    match value {
+        Value::Integer(i) => Ok(*i),
+        Value::Real(f) => Ok(*f as i64),
+        Value::Null => Ok(0),
+        Value::Text(_) => Err(ExecutorError::new("expected integer value")),
+    }
+}
+
+fn sql_substr(source: &str, start: i64, length: Option<i64>) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let char_len = chars.len() as i64;
+    if char_len == 0 {
+        return String::new();
+    }
+
+    let mut start_idx = if start > 0 {
+        start - 1
+    } else if start < 0 {
+        char_len + start
+    } else {
+        0
+    };
+    start_idx = start_idx.clamp(0, char_len);
+
+    let (begin, end) = match length {
+        Some(len) if len < 0 => {
+            let end = start_idx;
+            let begin = (start_idx + len).clamp(0, end);
+            (begin, end)
+        }
+        Some(len) => {
+            let end = (start_idx + len).clamp(start_idx, char_len);
+            (start_idx, end)
+        }
+        None => (start_idx, char_len),
+    };
+
+    chars[begin as usize..end as usize].iter().collect()
 }
 
 fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> ExecResult<Value> {
@@ -462,15 +718,19 @@ fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> ExecResult<Va
         Add | Subtract | Multiply | Divide | Modulo => eval_numeric_binary(lhs, op, rhs),
         Eq => Ok(Value::Integer(values_equal(lhs, rhs) as i64)),
         NotEq => Ok(Value::Integer((!values_equal(lhs, rhs)) as i64)),
-        Lt => compare_values(lhs, rhs).map(|ord| Value::Integer((ord == std::cmp::Ordering::Less) as i64)),
+        Lt => compare_values(lhs, rhs)
+            .map(|ord| Value::Integer((ord == std::cmp::Ordering::Less) as i64)),
         LtEq => compare_values(lhs, rhs).map(|ord| {
-            Value::Integer((ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal) as i64)
+            Value::Integer(
+                (ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal) as i64,
+            )
         }),
-        Gt => {
-            compare_values(lhs, rhs).map(|ord| Value::Integer((ord == std::cmp::Ordering::Greater) as i64))
-        }
+        Gt => compare_values(lhs, rhs)
+            .map(|ord| Value::Integer((ord == std::cmp::Ordering::Greater) as i64)),
         GtEq => compare_values(lhs, rhs).map(|ord| {
-            Value::Integer((ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal) as i64)
+            Value::Integer(
+                (ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal) as i64,
+            )
         }),
         And => Ok(Value::Integer((is_truthy(lhs) && is_truthy(rhs)) as i64)),
         Or => Ok(Value::Integer((is_truthy(lhs) || is_truthy(rhs)) as i64)),
@@ -608,7 +868,9 @@ fn compare_values(lhs: &Value, rhs: &Value) -> ExecResult<std::cmp::Ordering> {
             .ok_or_else(|| ExecutorError::new("cannot compare NaN values")),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
         (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        _ => Err(ExecutorError::new("cannot compare values of different types")),
+        _ => Err(ExecutorError::new(
+            "cannot compare values of different types",
+        )),
     }
 }
 
@@ -850,6 +1112,13 @@ mod tests {
         }
     }
 
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name: name.to_string(),
+            args,
+        }
+    }
+
     #[test]
     fn scan_emits_rows_in_order() {
         let mut scan = Scan::new(vec![vec![int(1)], vec![int(2)]]);
@@ -924,7 +1193,11 @@ mod tests {
     #[test]
     fn eval_expr_handles_arithmetic_and_boolean_ops() {
         let expr = bin(
-            bin(Expr::IntegerLiteral(7), BinaryOperator::Subtract, Expr::IntegerLiteral(2)),
+            bin(
+                Expr::IntegerLiteral(7),
+                BinaryOperator::Subtract,
+                Expr::IntegerLiteral(2),
+            ),
             BinaryOperator::Eq,
             Expr::IntegerLiteral(5),
         );
@@ -981,6 +1254,75 @@ mod tests {
         let columns = vec!["known".to_string()];
         let err = eval_expr(&col("missing"), Some((&row, columns.as_slice()))).unwrap_err();
         assert_eq!(err.to_string(), "unknown column 'missing'");
+    }
+
+    #[test]
+    fn eval_expr_supports_scalar_functions() {
+        assert_eq!(
+            eval_expr(
+                &call("LENGTH", vec![Expr::StringLiteral("hello".to_string())]),
+                None
+            )
+            .unwrap(),
+            int(5)
+        );
+        assert_eq!(
+            eval_expr(
+                &call("UPPER", vec![Expr::StringLiteral("MiXeD".to_string())]),
+                None
+            )
+            .unwrap(),
+            Value::Text("MIXED".to_string())
+        );
+        assert_eq!(
+            eval_expr(
+                &call(
+                    "COALESCE",
+                    vec![Expr::Null, Expr::IntegerLiteral(7), Expr::IntegerLiteral(8)]
+                ),
+                None
+            )
+            .unwrap(),
+            int(7)
+        );
+        assert_eq!(
+            eval_expr(
+                &call(
+                    "SUBSTR",
+                    vec![
+                        Expr::StringLiteral("alphabet".to_string()),
+                        Expr::IntegerLiteral(3),
+                        Expr::IntegerLiteral(3)
+                    ]
+                ),
+                None
+            )
+            .unwrap(),
+            Value::Text("pha".to_string())
+        );
+        assert_eq!(
+            eval_expr(
+                &call(
+                    "TRIM",
+                    vec![
+                        Expr::StringLiteral("..hello..".to_string()),
+                        Expr::StringLiteral(".".to_string())
+                    ]
+                ),
+                None
+            )
+            .unwrap(),
+            Value::Text("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_expr_scalar_function_errors_for_unsupported_name() {
+        let err = eval_expr(&call("DOES_NOT_EXIST", vec![]), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "function 'DOES_NOT_EXIST' is not supported yet"
+        );
     }
 
     #[test]

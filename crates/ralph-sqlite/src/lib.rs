@@ -7,9 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ralph_executor::{
-    self, decode_index_payload, decode_row, encode_value, index_key_for_value,
-    ordered_index_key_for_value, sql_like_match, Filter, IndexBucket, IndexEqScan, Operator,
-    TableScan, Value,
+    self, decode_index_payload, decode_row, encode_value, eval_scalar_function,
+    index_key_for_value, ordered_index_key_for_value, sql_like_match, Filter, IndexBucket,
+    IndexEqScan, Operator, TableScan, Value,
 };
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
@@ -88,6 +88,12 @@ struct IndexCardinalityStats {
     estimated_rows: usize,
     estimated_distinct_keys: usize,
     prefix_distinct_counts: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct JoinIndexProbePlan {
+    index_meta: IndexMeta,
+    left_probe_col_idx: usize,
 }
 
 pub struct Database {
@@ -2431,7 +2437,9 @@ fn eval_grouped_expr(
             if is_aggregate_function(name) {
                 eval_aggregate_function(name, args, meta, rows, scalar_row_count)
             } else {
-                eval_expr(expr, row_ctx)
+                eval_scalar_function_expr(name, args, |arg| {
+                    eval_grouped_expr(arg, meta, rows, scalar_row_count, representative_row)
+                })
             }
         }
     }
@@ -2590,7 +2598,13 @@ fn eval_aggregate_expr(
             ))
         }
         Expr::FunctionCall { name, args } => {
-            eval_aggregate_function(name, args, meta, rows, scalar_row_count)
+            if is_aggregate_function(name) {
+                eval_aggregate_function(name, args, meta, rows, scalar_row_count)
+            } else {
+                eval_scalar_function_expr(name, args, |arg| {
+                    eval_aggregate_expr(arg, meta, rows, scalar_row_count)
+                })
+            }
         }
     }
 }
@@ -3044,11 +3058,9 @@ fn eval_grouped_join_expr(
             if is_aggregate_function(name) {
                 eval_join_aggregate_function(name, args, meta, rows, table_ranges)
             } else {
-                let row = representative_row.ok_or_else(|| {
-                    "grouped join query requires at least one row for non-aggregate expressions"
-                        .to_string()
-                })?;
-                eval_join_expr(expr, meta, row, table_ranges)
+                eval_scalar_function_expr(name, args, |arg| {
+                    eval_grouped_join_expr(arg, meta, rows, representative_row, table_ranges)
+                })
             }
         }
     }
@@ -3167,7 +3179,13 @@ fn eval_join_aggregate_expr(
             ))
         }
         Expr::FunctionCall { name, args } => {
-            eval_join_aggregate_function(name, args, meta, rows, table_ranges)
+            if is_aggregate_function(name) {
+                eval_join_aggregate_function(name, args, meta, rows, table_ranges)
+            } else {
+                eval_scalar_function_expr(name, args, |arg| {
+                    eval_join_aggregate_expr(arg, meta, rows, table_ranges)
+                })
+            }
         }
     }
 }
@@ -3434,7 +3452,9 @@ fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Val
                 (if *negated { !found } else { found }) as i64,
             ))
         }
-        Expr::FunctionCall { name, .. } => Err(format!("function '{name}' is not supported yet")),
+        Expr::FunctionCall { name, args } => {
+            eval_scalar_function_expr(name, args, |arg| eval_expr(arg, row_ctx))
+        }
     }
 }
 
@@ -3547,8 +3567,21 @@ fn eval_join_expr(
                 (if *negated { !found } else { found }) as i64,
             ))
         }
-        Expr::FunctionCall { name, .. } => Err(format!("function '{name}' is not supported yet")),
+        Expr::FunctionCall { name, args } => eval_scalar_function_expr(name, args, |arg| {
+            eval_join_expr(arg, meta, row, table_ranges)
+        }),
     }
+}
+
+fn eval_scalar_function_expr<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, String>
+where
+    F: FnMut(&Expr) -> Result<Value, String>,
+{
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_arg(arg)?);
+    }
+    eval_scalar_function(name, &values).map_err(|err| err.to_string())
 }
 
 fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value, String> {
@@ -7015,6 +7048,86 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("without GROUP BY"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn scalar_functions_execute_in_selects() {
+        let path = temp_db_path("scalar_functions");
+        let mut db = Database::open(&path).unwrap();
+
+        let result = db
+            .execute(
+                "SELECT LENGTH('hello'), UPPER('MiXeD'), LOWER('MiXeD'), \
+                 SUBSTR('alphabet', 3, 3), INSTR('alphabet', 'ha'), \
+                 TRIM('..hello..', '.'), REPLACE('banana', 'na', 'X'), TYPEOF(42);",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(5),
+                        Value::Text("MIXED".to_string()),
+                        Value::Text("mixed".to_string()),
+                        Value::Text("pha".to_string()),
+                        Value::Integer(4),
+                        Value::Text("hello".to_string()),
+                        Value::Text("baXX".to_string()),
+                        Value::Text("integer".to_string()),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn scalar_functions_handle_null_and_aggregate_wrapping() {
+        let path = temp_db_path("scalar_functions_null_aggregate");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (v INTEGER, s TEXT);").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, NULL);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT COALESCE(NULL, NULL, 'x'), IFNULL(NULL, 7), \
+                 NULLIF(5, 5), NULLIF(5, 4), ABS(-4), LENGTH(NULL);",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Text("x".to_string()),
+                        Value::Integer(7),
+                        Value::Null,
+                        Value::Integer(5),
+                        Value::Integer(4),
+                        Value::Null,
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Scalar function around aggregate argument should evaluate in aggregate mode.
+        let wrapped_agg = db
+            .execute("SELECT COALESCE(MAX(v), 0) FROM t WHERE v > 100;")
+            .unwrap();
+        match wrapped_agg {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(0)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }
