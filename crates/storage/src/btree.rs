@@ -35,6 +35,7 @@
 //! [12..]  payload: [u8; payload_size]
 //! ```
 
+use std::collections::HashSet;
 use std::io;
 
 use crate::pager::{PageNum, Pager};
@@ -87,6 +88,21 @@ impl<'a> BTree<'a> {
             init_leaf(page, page_size);
         }
         Ok(page_num)
+    }
+
+    /// Reclaim all pages that belong to a tree rooted at `root_page`.
+    ///
+    /// Pages are freed in post-order (children before parent) so the page
+    /// graph is fully traversed before reclamation.
+    pub fn reclaim_tree(pager: &mut Pager, root_page: PageNum) -> io::Result<usize> {
+        let mut pages = Vec::new();
+        let mut visited = HashSet::new();
+        Self::collect_tree_pages(pager, root_page, &mut pages, &mut visited)?;
+
+        for page_num in pages.iter().rev().copied() {
+            pager.free_page(page_num)?;
+        }
+        Ok(pages.len())
     }
 
     /// Insert a key-value pair. If the key already exists, the payload is updated.
@@ -695,6 +711,42 @@ impl<'a> BTree<'a> {
         }
 
         Ok(results)
+    }
+
+    fn collect_tree_pages(
+        pager: &mut Pager,
+        page_num: PageNum,
+        out: &mut Vec<PageNum>,
+        visited: &mut HashSet<PageNum>,
+    ) -> io::Result<()> {
+        if !visited.insert(page_num) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate or cyclic B+tree page reference: {}", page_num),
+            ));
+        }
+
+        let (page_type, children) = {
+            let page = pager.read_page(page_num)?;
+            match page[0] {
+                PAGE_TYPE_LEAF => (PAGE_TYPE_LEAF, Vec::new()),
+                PAGE_TYPE_INTERIOR => (PAGE_TYPE_INTERIOR, read_interior_node(page).children),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown page type: {}", other),
+                    ))
+                }
+            }
+        };
+
+        if page_type == PAGE_TYPE_INTERIOR {
+            for child in children {
+                Self::collect_tree_pages(pager, child, out, visited)?;
+            }
+        }
+        out.push(page_num);
+        Ok(())
     }
 }
 
@@ -1396,6 +1448,40 @@ mod tests {
         let reclaimed = pager.header().freelist_count;
         assert!(reclaimed > 0);
         let page_count_before = pager.page_count();
+        for _ in 0..reclaimed {
+            pager.allocate_page().unwrap();
+        }
+        assert_eq!(pager.page_count(), page_count_before);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reclaim_tree_returns_pages_to_freelist() {
+        let path = temp_db_path("btree_reclaim_tree.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let root_page = {
+            let mut tree = BTree::new(&mut pager, root);
+            let payload = vec![0xD8; 80];
+            for i in 0..240 {
+                tree.insert(i, &payload).unwrap();
+            }
+            tree.root_page()
+        };
+
+        let freelist_before = pager.header().freelist_count;
+        let page_count_before = pager.page_count();
+        let reclaimed = BTree::reclaim_tree(&mut pager, root_page).unwrap();
+
+        assert!(reclaimed > 0);
+        assert_eq!(
+            pager.header().freelist_count,
+            freelist_before + reclaimed as u32
+        );
+
         for _ in 0..reclaimed {
             pager.allocate_page().unwrap();
         }

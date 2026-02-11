@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE` execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -28,8 +28,13 @@ Latest completions:
 - Schema persistence integration in `crates/storage` + `crates/ralph-sqlite` (Agent codex) — `Database::open` now loads persisted table/index catalogs from schema entries, `CREATE TABLE`/`CREATE INDEX` now persist metadata via `Schema`, and reopen retains both table and index catalogs
 - Transactional dirty-page eviction isolation in `crates/storage` (Agent codex) — dirty LRU victims now spill to an in-memory pending-dirty map instead of writing directly to the DB file; `flush_all` now commits both buffered and spilled dirty pages via WAL, preserving rollback correctness when eviction occurs before COMMIT
 - B+tree delete freelist reclamation in `crates/storage` (Agent 3) — delete-time compaction now returns removed leaf/interior/root-child pages to `Pager::free_page()` so reclaimed pages are reusable via the freelist
+- DROP TABLE execution + object-tree reclamation in `crates/ralph-sqlite` + `crates/storage` (Agent codex) — `DROP TABLE` now removes schema entries and dependent index metadata, then reclaims table/index B+tree pages through a new `BTree::reclaim_tree` helper so pages return to the freelist
 
 Test pass rate:
+- `cargo test --workspace` (DROP TABLE + reclamation): pass, 0 failed (151 tests).
+- `cargo test -p ralph-storage` (DROP TABLE + reclamation): pass, 0 failed (51 tests).
+- `cargo test -p ralph-sqlite` (DROP TABLE + reclamation): pass, 0 failed (28 tests).
+- `./test.sh --fast` (DROP TABLE + reclamation, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (B+tree delete freelist reclamation): pass, 0 failed (46 tests).
 - `./test.sh --fast` (B+tree delete freelist reclamation, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
@@ -85,6 +90,7 @@ Test pass rate:
 18. ~~B+tree split/merge~~ ✓
 19. ~~ORDER BY, LIMIT, aggregates~~ ✓
 20. ~~Transactional dirty-page eviction isolation~~ ✓
+21. ~~DROP TABLE execution + schema/index page reclamation~~ ✓
 
 ## Completed Tasks
 
@@ -205,14 +211,19 @@ Test pass rate:
   - `ensure_loaded` now reloads spilled dirty pages before disk reads so uncommitted changes stay visible inside the current transaction
   - `flush_all` now WAL-commits and applies both in-pool dirty pages and spilled dirty pages
   - Added pager tests for dirty-page visibility after eviction and non-durability across reopen without commit; see `notes/wal-eviction-transactional-correctness.md`
+- [x] DROP TABLE execution + object-tree reclamation (agent codex)
+  - Added `Stmt::DropTable` execution with `IF EXISTS` behavior and `ExecuteResult::DropTable`
+  - Added schema deletion APIs: `Schema::drop_table`, `Schema::drop_index`, `Schema::list_indexes_for_table`
+  - Added `BTree::reclaim_tree` to free full table/index trees back to the freelist during object drop
+  - Added storage + integration coverage; see `notes/drop-table-page-reclamation.md`
 
 ## Known Issues
 
-- Pager now exposes `free_page()` and B+tree delete compaction reclaims removed pages, but broader page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
 - UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.
 - Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.
+- `DROP INDEX` SQL execution is not implemented yet.
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support

@@ -172,6 +172,28 @@ impl Schema {
         Self::list_by_type(pager, ObjectType::Index)
     }
 
+    /// List indexes associated with the given table.
+    pub fn list_indexes_for_table(
+        pager: &mut Pager,
+        table_name: &str,
+    ) -> io::Result<Vec<SchemaEntry>> {
+        let indexes = Self::list_indexes(pager)?;
+        Ok(indexes
+            .into_iter()
+            .filter(|entry| entry.table_name.eq_ignore_ascii_case(table_name))
+            .collect())
+    }
+
+    /// Remove a table entry from the schema and return the removed metadata.
+    pub fn drop_table(pager: &mut Pager, table_name: &str) -> io::Result<Option<SchemaEntry>> {
+        Self::delete_by_name(pager, ObjectType::Table, table_name)
+    }
+
+    /// Remove an index entry from the schema and return the removed metadata.
+    pub fn drop_index(pager: &mut Pager, index_name: &str) -> io::Result<Option<SchemaEntry>> {
+        Self::delete_by_name(pager, ObjectType::Index, index_name)
+    }
+
     fn insert_entry(pager: &mut Pager, mut entry: SchemaEntry) -> io::Result<()> {
         let new_id = Self::next_id(pager)?;
         entry.id = new_id;
@@ -223,6 +245,29 @@ impl Schema {
             entries.push(schema_entry);
         }
         Ok(entries)
+    }
+
+    fn delete_by_name(
+        pager: &mut Pager,
+        object_type: ObjectType,
+        name: &str,
+    ) -> io::Result<Option<SchemaEntry>> {
+        let Some(entry) = Self::find_by_name(pager, object_type, name)? else {
+            return Ok(None);
+        };
+
+        let schema_root = pager.header().schema_root;
+        let mut tree = BTree::new(pager, schema_root);
+        let deleted = tree.delete(entry.id)?;
+        if !deleted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("schema entry id {} not found during delete", entry.id),
+            ));
+        }
+
+        pager.header_mut().schema_root = tree.root_page();
+        Ok(Some(entry))
     }
 
     /// Get the next available schema entry ID.
@@ -287,7 +332,10 @@ fn deserialize_entry(data: &[u8]) -> io::Result<SchemaEntry> {
     let mut pos = 0;
 
     if data.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty schema entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty schema entry",
+        ));
     }
 
     let object_type = match data[pos] {
@@ -339,7 +387,10 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 
 fn read_u16(data: &[u8], pos: &mut usize) -> io::Result<u16> {
     if *pos + 2 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated schema entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated schema entry",
+        ));
     }
     let val = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
@@ -348,7 +399,10 @@ fn read_u16(data: &[u8], pos: &mut usize) -> io::Result<u16> {
 
 fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
     if *pos + 4 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated schema entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated schema entry",
+        ));
     }
     let val = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
@@ -358,7 +412,10 @@ fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
 fn read_str(data: &[u8], pos: &mut usize) -> io::Result<String> {
     let len = read_u16(data, pos)? as usize;
     if *pos + len > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated string in schema entry"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated string in schema entry",
+        ));
     }
     let s = std::str::from_utf8(&data[*pos..*pos + len])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -608,6 +665,75 @@ mod tests {
         let indexes = Schema::list_indexes(&mut pager).unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].name, "idx_users_age");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_table_removes_schema_entry() {
+        let path = temp_db_path("schema_drop_table.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        Schema::initialize(&mut pager).unwrap();
+
+        let table_root = Schema::create_table(
+            &mut pager,
+            "users",
+            &[("id".to_string(), "INTEGER".to_string())],
+            "CREATE TABLE users (id INTEGER)",
+        )
+        .unwrap();
+
+        let dropped = Schema::drop_table(&mut pager, "users").unwrap().unwrap();
+        assert_eq!(dropped.root_page, table_root);
+        assert!(Schema::find_table(&mut pager, "users").unwrap().is_none());
+        assert!(Schema::drop_table(&mut pager, "users").unwrap().is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_removes_schema_entry() {
+        let path = temp_db_path("schema_drop_index.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        Schema::initialize(&mut pager).unwrap();
+        Schema::create_table(
+            &mut pager,
+            "users",
+            &[
+                ("id".to_string(), "INTEGER".to_string()),
+                ("age".to_string(), "INTEGER".to_string()),
+            ],
+            "CREATE TABLE users (id INTEGER, age INTEGER)",
+        )
+        .unwrap();
+        let index_root = Schema::create_index(
+            &mut pager,
+            "idx_users_age",
+            "users",
+            "age",
+            1,
+            "CREATE INDEX idx_users_age ON users(age)",
+        )
+        .unwrap();
+
+        let indexes_for_table = Schema::list_indexes_for_table(&mut pager, "users").unwrap();
+        assert_eq!(indexes_for_table.len(), 1);
+        assert_eq!(indexes_for_table[0].name, "idx_users_age");
+
+        let dropped = Schema::drop_index(&mut pager, "idx_users_age")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.root_page, index_root);
+        assert!(Schema::find_index(&mut pager, "idx_users_age")
+            .unwrap()
+            .is_none());
+        assert!(Schema::drop_index(&mut pager, "idx_users_age")
+            .unwrap()
+            .is_none());
 
         cleanup(&path);
     }

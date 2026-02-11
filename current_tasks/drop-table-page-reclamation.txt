@@ -1,3 +1,0 @@
-created_at_unix=1770808844
-agent_id=4
-task=DROP TABLE execution with schema/index page reclamation

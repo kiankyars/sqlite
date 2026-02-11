@@ -6,13 +6,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ralph_parser::ast::{
-    Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
-    OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName, UnaryOperator, UpdateStmt,
-};
 use ralph_executor::{
     self, decode_index_payload, decode_row, encode_value, index_key_for_value, Filter, IndexBucket,
     IndexEqScan, Operator, TableScan, Value,
+};
+use ralph_parser::ast::{
+    Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropTableStmt, Expr,
+    InsertStmt, OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName, UnaryOperator, UpdateStmt,
 };
 use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
@@ -31,6 +31,7 @@ pub enum ExecuteResult {
     Rollback,
     CreateTable,
     CreateIndex,
+    DropTable,
     Insert { rows_affected: usize },
     Update { rows_affected: usize },
     Delete { rows_affected: usize },
@@ -95,11 +96,11 @@ impl Database {
             Stmt::Rollback => self.execute_rollback(),
             Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt, sql),
             Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt, sql),
+            Stmt::DropTable(drop_stmt) => self.execute_drop_table(drop_stmt),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
             Stmt::Update(update_stmt) => self.execute_update(update_stmt),
             Stmt::Delete(delete_stmt) => self.execute_delete(delete_stmt),
             Stmt::Select(select_stmt) => self.execute_select(select_stmt),
-            other => Err(format!("statement not supported yet: {other:?}")),
         }
     }
 
@@ -273,6 +274,55 @@ impl Database {
         self.indexes.insert(index_key, index_meta);
         self.commit_if_autocommit("create index")?;
         Ok(ExecuteResult::CreateIndex)
+    }
+
+    fn execute_drop_table(&mut self, stmt: DropTableStmt) -> Result<ExecuteResult, String> {
+        let table_key = normalize_identifier(&stmt.table);
+        let table_meta = match self.tables.get(&table_key).cloned() {
+            Some(meta) => meta,
+            None => {
+                if stmt.if_exists {
+                    return Ok(ExecuteResult::DropTable);
+                }
+                return Err(format!("no such table '{}'", stmt.table));
+            }
+        };
+
+        let table_indexes: Vec<(String, IndexMeta)> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.table_key == table_key)
+            .map(|(name, idx)| (name.clone(), idx.clone()))
+            .collect();
+
+        for (index_key, _) in &table_indexes {
+            let dropped = Schema::drop_index(&mut self.pager, index_key)
+                .map_err(|e| format!("drop index schema entry '{}': {e}", index_key))?;
+            let dropped = dropped.ok_or_else(|| {
+                format!(
+                    "drop table '{}': index schema entry '{}' not found",
+                    table_meta.name, index_key
+                )
+            })?;
+            BTree::reclaim_tree(&mut self.pager, dropped.root_page)
+                .map_err(|e| format!("drop index '{}': reclaim pages: {e}", dropped.name))?;
+            self.indexes.remove(index_key);
+        }
+
+        let dropped_table = Schema::drop_table(&mut self.pager, &table_meta.name)
+            .map_err(|e| format!("drop table schema entry '{}': {e}", table_meta.name))?;
+        let dropped_table = dropped_table.ok_or_else(|| {
+            format!(
+                "drop table '{}': table schema entry not found",
+                table_meta.name
+            )
+        })?;
+        BTree::reclaim_tree(&mut self.pager, dropped_table.root_page)
+            .map_err(|e| format!("drop table '{}': reclaim pages: {e}", dropped_table.name))?;
+
+        self.tables.remove(&table_key);
+        self.commit_if_autocommit("drop table")?;
+        Ok(ExecuteResult::DropTable)
     }
 
     fn execute_insert(&mut self, stmt: InsertStmt) -> Result<ExecuteResult, String> {
@@ -718,9 +768,7 @@ impl Database {
         access_path: &AccessPath,
     ) -> Result<Vec<Vec<Value>>, String> {
         let scan_op: Box<dyn Operator + '_> = match access_path {
-            AccessPath::TableScan => {
-                Box::new(TableScan::new(&mut self.pager, meta.root_page))
-            }
+            AccessPath::TableScan => Box::new(TableScan::new(&mut self.pager, meta.root_page)),
             AccessPath::IndexEq {
                 index_name,
                 value_expr,
@@ -748,8 +796,9 @@ impl Database {
             let meta = meta.clone();
             let expr = expr.clone();
             Box::new(Filter::new(scan_op, move |row| {
-                 let val = eval_expr(&expr, Some((&meta, row))).map_err(|e| ralph_executor::ExecutorError::new(e))?;
-                 match val {
+                let val = eval_expr(&expr, Some((&meta, row)))
+                    .map_err(|e| ralph_executor::ExecutorError::new(e))?;
+                match val {
                     Value::Null => Ok(false),
                     Value::Integer(i) => Ok(i != 0),
                     Value::Real(f) => Ok(f != 0.0),
@@ -763,7 +812,7 @@ impl Database {
         let rows = ralph_executor::execute(root_op).map_err(|e| e.to_string())?;
 
         for row in &rows {
-             if row.len() != meta.columns.len() {
+            if row.len() != meta.columns.len() {
                 return Err(format!(
                     "row column count {} does not match table schema {}",
                     row.len(),
@@ -1648,7 +1697,6 @@ fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-
 pub fn version() -> &'static str {
     "0.1.0-bootstrap"
 }
@@ -2080,6 +2128,58 @@ mod tests {
     }
 
     #[test]
+    fn drop_table_removes_table_indexes_and_reclaims_pages() {
+        let path = temp_db_path("drop_table_reclaim");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 30), (2, 20), (3, 30);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+
+        let freelist_before = db.pager.header().freelist_count;
+        let dropped = db.execute("DROP TABLE users;").unwrap();
+        assert_eq!(dropped, ExecuteResult::DropTable);
+        assert!(db
+            .execute("SELECT * FROM users;")
+            .unwrap_err()
+            .contains("no such table"));
+        assert!(!db.indexes.contains_key("idx_users_age"));
+        assert!(db.pager.header().freelist_count > freelist_before);
+
+        assert_eq!(
+            db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+                .unwrap(),
+            ExecuteResult::CreateTable
+        );
+        assert_eq!(
+            db.execute("CREATE INDEX idx_users_age ON users(age);")
+                .unwrap(),
+            ExecuteResult::CreateIndex
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_table_if_exists_is_noop_for_missing_table() {
+        let path = temp_db_path("drop_table_if_exists");
+        let mut db = Database::open(&path).unwrap();
+
+        assert_eq!(
+            db.execute("DROP TABLE IF EXISTS missing;").unwrap(),
+            ExecuteResult::DropTable
+        );
+
+        let err = db.execute("DROP TABLE missing;").unwrap_err();
+        assert!(err.contains("no such table"));
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn table_catalog_persists_across_reopen() {
         let path = temp_db_path("table_catalog_reopen");
         {
@@ -2379,10 +2479,8 @@ mod tests {
             .unwrap();
         db.execute("CREATE INDEX idx_users_score ON users(score);")
             .unwrap();
-        db.execute(
-            "INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);",
-        )
-        .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);")
+            .unwrap();
 
         // UPDATE with WHERE on indexed column — planner should use IndexEq
         let result = db
@@ -2441,20 +2539,14 @@ mod tests {
             .unwrap();
         db.execute("CREATE INDEX idx_users_score ON users(score);")
             .unwrap();
-        db.execute(
-            "INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);",
-        )
-        .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);")
+            .unwrap();
 
         // DELETE with WHERE on indexed column — planner should use IndexEq
-        let result = db
-            .execute("DELETE FROM users WHERE score = 10;")
-            .unwrap();
+        let result = db.execute("DELETE FROM users WHERE score = 10;").unwrap();
         assert_eq!(result, ExecuteResult::Delete { rows_affected: 2 });
 
-        let selected = db
-            .execute("SELECT id, name, score FROM users;")
-            .unwrap();
+        let selected = db.execute("SELECT id, name, score FROM users;").unwrap();
         match selected {
             ExecuteResult::Select(q) => {
                 assert_eq!(
@@ -2497,10 +2589,8 @@ mod tests {
             .unwrap();
         db.execute("CREATE INDEX idx_t_category ON t(category);")
             .unwrap();
-        db.execute(
-            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a');",
-        )
-        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a');")
+            .unwrap();
 
         // Update the indexed column value via index-driven selection
         let result = db
