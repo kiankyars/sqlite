@@ -114,8 +114,7 @@ impl Schema {
         pager: &mut Pager,
         index_name: &str,
         table_name: &str,
-        column_name: &str,
-        column_index: u32,
+        columns: &[(String, u32)],
         sql: &str,
     ) -> io::Result<PageNum> {
         let schema_root = pager.header().schema_root;
@@ -132,6 +131,12 @@ impl Schema {
                 format!("index '{}' already exists", index_name),
             ));
         }
+        if columns.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index must include at least one column",
+            ));
+        }
 
         let index_root = BTree::create(pager)?;
         let entry = SchemaEntry {
@@ -141,11 +146,14 @@ impl Schema {
             table_name: table_name.to_string(),
             root_page: index_root,
             sql: sql.to_string(),
-            columns: vec![ColumnInfo {
-                name: column_name.to_string(),
-                data_type: String::new(),
-                index: column_index,
-            }],
+            columns: columns
+                .iter()
+                .map(|(name, index)| ColumnInfo {
+                    name: name.clone(),
+                    data_type: String::new(),
+                    index: *index,
+                })
+                .collect(),
         };
 
         Self::insert_entry(pager, entry)?;
@@ -647,8 +655,7 @@ mod tests {
             &mut pager,
             "idx_users_age",
             "users",
-            "age",
-            1,
+            &[("age".to_string(), 1)],
             "CREATE INDEX idx_users_age ON users(age)",
         )
         .unwrap();
@@ -714,8 +721,7 @@ mod tests {
             &mut pager,
             "idx_users_age",
             "users",
-            "age",
-            1,
+            &[("age".to_string(), 1)],
             "CREATE INDEX idx_users_age ON users(age)",
         )
         .unwrap();

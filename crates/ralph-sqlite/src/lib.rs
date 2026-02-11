@@ -51,8 +51,8 @@ struct TableMeta {
 struct IndexMeta {
     table_key: String,
     table_name: String,
-    column: String,
-    column_idx: usize,
+    columns: Vec<String>,
+    column_indices: Vec<usize>,
     root_page: PageNum,
     unique: bool,
 }
@@ -222,10 +222,6 @@ impl Database {
         stmt: CreateIndexStmt,
         original_sql: &str,
     ) -> Result<ExecuteResult, String> {
-        if stmt.columns.len() != 1 {
-            return Err("only single-column indexes are supported yet".to_string());
-        }
-
         let index_key = normalize_identifier(&stmt.index);
         if self.indexes.contains_key(&index_key) {
             if stmt.if_not_exists {
@@ -241,16 +237,27 @@ impl Database {
             .cloned()
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
 
-        let column = stmt.columns[0].clone();
-        let column_idx = find_column_index(&table_meta, &column)
-            .ok_or_else(|| format!("unknown column '{}' in table '{}'", column, table_meta.name))?;
+        let mut seen_column_indexes = HashSet::new();
+        let mut indexed_columns = Vec::with_capacity(stmt.columns.len());
+        for column in &stmt.columns {
+            let column_idx = find_column_index(&table_meta, column).ok_or_else(|| {
+                format!("unknown column '{}' in table '{}'", column, table_meta.name)
+            })?;
+            if !seen_column_indexes.insert(column_idx) {
+                return Err(format!("duplicate column '{}' in index definition", column));
+            }
+            indexed_columns.push((column.clone(), column_idx));
+        }
+        let schema_columns: Vec<(String, u32)> = indexed_columns
+            .iter()
+            .map(|(name, idx)| (name.clone(), *idx as u32))
+            .collect();
 
         let root_page = Schema::create_index(
             &mut self.pager,
             &stmt.index,
             &table_meta.name,
-            &column,
-            column_idx as u32,
+            &schema_columns,
             original_sql.trim(),
         )
         .map_err(|e| format!("create index: {e}"))?;
@@ -273,11 +280,18 @@ impl Database {
             decoded_rows.push((entry.key, row));
         }
 
+        let index_columns: Vec<String> = indexed_columns
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let index_column_indices: Vec<usize> =
+            indexed_columns.iter().map(|(_, idx)| *idx).collect();
+
         if stmt.unique {
             validate_unique_index_backfill_rows(
                 &table_meta.name,
-                &column,
-                column_idx,
+                &index_columns,
+                &index_column_indices,
                 decoded_rows.iter().map(|(_, row)| row),
             )?;
         }
@@ -285,8 +299,8 @@ impl Database {
         let index_meta = IndexMeta {
             table_key: table_key.clone(),
             table_name: table_meta.name.clone(),
-            column,
-            column_idx,
+            columns: index_columns,
+            column_indices: index_column_indices,
             root_page,
             unique: stmt.unique,
         };
@@ -449,14 +463,8 @@ impl Database {
         rowid: i64,
         row: &[Value],
     ) -> Result<(), String> {
-        let value = row.get(index_meta.column_idx).ok_or_else(|| {
-            format!(
-                "row missing indexed column '{}' for index on '{}'",
-                index_meta.column, index_meta.table_name
-            )
-        })?;
-
-        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
+        let indexed_values = index_values_from_row(index_meta, row)?;
+        let (key, bucket_value) = index_key_and_bucket_value(&indexed_values)?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let mut buckets = match tree
             .lookup(key)
@@ -466,9 +474,12 @@ impl Database {
             None => Vec::new(),
         };
 
-        if let Some(existing) = buckets.iter_mut().find(|b| values_equal(&b.value, value)) {
+        if let Some(existing) = buckets
+            .iter_mut()
+            .find(|b| values_equal(&b.value, &bucket_value))
+        {
             if index_meta.unique
-                && !matches!(value, Value::Null)
+                && !index_value_contains_null(&indexed_values)
                 && existing
                     .rowids
                     .iter()
@@ -476,7 +487,7 @@ impl Database {
             {
                 return Err(unique_constraint_error(
                     &index_meta.table_name,
-                    &index_meta.column,
+                    &index_meta.columns,
                 ));
             }
             if !existing.rowids.contains(&rowid) {
@@ -484,7 +495,7 @@ impl Database {
             }
         } else {
             buckets.push(IndexBucket {
-                value: value.clone(),
+                value: bucket_value,
                 rowids: vec![rowid],
             });
         }
@@ -501,14 +512,8 @@ impl Database {
         rowid: i64,
         row: &[Value],
     ) -> Result<(), String> {
-        let value = row.get(index_meta.column_idx).ok_or_else(|| {
-            format!(
-                "row missing indexed column '{}' for index on '{}'",
-                index_meta.column, index_meta.table_name
-            )
-        })?;
-
-        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
+        let indexed_values = index_values_from_row(index_meta, row)?;
+        let (key, bucket_value) = index_key_and_bucket_value(&indexed_values)?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let Some(payload) = tree
             .lookup(key)
@@ -520,7 +525,7 @@ impl Database {
         let mut buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
         if let Some(bucket) = buckets
             .iter_mut()
-            .find(|bucket| values_equal(&bucket.value, value))
+            .find(|bucket| values_equal(&bucket.value, &bucket_value))
         {
             bucket.rowids.retain(|candidate| *candidate != rowid);
         }
@@ -1061,11 +1066,11 @@ impl Database {
     fn planner_indexes_for_table(&self, table_key: &str) -> Vec<IndexInfo> {
         self.indexes
             .iter()
-            .filter(|(_, idx)| idx.table_key == table_key)
+            .filter(|(_, idx)| idx.table_key == table_key && idx.columns.len() == 1)
             .map(|(name, idx)| IndexInfo {
                 name: name.clone(),
                 table: idx.table_name.clone(),
-                column: idx.column.clone(),
+                column: idx.columns[0].clone(),
             })
             .collect()
     }
@@ -1176,10 +1181,7 @@ impl Database {
         let left_rows = self.read_all_rows(&left_meta)?;
 
         // Build joined meta starting from left table
-        let left_alias = from
-            .alias
-            .as_deref()
-            .unwrap_or(&from.table);
+        let left_alias = from.alias.as_deref().unwrap_or(&from.table);
         let mut joined_columns: Vec<String> = left_meta.columns.clone();
         let mut table_ranges: Vec<(String, usize, usize)> =
             vec![(left_alias.to_string(), 0, left_meta.columns.len())];
@@ -1194,10 +1196,7 @@ impl Database {
                 .ok_or_else(|| format!("no such table '{}'", join.table))?;
             let right_rows = self.read_all_rows(&right_meta)?;
 
-            let right_alias = join
-                .alias
-                .as_deref()
-                .unwrap_or(&join.table);
+            let right_alias = join.alias.as_deref().unwrap_or(&join.table);
             let right_col_start = joined_columns.len();
             joined_columns.extend(right_meta.columns.iter().cloned());
             table_ranges.push((
@@ -1224,12 +1223,8 @@ impl Database {
                     combined.extend_from_slice(right_row);
 
                     if let Some(on_expr) = &join.condition {
-                        let matches = eval_join_expr(
-                            on_expr,
-                            &synthetic_meta,
-                            &combined,
-                            &table_ranges,
-                        )?;
+                        let matches =
+                            eval_join_expr(on_expr, &synthetic_meta, &combined, &table_ranges)?;
                         if !is_truthy(&matches) {
                             continue;
                         }
@@ -1266,7 +1261,11 @@ impl Database {
                 let right_key = normalize_identifier(&join.table);
                 let right_meta = self.tables.get(&right_key).cloned().unwrap();
                 let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-                table_ranges.push((right_alias.to_string(), offset, offset + right_meta.columns.len()));
+                table_ranges.push((
+                    right_alias.to_string(),
+                    offset,
+                    offset + right_meta.columns.len(),
+                ));
                 offset += right_meta.columns.len();
             }
         }
@@ -1335,34 +1334,35 @@ impl Database {
                 if !index_meta.unique {
                     continue;
                 }
-                let value = row.get(index_meta.column_idx).ok_or_else(|| {
-                    format!(
-                        "row missing indexed column '{}' for index on '{}'",
-                        index_meta.column, index_meta.table_name
-                    )
-                })?;
-                if matches!(value, Value::Null) {
+                let indexed_values = index_values_from_row(index_meta, row)?;
+                if index_value_contains_null(&indexed_values) {
                     continue;
                 }
+                let (key, bucket_value) = index_key_and_bucket_value(&indexed_values)?;
 
-                if self.unique_value_conflicts_with_existing(index_meta, value, &excluded_rowids)? {
+                if self.unique_value_conflicts_with_existing(
+                    index_meta,
+                    key,
+                    &bucket_value,
+                    &excluded_rowids,
+                )? {
                     return Err(unique_constraint_error(
                         &index_meta.table_name,
-                        &index_meta.column,
+                        &index_meta.columns,
                     ));
                 }
 
                 let seen_values = seen_by_index.entry(index_meta.root_page).or_default();
                 if seen_values
                     .iter()
-                    .any(|seen_value| values_equal(seen_value, value))
+                    .any(|seen_value| values_equal(seen_value, &bucket_value))
                 {
                     return Err(unique_constraint_error(
                         &index_meta.table_name,
-                        &index_meta.column,
+                        &index_meta.columns,
                     ));
                 }
-                seen_values.push(value.clone());
+                seen_values.push(bucket_value);
             }
         }
 
@@ -1375,23 +1375,24 @@ impl Database {
         updates: &[(i64, Vec<Value>, Vec<Value>)],
     ) -> Result<(), String> {
         let update_rowids: HashSet<i64> = updates.iter().map(|(rowid, _, _)| *rowid).collect();
-        let mut current_values_by_index: HashMap<PageNum, HashMap<i64, Value>> = HashMap::new();
+        let mut current_values_by_index: HashMap<PageNum, HashMap<i64, Option<Value>>> =
+            HashMap::new();
 
         for (rowid, original_row, _) in updates {
             for index_meta in table_indexes {
                 if !index_meta.unique {
                     continue;
                 }
-                let value = original_row.get(index_meta.column_idx).ok_or_else(|| {
-                    format!(
-                        "row missing indexed column '{}' for index on '{}'",
-                        index_meta.column, index_meta.table_name
-                    )
-                })?;
+                let indexed_values = index_values_from_row(index_meta, original_row)?;
+                let encoded = if index_value_contains_null(&indexed_values) {
+                    None
+                } else {
+                    Some(index_key_and_bucket_value(&indexed_values)?.1)
+                };
                 current_values_by_index
                     .entry(index_meta.root_page)
                     .or_default()
-                    .insert(*rowid, value.clone());
+                    .insert(*rowid, encoded);
             }
         }
 
@@ -1400,26 +1401,27 @@ impl Database {
                 if !index_meta.unique {
                     continue;
                 }
-                let value = updated_row.get(index_meta.column_idx).ok_or_else(|| {
-                    format!(
-                        "row missing indexed column '{}' for index on '{}'",
-                        index_meta.column, index_meta.table_name
-                    )
-                })?;
+                let indexed_values = index_values_from_row(index_meta, updated_row)?;
 
                 let current_values = current_values_by_index
                     .entry(index_meta.root_page)
                     .or_default();
 
-                if matches!(value, Value::Null) {
-                    current_values.insert(*rowid, Value::Null);
+                if index_value_contains_null(&indexed_values) {
+                    current_values.insert(*rowid, None);
                     continue;
                 }
+                let (key, bucket_value) = index_key_and_bucket_value(&indexed_values)?;
 
-                if self.unique_value_conflicts_with_existing(index_meta, value, &update_rowids)? {
+                if self.unique_value_conflicts_with_existing(
+                    index_meta,
+                    key,
+                    &bucket_value,
+                    &update_rowids,
+                )? {
                     return Err(unique_constraint_error(
                         &index_meta.table_name,
-                        &index_meta.column,
+                        &index_meta.columns,
                     ));
                 }
 
@@ -1427,17 +1429,18 @@ impl Database {
                     .iter()
                     .any(|(candidate_rowid, candidate_value)| {
                         *candidate_rowid != *rowid
-                            && !matches!(candidate_value, Value::Null)
-                            && values_equal(candidate_value, value)
+                            && candidate_value
+                                .as_ref()
+                                .is_some_and(|candidate| values_equal(candidate, &bucket_value))
                     })
                 {
                     return Err(unique_constraint_error(
                         &index_meta.table_name,
-                        &index_meta.column,
+                        &index_meta.columns,
                     ));
                 }
 
-                current_values.insert(*rowid, value.clone());
+                current_values.insert(*rowid, Some(bucket_value));
             }
         }
 
@@ -1447,10 +1450,10 @@ impl Database {
     fn unique_value_conflicts_with_existing(
         &mut self,
         index_meta: &IndexMeta,
-        value: &Value,
+        key: i64,
+        bucket_value: &Value,
         excluded_rowids: &HashSet<i64>,
     ) -> Result<bool, String> {
-        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let Some(payload) = tree
             .lookup(key)
@@ -1462,7 +1465,7 @@ impl Database {
         let buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
         let Some(existing_bucket) = buckets
             .iter()
-            .find(|bucket| values_equal(&bucket.value, value))
+            .find(|bucket| values_equal(&bucket.value, bucket_value))
         else {
             return Ok(false);
         };
@@ -1518,10 +1521,12 @@ fn load_catalogs(
         if indexes.contains_key(&index_key) {
             return Err(format!("duplicate index in schema: '{}'", index.name));
         }
-        let indexed_column = index
-            .columns
-            .first()
-            .ok_or_else(|| format!("index '{}' has no indexed column metadata", index.name))?;
+        if index.columns.is_empty() {
+            return Err(format!(
+                "index '{}' has no indexed column metadata",
+                index.name
+            ));
+        }
 
         let table_key = normalize_identifier(&index.table_name);
         let table_meta = tables.get(&table_key).ok_or_else(|| {
@@ -1530,19 +1535,25 @@ fn load_catalogs(
                 index.name, index.table_name
             )
         })?;
-        let column_idx = if (indexed_column.index as usize) < table_meta.columns.len()
-            && table_meta.columns[indexed_column.index as usize]
-                .eq_ignore_ascii_case(&indexed_column.name)
-        {
-            indexed_column.index as usize
-        } else {
-            find_column_index(table_meta, &indexed_column.name).ok_or_else(|| {
-                format!(
-                    "index '{}' references unknown column '{}' on table '{}'",
-                    index.name, indexed_column.name, table_meta.name
-                )
-            })?
-        };
+        let mut index_columns = Vec::with_capacity(index.columns.len());
+        let mut index_column_indices = Vec::with_capacity(index.columns.len());
+        for indexed_column in &index.columns {
+            let column_idx = if (indexed_column.index as usize) < table_meta.columns.len()
+                && table_meta.columns[indexed_column.index as usize]
+                    .eq_ignore_ascii_case(&indexed_column.name)
+            {
+                indexed_column.index as usize
+            } else {
+                find_column_index(table_meta, &indexed_column.name).ok_or_else(|| {
+                    format!(
+                        "index '{}' references unknown column '{}' on table '{}'",
+                        index.name, indexed_column.name, table_meta.name
+                    )
+                })?
+            };
+            index_columns.push(indexed_column.name.clone());
+            index_column_indices.push(column_idx);
+        }
         let unique = create_index_stmt_from_sql(&index.sql)
             .map(|stmt| stmt.unique)
             .unwrap_or(false);
@@ -1552,8 +1563,8 @@ fn load_catalogs(
             IndexMeta {
                 table_key,
                 table_name: table_meta.name.clone(),
-                column: indexed_column.name.clone(),
-                column_idx,
+                columns: index_columns,
+                column_indices: index_column_indices,
                 root_page: index.root_page,
                 unique,
             },
@@ -1570,31 +1581,43 @@ fn create_index_stmt_from_sql(sql: &str) -> Option<CreateIndexStmt> {
     }
 }
 
-fn unique_constraint_error(table_name: &str, column: &str) -> String {
-    format!("UNIQUE constraint failed: {table_name}.{column}")
+fn unique_constraint_error(table_name: &str, columns: &[String]) -> String {
+    let refs = columns
+        .iter()
+        .map(|column| format!("{table_name}.{column}"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    format!("UNIQUE constraint failed: {refs}")
 }
 
 fn validate_unique_index_backfill_rows<'a>(
     table_name: &str,
-    column: &str,
-    column_idx: usize,
+    columns: &[String],
+    column_indices: &[usize],
     rows: impl Iterator<Item = &'a Vec<Value>>,
 ) -> Result<(), String> {
+    if columns.len() != column_indices.len() {
+        return Err(format!(
+            "index column metadata mismatch for table '{}': {} columns vs {} indices",
+            table_name,
+            columns.len(),
+            column_indices.len()
+        ));
+    }
     let mut seen_values = Vec::new();
     for row in rows {
-        let value = row.get(column_idx).ok_or_else(|| {
-            format!("row missing indexed column '{column}' for index on '{table_name}'")
-        })?;
-        if matches!(value, Value::Null) {
+        let values = indexed_values_from_row(columns, column_indices, table_name, row)?;
+        if index_value_contains_null(&values) {
             continue;
         }
+        let (_, bucket_value) = index_key_and_bucket_value(&values)?;
         if seen_values
             .iter()
-            .any(|seen_value| values_equal(seen_value, value))
+            .any(|seen_value| values_equal(seen_value, &bucket_value))
         {
-            return Err(unique_constraint_error(table_name, column));
+            return Err(unique_constraint_error(table_name, columns));
         }
-        seen_values.push(value.clone());
+        seen_values.push(bucket_value);
     }
     Ok(())
 }
@@ -2502,10 +2525,7 @@ fn eval_join_expr(
                     .iter()
                     .position(|c| c.eq_ignore_ascii_case(column))
                     .ok_or_else(|| {
-                        format!(
-                            "unknown column '{}' in table '{}'",
-                            column, table_qualifier
-                        )
+                        format!("unknown column '{}' in table '{}'", column, table_qualifier)
                     })?;
                 Ok(row[start + local_idx].clone())
             } else {
@@ -2521,8 +2541,7 @@ fn eval_join_expr(
                         }
                     }
                 }
-                let idx =
-                    found.ok_or_else(|| format!("unknown column '{}'", column))?;
+                let idx = found.ok_or_else(|| format!("unknown column '{}'", column))?;
                 Ok(row[idx].clone())
             }
         }
@@ -2718,6 +2737,98 @@ fn normalize_identifier(ident: &str) -> String {
     ident.to_ascii_lowercase()
 }
 
+fn index_values_from_row(index_meta: &IndexMeta, row: &[Value]) -> Result<Vec<Value>, String> {
+    indexed_values_from_row(
+        &index_meta.columns,
+        &index_meta.column_indices,
+        &index_meta.table_name,
+        row,
+    )
+}
+
+fn indexed_values_from_row(
+    columns: &[String],
+    column_indices: &[usize],
+    table_name: &str,
+    row: &[Value],
+) -> Result<Vec<Value>, String> {
+    if columns.len() != column_indices.len() {
+        return Err(format!(
+            "index column metadata mismatch on table '{}': {} columns vs {} indices",
+            table_name,
+            columns.len(),
+            column_indices.len()
+        ));
+    }
+    let mut values = Vec::with_capacity(columns.len());
+    for (column, column_idx) in columns.iter().zip(column_indices.iter().copied()) {
+        let value = row.get(column_idx).ok_or_else(|| {
+            format!(
+                "row missing indexed column '{}' for index on '{}'",
+                column, table_name
+            )
+        })?;
+        values.push(value.clone());
+    }
+    Ok(values)
+}
+
+fn index_value_contains_null(values: &[Value]) -> bool {
+    values.iter().any(|value| matches!(value, Value::Null))
+}
+
+fn index_key_and_bucket_value(indexed_values: &[Value]) -> Result<(i64, Value), String> {
+    match indexed_values {
+        [] => Err("index key requires at least one value".to_string()),
+        [single] => Ok((
+            index_key_for_value(single).map_err(|e| e.to_string())?,
+            single.clone(),
+        )),
+        _ => {
+            let encoded = encode_index_value_tuple(indexed_values)?;
+            let hash = fnv1a64(&encoded);
+            Ok((
+                i64::from_be_bytes(hash.to_be_bytes()),
+                Value::Text(format!("__idx_tuple__:{}", hex_encode(&encoded))),
+            ))
+        }
+    }
+}
+
+fn encode_index_value_tuple(values: &[Value]) -> Result<Vec<u8>, String> {
+    let value_count: u32 = values
+        .len()
+        .try_into()
+        .map_err(|_| "index key has too many values".to_string())?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&value_count.to_be_bytes());
+    for value in values {
+        encode_value(value, &mut encoded).map_err(|e| e.to_string())?;
+    }
+    Ok(encoded)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn encode_row(row: &[Value]) -> Result<Vec<u8>, String> {
     let col_count: u32 = row
         .len()
@@ -2790,15 +2901,23 @@ mod tests {
     }
 
     fn indexed_rowids(db: &mut Database, index_name: &str, value: &Value) -> Vec<i64> {
+        indexed_rowids_for_values(db, index_name, std::slice::from_ref(value))
+    }
+
+    fn indexed_rowids_for_values(
+        db: &mut Database,
+        index_name: &str,
+        values: &[Value],
+    ) -> Vec<i64> {
         let idx_key = normalize_identifier(index_name);
         let index_meta = db.indexes.get(&idx_key).unwrap().clone();
-        let key = index_key_for_value(value).unwrap();
+        let (key, bucket_value) = index_key_and_bucket_value(values).unwrap();
         let mut index_tree = BTree::new(&mut db.pager, index_meta.root_page);
         let payload = index_tree.lookup(key).unwrap().unwrap();
         let buckets = decode_index_payload(&payload).unwrap();
         buckets
             .into_iter()
-            .find(|bucket| values_equal(&bucket.value, value))
+            .find(|bucket| values_equal(&bucket.value, &bucket_value))
             .map(|bucket| bucket.rowids)
             .unwrap_or_default()
     }
@@ -3327,6 +3446,157 @@ mod tests {
     }
 
     #[test]
+    fn create_multi_column_index_backfills_existing_rows() {
+        let path = temp_db_path("index_backfill_multi_column");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, a INTEGER, b TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 7, 'x'), (2, 7, 'y'), (3, 7, 'x');")
+            .unwrap();
+
+        let result = db.execute("CREATE INDEX idx_t_a_b ON t(a, b);").unwrap();
+        assert_eq!(result, ExecuteResult::CreateIndex);
+
+        assert_eq!(
+            indexed_rowids_for_values(
+                &mut db,
+                "idx_t_a_b",
+                &[Value::Integer(7), Value::Text("x".to_string())],
+            ),
+            vec![1, 3]
+        );
+        assert_eq!(
+            indexed_rowids_for_values(
+                &mut db,
+                "idx_t_a_b",
+                &[Value::Integer(7), Value::Text("y".to_string())],
+            ),
+            vec![2]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn insert_updates_multi_column_index() {
+        let path = temp_db_path("index_insert_multi_column");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER, city TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age_city ON users(age, city);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 30, 'austin'), (2, 30, 'austin'), (3, 30, 'dallas');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            indexed_rowids_for_values(
+                &mut db,
+                "idx_users_age_city",
+                &[Value::Integer(30), Value::Text("austin".to_string())],
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            indexed_rowids_for_values(
+                &mut db,
+                "idx_users_age_city",
+                &[Value::Integer(30), Value::Text("dallas".to_string())],
+            ),
+            vec![3]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_unique_multi_column_index_rejects_existing_duplicates() {
+        let path = temp_db_path("create_unique_index_multi_column_duplicates");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, first TEXT, last TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a', 'x'), (2, 'a', 'x');")
+            .unwrap();
+
+        let err = db
+            .execute("CREATE UNIQUE INDEX ux_users_name ON users(first, last);")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.first, users.last"));
+        assert!(!db
+            .indexes
+            .contains_key(&normalize_identifier("ux_users_name")));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_column_unique_allows_null_values() {
+        let path = temp_db_path("unique_multi_column_allows_nulls");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_a_b ON users(a, b);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, NULL), (2, 10, NULL), (3, NULL, 5), (4, NULL, 5);",
+        )
+        .unwrap();
+
+        let selected = db
+            .execute(
+                "SELECT COUNT(*) FROM users WHERE (a = 10 AND b IS NULL) OR (a IS NULL AND b = 5);",
+            )
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => assert_eq!(q.rows, vec![vec![Value::Integer(4)]]),
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_rejects_duplicate_for_multi_column_unique_index() {
+        let path = temp_db_path("update_unique_multi_column_violation");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX ux_users_a_b ON users(a, b);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 1, 1), (2, 1, 2);")
+            .unwrap();
+
+        let err = db
+            .execute("UPDATE users SET b = 1 WHERE id = 2;")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.a, users.b"));
+
+        let selected = db
+            .execute("SELECT id, a, b FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Integer(1), Value::Integer(1)],
+                        vec![Value::Integer(2), Value::Integer(1), Value::Integer(2)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn create_unique_index_rejects_existing_duplicates() {
         let path = temp_db_path("create_unique_index_duplicates");
         let mut db = Database::open(&path).unwrap();
@@ -3728,6 +3998,45 @@ mod tests {
                 assert_eq!(
                     q.rows,
                     vec![vec![Value::Integer(1), Value::Text("a@x".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unique_multi_column_index_constraint_persists_across_reopen() {
+        let path = temp_db_path("unique_multi_column_index_reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER, first TEXT, last TEXT);")
+                .unwrap();
+            db.execute("CREATE UNIQUE INDEX ux_users_name ON users(first, last);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'a', 'x');")
+                .unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let err = reopened
+            .execute("INSERT INTO users VALUES (2, 'a', 'x');")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed: users.first, users.last"));
+
+        let selected = reopened
+            .execute("SELECT id, first, last FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(1),
+                        Value::Text("a".to_string()),
+                        Value::Text("x".to_string()),
+                    ]]
                 );
             }
             _ => panic!("expected SELECT result"),
@@ -4328,10 +4637,8 @@ mod tests {
             .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
             .unwrap();
-        db.execute(
-            "INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (2, 'sprocket');",
-        )
-        .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (2, 'sprocket');")
+            .unwrap();
 
         let result = db
             .execute(
@@ -4536,9 +4843,7 @@ mod tests {
 
         // sname is unambiguous — only in table s
         let result = db
-            .execute(
-                "SELECT sname, rid FROM s JOIN r ON s.sid = r.sid_ref;",
-            )
+            .execute("SELECT sname, rid FROM s JOIN r ON s.sid = r.sid_ref;")
             .unwrap();
         match result {
             ExecuteResult::Select(q) => {
