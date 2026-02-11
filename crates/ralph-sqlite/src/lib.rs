@@ -714,11 +714,11 @@ impl Database {
 
     /// Read candidate B+tree entries using the given access path.
     ///
-    /// When an index equality path is available, only the rowids matching the
-    /// index probe are fetched from the table B+tree (instead of a full scan).
-    /// The caller is still responsible for applying the full WHERE predicate on
-    /// the returned entries because the index may over-select (hash collisions,
-    /// AND predicates with additional terms, etc.).
+    /// When an index-driven path is available, only rowids selected from the
+    /// index are fetched from the table B+tree (instead of a full scan). The
+    /// caller is still responsible for applying the full WHERE predicate on the
+    /// returned entries because the index may over-select (hash collisions, AND
+    /// predicates with additional terms, etc.).
     fn read_candidate_entries(
         &mut self,
         meta: &TableMeta,
@@ -734,51 +734,140 @@ impl Database {
                 value_expr,
                 ..
             } => {
-                let idx_key = normalize_identifier(index_name);
-                let index_meta = self
-                    .indexes
-                    .get(&idx_key)
-                    .cloned()
-                    .ok_or_else(|| format!("index '{}' not found", index_name))?;
-
+                let index_meta = self.resolve_index_meta(index_name)?;
                 let value = eval_expr(value_expr, None)?;
-                let key = index_key_for_value(&value).map_err(|e| e.to_string())?;
-
-                let rowids = {
-                    let mut idx_tree = BTree::new(&mut self.pager, index_meta.root_page);
-                    match idx_tree
-                        .lookup(key)
-                        .map_err(|e| format!("index lookup: {e}"))?
-                    {
-                        Some(payload) => {
-                            let buckets =
-                                decode_index_payload(&payload).map_err(|e| e.to_string())?;
-                            buckets
-                                .into_iter()
-                                .filter(|b| values_equal(&b.value, &value))
-                                .flat_map(|b| b.rowids)
-                                .collect::<Vec<i64>>()
-                        }
-                        None => Vec::new(),
-                    }
+                let rowids = self.index_eq_rowids(index_meta.root_page, &value)?;
+                self.lookup_table_entries_by_rowids(meta.root_page, rowids)
+            }
+            AccessPath::IndexRange {
+                index_name,
+                lower,
+                upper,
+                ..
+            } => {
+                let index_meta = self.resolve_index_meta(index_name)?;
+                let lower_bound = match lower {
+                    Some(bound) => Some((eval_expr(&bound.value_expr, None)?, bound.inclusive)),
+                    None => None,
+                };
+                let upper_bound = match upper {
+                    Some(bound) => Some((eval_expr(&bound.value_expr, None)?, bound.inclusive)),
+                    None => None,
                 };
 
-                let mut entries = Vec::with_capacity(rowids.len());
-                for rowid in rowids {
-                    let mut table_tree = BTree::new(&mut self.pager, meta.root_page);
-                    if let Some(payload) = table_tree
-                        .lookup(rowid)
-                        .map_err(|e| format!("table lookup: {e}"))?
-                    {
-                        entries.push(ralph_storage::btree::Entry {
-                            key: rowid,
-                            payload,
-                        });
-                    }
-                }
-                Ok(entries)
+                let rowids = self.index_range_rowids(
+                    index_meta.root_page,
+                    lower_bound
+                        .as_ref()
+                        .map(|(value, inclusive)| (value, *inclusive)),
+                    upper_bound
+                        .as_ref()
+                        .map(|(value, inclusive)| (value, *inclusive)),
+                )?;
+                self.lookup_table_entries_by_rowids(meta.root_page, rowids)
             }
         }
+    }
+
+    fn resolve_index_meta(&self, index_name: &str) -> Result<IndexMeta, String> {
+        let idx_key = normalize_identifier(index_name);
+        self.indexes
+            .get(&idx_key)
+            .cloned()
+            .ok_or_else(|| format!("index '{}' not found", index_name))
+    }
+
+    fn index_eq_rowids(&mut self, index_root: PageNum, value: &Value) -> Result<Vec<i64>, String> {
+        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
+        let mut idx_tree = BTree::new(&mut self.pager, index_root);
+        match idx_tree
+            .lookup(key)
+            .map_err(|e| format!("index lookup: {e}"))?
+        {
+            Some(payload) => {
+                let buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
+                Ok(buckets
+                    .into_iter()
+                    .filter(|b| values_equal(&b.value, value))
+                    .flat_map(|b| b.rowids)
+                    .collect::<Vec<i64>>())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn index_range_rowids(
+        &mut self,
+        index_root: PageNum,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Result<Vec<i64>, String> {
+        let mut idx_tree = BTree::new(&mut self.pager, index_root);
+        let index_entries = idx_tree
+            .scan_all()
+            .map_err(|e| format!("index scan: {e}"))?;
+
+        let mut rowids = Vec::new();
+        let mut seen = HashSet::new();
+
+        for entry in index_entries {
+            let buckets = decode_index_payload(&entry.payload).map_err(|e| e.to_string())?;
+            for bucket in buckets {
+                let lower_ok = if let Some((bound, inclusive)) = lower {
+                    let ordering = compare_values(&bucket.value, bound)?;
+                    ordering == std::cmp::Ordering::Greater
+                        || (inclusive && ordering == std::cmp::Ordering::Equal)
+                } else {
+                    true
+                };
+                if !lower_ok {
+                    continue;
+                }
+
+                let upper_ok = if let Some((bound, inclusive)) = upper {
+                    let ordering = compare_values(&bucket.value, bound)?;
+                    ordering == std::cmp::Ordering::Less
+                        || (inclusive && ordering == std::cmp::Ordering::Equal)
+                } else {
+                    true
+                };
+                if !upper_ok {
+                    continue;
+                }
+
+                for rowid in bucket.rowids {
+                    if seen.insert(rowid) {
+                        rowids.push(rowid);
+                    }
+                }
+            }
+        }
+
+        Ok(rowids)
+    }
+
+    fn lookup_table_entries_by_rowids(
+        &mut self,
+        table_root: PageNum,
+        mut rowids: Vec<i64>,
+    ) -> Result<Vec<ralph_storage::btree::Entry>, String> {
+        rowids.sort_unstable();
+        rowids.dedup();
+
+        let mut entries = Vec::with_capacity(rowids.len());
+        let mut table_tree = BTree::new(&mut self.pager, table_root);
+        for rowid in rowids {
+            if let Some(payload) = table_tree
+                .lookup(rowid)
+                .map_err(|e| format!("table lookup: {e}"))?
+            {
+                entries.push(ralph_storage::btree::Entry {
+                    key: rowid,
+                    payload,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     fn planner_indexes_for_table(&self, table_key: &str) -> Vec<IndexInfo> {
@@ -799,6 +888,17 @@ impl Database {
         where_clause: Option<&Expr>,
         access_path: &AccessPath,
     ) -> Result<Vec<Vec<Value>>, String> {
+        if let AccessPath::IndexRange { .. } = access_path {
+            let entries = self.read_candidate_entries(meta, access_path)?;
+            let mut rows = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let row = decode_table_row(meta, &entry.payload)?;
+                if where_clause_matches(meta, &row, where_clause)? {
+                    rows.push(row);
+                }
+            }
+            return Ok(rows);
+        }
         let scan_op: Box<dyn Operator + '_> = match access_path {
             AccessPath::TableScan => Box::new(TableScan::new(&mut self.pager, meta.root_page)),
             AccessPath::IndexEq {
@@ -822,6 +922,7 @@ impl Database {
                     value,
                 ))
             }
+            AccessPath::IndexRange { .. } => unreachable!("handled above"),
         };
 
         let root_op: Box<dyn Operator + '_> = if let Some(expr) = where_clause {
@@ -2664,6 +2765,74 @@ mod tests {
             indexed_rowids(&mut db, "idx_users_score", &Value::Integer(20)),
             vec![2]
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_supports_index_range_predicates() {
+        let path = temp_db_path("select_index_range");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10), (2, 15), (3, 25), (4, 30);")
+            .unwrap();
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE score >= 15 AND score < 30 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_index_for_range_predicate() {
+        let path = temp_db_path("update_index_range");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd');",
+        )
+        .unwrap();
+
+        let updated = db
+            .execute("UPDATE users SET label = 'hit' WHERE score > 15 AND score <= 30;")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a".to_string())],
+                        vec![Value::Integer(2), Value::Text("hit".to_string())],
+                        vec![Value::Integer(3), Value::Text("hit".to_string())],
+                        vec![Value::Integer(4), Value::Text("d".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

@@ -2,7 +2,7 @@
 //!
 //! The current planner scope is intentionally small:
 //! - recognize single-table `WHERE` predicates that can use an index
-//! - choose between full table scan and index equality lookup
+//! - choose between full table scan and index-driven lookup
 
 use ralph_parser::ast::{BinaryOperator, Expr, SelectStmt};
 
@@ -35,6 +35,18 @@ pub enum AccessPath {
         column: String,
         value_expr: Expr,
     },
+    IndexRange {
+        index_name: String,
+        column: String,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeBound {
+    pub value_expr: Expr,
+    pub inclusive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,13 +64,22 @@ pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -
 }
 
 fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
+    choose_index_eq_access(expr, table_name, indexes)
+        .or_else(|| choose_index_range_access(expr, table_name, indexes))
+}
+
+fn choose_index_eq_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => choose_index_access(left, table_name, indexes)
-            .or_else(|| choose_index_access(right, table_name, indexes)),
+        } => choose_index_eq_access(left, table_name, indexes)
+            .or_else(|| choose_index_eq_access(right, table_name, indexes)),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
@@ -67,6 +88,133 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
             .or_else(|| plan_index_eq(right, left, table_name, indexes)),
         _ => None,
     }
+}
+
+fn choose_index_range_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => choose_index_range_access(left, table_name, indexes)
+            .or_else(|| choose_index_range_access(right, table_name, indexes)),
+        Expr::BinaryOp { left, op, right } => {
+            plan_index_range_binary(left, *op, right, table_name, indexes).or_else(|| {
+                invert_comparison(*op).and_then(|inverted| {
+                    plan_index_range_binary(right, inverted, left, table_name, indexes)
+                })
+            })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            if *negated {
+                return None;
+            }
+            let (col_table, col_name) = match expr.as_ref() {
+                Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if let Some(qualifier) = col_table {
+                if !qualifier.eq_ignore_ascii_case(table_name) {
+                    return None;
+                }
+            }
+            if expr_contains_column_ref(low) || expr_contains_column_ref(high) {
+                return None;
+            }
+            let index = find_matching_index(table_name, col_name, indexes)?;
+            Some(AccessPath::IndexRange {
+                index_name: index.name.clone(),
+                column: index.column.clone(),
+                lower: Some(RangeBound {
+                    value_expr: low.as_ref().clone(),
+                    inclusive: true,
+                }),
+                upper: Some(RangeBound {
+                    value_expr: high.as_ref().clone(),
+                    inclusive: true,
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn plan_index_range_binary(
+    lhs: &Expr,
+    op: BinaryOperator,
+    rhs: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    match op {
+        BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq => {}
+        _ => return None,
+    }
+
+    let (col_table, col_name) = match lhs {
+        Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
+        _ => return None,
+    };
+
+    if let Some(qualifier) = col_table {
+        if !qualifier.eq_ignore_ascii_case(table_name) {
+            return None;
+        }
+    }
+
+    if expr_contains_column_ref(rhs) {
+        return None;
+    }
+
+    let index = find_matching_index(table_name, col_name, indexes)?;
+
+    let (lower, upper) = match op {
+        BinaryOperator::Gt => (
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: false,
+            }),
+            None,
+        ),
+        BinaryOperator::GtEq => (
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: true,
+            }),
+            None,
+        ),
+        BinaryOperator::Lt => (
+            None,
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: false,
+            }),
+        ),
+        BinaryOperator::LtEq => (
+            None,
+            Some(RangeBound {
+                value_expr: rhs.clone(),
+                inclusive: true,
+            }),
+        ),
+        _ => return None,
+    };
+
+    Some(AccessPath::IndexRange {
+        index_name: index.name.clone(),
+        column: index.column.clone(),
+        lower,
+        upper,
+    })
 }
 
 fn plan_index_eq(
@@ -90,15 +238,33 @@ fn plan_index_eq(
         return None;
     }
 
-    let index = indexes.iter().find(|idx| {
-        idx.table.eq_ignore_ascii_case(table_name) && idx.column.eq_ignore_ascii_case(col_name)
-    })?;
+    let index = find_matching_index(table_name, col_name, indexes)?;
 
     Some(AccessPath::IndexEq {
         index_name: index.name.clone(),
         column: index.column.clone(),
         value_expr: rhs.clone(),
     })
+}
+
+fn find_matching_index<'a>(
+    table_name: &str,
+    col_name: &str,
+    indexes: &'a [IndexInfo],
+) -> Option<&'a IndexInfo> {
+    indexes.iter().find(|idx| {
+        idx.table.eq_ignore_ascii_case(table_name) && idx.column.eq_ignore_ascii_case(col_name)
+    })
+}
+
+fn invert_comparison(op: BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        _ => None,
+    }
 }
 
 fn expr_contains_column_ref(expr: &Expr) -> bool {
@@ -214,6 +380,63 @@ mod tests {
     }
 
     #[test]
+    fn chooses_index_range_for_greater_than_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score > 10;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexRange {
+                index_name: "idx_t_score".to_string(),
+                column: "score".to_string(),
+                lower: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(10),
+                    inclusive: false,
+                }),
+                upper: None,
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_index_range_for_reversed_comparison_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE 100 <= score;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexRange {
+                index_name: "idx_t_score".to_string(),
+                column: "score".to_string(),
+                lower: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(100),
+                    inclusive: true,
+                }),
+                upper: None,
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_index_range_for_between_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score BETWEEN 3 AND 7;");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexRange {
+                index_name: "idx_t_score".to_string(),
+                column: "score".to_string(),
+                lower: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(3),
+                    inclusive: true,
+                }),
+                upper: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(7),
+                    inclusive: true,
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn falls_back_when_rhs_uses_columns() {
         let stmt = parse_select("SELECT * FROM t WHERE score = age;");
         let plan = plan_select(&stmt, "t", &default_indexes());
@@ -257,5 +480,23 @@ mod tests {
         let where_expr = parse_where("SELECT * FROM t WHERE id = 1;");
         let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
         assert_eq!(path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn plan_where_chooses_index_for_range_predicate() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score <= 99;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexRange {
+                index_name: "idx_t_score".to_string(),
+                column: "score".to_string(),
+                lower: None,
+                upper: Some(RangeBound {
+                    value_expr: Expr::IntegerLiteral(99),
+                    inclusive: true,
+                }),
+            }
+        );
     }
 }

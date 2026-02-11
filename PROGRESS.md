@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -30,6 +30,7 @@ Latest completions:
 - B+tree delete freelist reclamation in `crates/storage` (Agent 3) — delete-time compaction now returns removed leaf/interior/root-child pages to `Pager::free_page()` so reclaimed pages are reusable via the freelist
 - DROP TABLE execution + object-tree reclamation in `crates/ralph-sqlite` + `crates/storage` (Agent codex) — `DROP TABLE` now removes schema entries and dependent index metadata, then reclaims table/index B+tree pages through a new `BTree::reclaim_tree` helper so pages return to the freelist
 - DROP INDEX SQL execution in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `DROP INDEX [IF EXISTS]`, integration now executes index drops via schema removal plus `BTree::reclaim_tree` page reclamation, and query paths fall back to table scans after index removal
+- Range predicate index selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — planner now emits `IndexRange` access paths for indexed `<`/`<=`/`>`/`>=`/`BETWEEN` predicates (including reversed comparisons), and SELECT/UPDATE candidate reads consume planner range paths with residual WHERE filtering
 
 Test pass rate:
 - `./test.sh` (full, DROP INDEX execution): pass, 5/5 passed.
@@ -40,6 +41,9 @@ Test pass rate:
 - `cargo test -p ralph-storage` (DROP TABLE + reclamation): pass, 0 failed (51 tests).
 - `cargo test -p ralph-sqlite` (DROP TABLE + reclamation): pass, 0 failed (28 tests).
 - `./test.sh --fast` (DROP TABLE + reclamation, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
+- `cargo test --workspace` (range predicate index selection): pass, 0 failed (157 tests).
+- `cargo test -p ralph-planner -p ralph-sqlite` (range predicate index selection): pass, 0 failed (43 tests).
+- `./test.sh --fast` (range predicate index selection, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (B+tree delete freelist reclamation): pass, 0 failed (46 tests).
 - `./test.sh --fast` (B+tree delete freelist reclamation, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
@@ -198,6 +202,11 @@ Test pass rate:
   - SELECT execution now requests planner output and performs index rowid lookups when planned
   - Added UPDATE/DELETE index maintenance so secondary indexes remain consistent when indexed column values change or rows are removed
   - Added planner unit tests and integration tests for update/delete index maintenance; see `notes/query-planner-index-selection.md`
+- [x] Query planner range predicate index selection (agent 3)
+  - Added `AccessPath::IndexRange` planning for indexed `<`/`<=`/`>`/`>=` and non-negated `BETWEEN` predicates, including reversed comparisons
+  - Added `ralph-sqlite` range-candidate row reads for planner-driven SELECT/UPDATE/DELETE paths
+  - Added planner unit tests plus integration coverage for SELECT and UPDATE range predicates
+  - See `notes/query-planner-range-selection.md` for implementation details and current hash-index limitation
 - [x] Expression evaluation in `crates/executor` (agent codex)
   - Added `eval_expr(&Expr, row_ctx)` support for literals, column refs, unary/binary ops, `IS NULL`, `BETWEEN`, and `IN (...)`
   - Added `Filter::from_expr(...)` and `Project::from_exprs(...)` helpers to evaluate parser AST expressions in execution pipelines
@@ -232,8 +241,9 @@ Test pass rate:
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
-- UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.
-- Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.
+- UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
+- Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
+- Range index planning currently does full index-bucket scans because secondary index keys are hash-based; true ordered range seeks are not implemented.
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
