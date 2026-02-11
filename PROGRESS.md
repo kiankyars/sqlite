@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates (parser now includes `GROUP BY`/`HAVING` clauses), WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -33,13 +33,17 @@ Latest completions:
 - Range predicate index selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — planner now emits `IndexRange` access paths for indexed `<`/`<=`/`>`/`>=`/`BETWEEN` predicates (including reversed comparisons), and SELECT/UPDATE candidate reads consume planner range paths with residual WHERE filtering
 - SELECT `GROUP BY` / `HAVING` parser support in `crates/parser` (Agent 4) — added SELECT AST fields for grouping/filtering clauses, parser support for `GROUP BY ...` and `HAVING ...`, and integration guards in `crates/ralph-sqlite` to return explicit unsupported errors until grouped execution is implemented
 - B+tree delete leaf occupancy rebalance in `crates/storage` (Agent codex) — delete underflow now triggers on low logical leaf occupancy (not only empty pages), with sibling merge when combined pages fit and sibling redistribution plus parent separator-key updates when they do not
+- SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
 
 Recommended next step:
-- Implement grouped SELECT execution semantics (`GROUP BY`/`HAVING`) in `crates/ralph-sqlite` and replace hash-bucket range scans with true ordered range index seeks.
+- Replace hash-bucket range scans with true ordered range index seeks (planner/executor/storage index format alignment).
 
 Test pass rate:
 - `cargo test -p ralph-storage` (B+tree leaf occupancy rebalance): pass, 0 failed (53 tests).
 - `./test.sh --fast` (B+tree leaf occupancy rebalance, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-sqlite` (GROUP BY/HAVING execution semantics): pass, 0 failed (38 tests).
+- `cargo test --workspace` (GROUP BY/HAVING execution semantics): pass, 0 failed (172 tests).
+- `./test.sh --fast` (GROUP BY/HAVING execution semantics, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test -p ralph-parser -p ralph-planner -p ralph-sqlite` (GROUP BY/HAVING parser support): pass, 0 failed.
 - `./test.sh --fast` (GROUP BY/HAVING parser support, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh` (full, DROP INDEX execution): pass, 5/5 passed.
@@ -111,6 +115,7 @@ Test pass rate:
 21. ~~DROP TABLE execution + schema/index page reclamation~~ ✓
 22. ~~DROP INDEX SQL execution + index-tree page reclamation~~ ✓
 23. ~~SELECT `GROUP BY` / `HAVING` parser support + integration guardrails~~ ✓
+24. ~~SELECT `GROUP BY` / `HAVING` execution semantics~~ ✓
 
 ## Completed Tasks
 
@@ -255,6 +260,11 @@ Test pass rate:
   - Added parser support for `GROUP BY` expression lists and optional `HAVING` expressions
   - Added `ralph-sqlite` guardrails that return explicit errors for grouped queries until grouped execution semantics are implemented
   - Added parser/planner/integration tests; see `notes/group-by-having-parser.md`
+- [x] SELECT `GROUP BY` / `HAVING` execution semantics (agent codex)
+  - Added grouped execution path in `execute_select` with GROUP BY key formation, HAVING filtering, and grouped ORDER BY expression evaluation
+  - Added grouped expression evaluation that supports aggregate and non-aggregate projection expressions per group
+  - Added aggregate-query HAVING behavior for no-`GROUP BY` queries and SQLite-style non-aggregate HAVING error reporting
+  - Added integration coverage for grouped aggregates, grouped dedup projection, no-`GROUP BY` HAVING, `GROUP BY` aggregate-expression rejection, and scalar no-`FROM` grouping; see `notes/group-by-having-execution.md`
 
 ## Known Issues
 
@@ -266,4 +276,4 @@ Test pass rate:
 - No JOIN support (single-table FROM only)
 - No subquery support
 - Multi-column and UNIQUE index execution are not supported yet.
-- Aggregate queries do not support `GROUP BY`/`HAVING` execution yet; grouped SELECTs currently return explicit unsupported errors, and column references outside aggregate functions are still rejected in aggregate SELECTs.
+- Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

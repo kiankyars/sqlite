@@ -62,6 +62,13 @@ struct TransactionSnapshot {
     indexes: HashMap<String, IndexMeta>,
 }
 
+#[derive(Debug, Clone)]
+struct GroupState {
+    key: Vec<Value>,
+    rows: Vec<Vec<Value>>,
+    scalar_row_count: usize,
+}
+
 pub struct Database {
     db_path: PathBuf,
     pager: Pager,
@@ -599,18 +606,20 @@ impl Database {
     }
 
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
-        if !stmt.group_by.is_empty() {
-            return Err("GROUP BY is not supported yet".to_string());
-        }
-        if stmt.having.is_some() {
-            return Err("HAVING is not supported yet".to_string());
-        }
-
         let aggregate_select = select_uses_aggregates(&stmt);
+        let aggregate_having = stmt
+            .having
+            .as_ref()
+            .map(expr_contains_aggregate)
+            .unwrap_or(false);
+
         if let Some(where_expr) = stmt.where_clause.as_ref() {
             if expr_contains_aggregate(where_expr) {
                 return Err("aggregate functions are not allowed in WHERE".to_string());
             }
+        }
+        if stmt.group_by.iter().any(expr_contains_aggregate) {
+            return Err("aggregate functions are not allowed in GROUP BY".to_string());
         }
 
         let table_ctx = if let Some(from) = &stmt.from {
@@ -632,20 +641,122 @@ impl Database {
             AccessPath::TableScan
         };
 
-        let mut rows_with_order_keys = if let Some(meta) = table_meta {
+        let mut rows_with_order_keys = if !stmt.group_by.is_empty() {
+            let groups = if let Some(meta) = table_meta {
+                let filtered_rows =
+                    self.read_rows_for_select(meta, stmt.where_clause.as_ref(), &access_path)?;
+                let mut groups = Vec::new();
+                for row in filtered_rows {
+                    let key = evaluate_group_by_key(&stmt.group_by, Some((meta, row.as_slice())))?;
+                    if let Some(existing) = groups
+                        .iter_mut()
+                        .find(|candidate: &&mut GroupState| group_keys_equal(&candidate.key, &key))
+                    {
+                        existing.rows.push(row);
+                    } else {
+                        groups.push(GroupState {
+                            key,
+                            rows: vec![row],
+                            scalar_row_count: 0,
+                        });
+                    }
+                }
+                groups
+            } else {
+                if stmt
+                    .columns
+                    .iter()
+                    .any(|col| matches!(col, SelectColumn::AllColumns))
+                {
+                    return Err("SELECT * without FROM is not supported".to_string());
+                }
+
+                let scalar_row_count = if let Some(where_expr) = &stmt.where_clause {
+                    let predicate = eval_expr(where_expr, None)?;
+                    if !is_truthy(&predicate) {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+
+                if scalar_row_count == 0 {
+                    Vec::new()
+                } else {
+                    vec![GroupState {
+                        key: evaluate_group_by_key(&stmt.group_by, None)?,
+                        rows: Vec::new(),
+                        scalar_row_count,
+                    }]
+                }
+            };
+
+            let mut rows = Vec::with_capacity(groups.len());
+            for group in &groups {
+                let representative_row = group.rows.first().map(|row| row.as_slice());
+                if let Some(having_expr) = stmt.having.as_ref() {
+                    let predicate = eval_grouped_expr(
+                        having_expr,
+                        table_meta,
+                        &group.rows,
+                        group.scalar_row_count,
+                        representative_row,
+                    )?;
+                    if !is_truthy(&predicate) {
+                        continue;
+                    }
+                }
+
+                let projected = project_grouped_row(
+                    &stmt.columns,
+                    table_meta,
+                    &group.rows,
+                    group.scalar_row_count,
+                    representative_row,
+                )?;
+                let order_keys = evaluate_grouped_order_by_keys(
+                    &stmt.order_by,
+                    table_meta,
+                    &group.rows,
+                    group.scalar_row_count,
+                    representative_row,
+                )?;
+                rows.push((projected, order_keys));
+            }
+            rows
+        } else if let Some(meta) = table_meta {
             let filtered_rows =
                 self.read_rows_for_select(meta, stmt.where_clause.as_ref(), &access_path)?;
+            let aggregate_query = aggregate_select || aggregate_having;
 
-            if aggregate_select {
-                vec![(
-                    project_aggregate_row(&stmt.columns, table_meta, &filtered_rows, 0)?,
-                    evaluate_aggregate_order_by_keys(
-                        &stmt.order_by,
-                        table_meta,
-                        &filtered_rows,
-                        0,
-                    )?,
-                )]
+            if stmt.having.is_some() && !aggregate_query {
+                return Err("HAVING clause on a non-aggregate query".to_string());
+            }
+
+            if aggregate_query {
+                let include_row = if let Some(having_expr) = stmt.having.as_ref() {
+                    let predicate =
+                        eval_aggregate_expr(having_expr, table_meta, &filtered_rows, 0)?;
+                    is_truthy(&predicate)
+                } else {
+                    true
+                };
+
+                if include_row {
+                    vec![(
+                        project_aggregate_row(&stmt.columns, table_meta, &filtered_rows, 0)?,
+                        evaluate_aggregate_order_by_keys(
+                            &stmt.order_by,
+                            table_meta,
+                            &filtered_rows,
+                            0,
+                        )?,
+                    )]
+                } else {
+                    Vec::new()
+                }
             } else {
                 let mut rows = Vec::with_capacity(filtered_rows.len());
                 for decoded in &filtered_rows {
@@ -675,11 +786,32 @@ impl Database {
                 1
             };
 
-            if aggregate_select {
-                vec![(
-                    project_aggregate_row(&stmt.columns, None, &[], scalar_row_count)?,
-                    evaluate_aggregate_order_by_keys(&stmt.order_by, None, &[], scalar_row_count)?,
-                )]
+            let aggregate_query = aggregate_select || aggregate_having;
+            if stmt.having.is_some() && !aggregate_query {
+                return Err("HAVING clause on a non-aggregate query".to_string());
+            }
+
+            if aggregate_query {
+                let include_row = if let Some(having_expr) = stmt.having.as_ref() {
+                    let predicate = eval_aggregate_expr(having_expr, None, &[], scalar_row_count)?;
+                    is_truthy(&predicate)
+                } else {
+                    true
+                };
+
+                if include_row {
+                    vec![(
+                        project_aggregate_row(&stmt.columns, None, &[], scalar_row_count)?,
+                        evaluate_aggregate_order_by_keys(
+                            &stmt.order_by,
+                            None,
+                            &[],
+                            scalar_row_count,
+                        )?,
+                    )]
+                } else {
+                    Vec::new()
+                }
             } else if scalar_row_count == 0 {
                 Vec::new()
             } else {
@@ -1140,6 +1272,173 @@ fn project_row_no_from(columns: &[SelectColumn]) -> Result<Vec<Value>, String> {
         }
     }
     Ok(projected)
+}
+
+fn evaluate_group_by_key(
+    group_by: &[Expr],
+    row_ctx: Option<(&TableMeta, &[Value])>,
+) -> Result<Vec<Value>, String> {
+    let mut key = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        key.push(eval_expr(expr, row_ctx)?);
+    }
+    Ok(key)
+}
+
+fn group_keys_equal(left: &[Value], right: &[Value]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(lhs, rhs)| values_equal(lhs, rhs))
+}
+
+fn grouped_row_ctx<'a>(
+    meta: Option<&'a TableMeta>,
+    representative_row: Option<&'a [Value]>,
+) -> Option<(&'a TableMeta, &'a [Value])> {
+    meta.and_then(|table_meta| representative_row.map(|row| (table_meta, row)))
+}
+
+fn project_grouped_row(
+    columns: &[SelectColumn],
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+    representative_row: Option<&[Value]>,
+) -> Result<Vec<Value>, String> {
+    let mut projected = Vec::new();
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns => {
+                let row = representative_row
+                    .ok_or_else(|| "SELECT * without FROM is not supported".to_string())?;
+                projected.extend_from_slice(row);
+            }
+            SelectColumn::Expr { expr, .. } => projected.push(eval_grouped_expr(
+                expr,
+                meta,
+                rows,
+                scalar_row_count,
+                representative_row,
+            )?),
+        }
+    }
+    Ok(projected)
+}
+
+fn evaluate_grouped_order_by_keys(
+    order_by: &[OrderByItem],
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+    representative_row: Option<&[Value]>,
+) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        out.push(eval_grouped_expr(
+            &item.expr,
+            meta,
+            rows,
+            scalar_row_count,
+            representative_row,
+        )?);
+    }
+    Ok(out)
+}
+
+fn eval_grouped_expr(
+    expr: &Expr,
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+    representative_row: Option<&[Value]>,
+) -> Result<Value, String> {
+    let row_ctx = grouped_row_ctx(meta, representative_row);
+    if !expr_contains_aggregate(expr) {
+        return eval_expr(expr, row_ctx);
+    }
+
+    match expr {
+        Expr::IntegerLiteral(_)
+        | Expr::FloatLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Null
+        | Expr::ColumnRef { .. } => eval_expr(expr, row_ctx),
+        Expr::Paren(inner) => {
+            eval_grouped_expr(inner, meta, rows, scalar_row_count, representative_row)
+        }
+        Expr::UnaryOp { op, expr } => {
+            let value = eval_grouped_expr(expr, meta, rows, scalar_row_count, representative_row)?;
+            match op {
+                UnaryOperator::Negate => match value {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err("cannot negate non-numeric value".to_string()),
+                },
+                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&value)) as i64)),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lhs = eval_grouped_expr(left, meta, rows, scalar_row_count, representative_row)?;
+            let rhs = eval_grouped_expr(right, meta, rows, scalar_row_count, representative_row)?;
+            eval_binary_op(&lhs, *op, &rhs)
+        }
+        Expr::IsNull { expr, negated } => {
+            let value = eval_grouped_expr(expr, meta, rows, scalar_row_count, representative_row)?;
+            let is_null = matches!(value, Value::Null);
+            Ok(Value::Integer(
+                (if *negated { !is_null } else { is_null }) as i64,
+            ))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval_grouped_expr(expr, meta, rows, scalar_row_count, representative_row)?;
+            let low_value =
+                eval_grouped_expr(low, meta, rows, scalar_row_count, representative_row)?;
+            let high_value =
+                eval_grouped_expr(high, meta, rows, scalar_row_count, representative_row)?;
+            let ge_low =
+                compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&value, &high_value).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let between = ge_low && le_high;
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = eval_grouped_expr(expr, meta, rows, scalar_row_count, representative_row)?;
+            let mut found = false;
+            for item in list {
+                let candidate =
+                    eval_grouped_expr(item, meta, rows, scalar_row_count, representative_row)?;
+                if values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
+        }
+        Expr::FunctionCall { name, args } => {
+            if is_aggregate_function(name) {
+                eval_aggregate_function(name, args, meta, rows, scalar_row_count)
+            } else {
+                eval_expr(expr, row_ctx)
+            }
+        }
+    }
 }
 
 fn select_uses_aggregates(stmt: &SelectStmt) -> bool {
@@ -2198,35 +2497,141 @@ mod tests {
     }
 
     #[test]
-    fn select_group_by_returns_not_supported_error() {
-        let path = temp_db_path("group_by_not_supported");
+    fn select_group_by_aggregate_and_having_filters_groups() {
+        let path = temp_db_path("group_by_aggregate_having");
         let mut db = Database::open(&path).unwrap();
 
         db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
             .unwrap();
-        db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20);")
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, NULL);")
             .unwrap();
 
-        let err = db
-            .execute("SELECT score, COUNT(*) FROM t GROUP BY score;")
-            .unwrap_err();
-        assert!(err.contains("GROUP BY is not supported yet"));
+        let result = db
+            .execute(
+                "SELECT score, COUNT(*), SUM(id) FROM t GROUP BY score HAVING COUNT(*) > 1 \
+                 ORDER BY score;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(10),
+                        Value::Integer(2),
+                        Value::Integer(3),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }
 
     #[test]
-    fn select_having_returns_not_supported_error() {
-        let path = temp_db_path("having_not_supported");
+    fn select_group_by_without_aggregates_deduplicates_rows() {
+        let path = temp_db_path("group_by_dedup");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, NULL);")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT score FROM t GROUP BY score ORDER BY score;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Null],
+                        vec![Value::Integer(10)],
+                        vec![Value::Integer(20)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_having_without_group_by_aggregate_query() {
+        let path = temp_db_path("having_aggregate_query");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3);").unwrap();
+
+        let true_result = db
+            .execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;")
+            .unwrap();
+        match true_result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(3)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        let false_result = db
+            .execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 3;")
+            .unwrap();
+        match false_result {
+            ExecuteResult::Select(q) => {
+                assert!(q.rows.is_empty());
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_having_without_group_by_non_aggregate_errors() {
+        let path = temp_db_path("having_non_aggregate_error");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+
+        let err = db.execute("SELECT 1 FROM t HAVING 1;").unwrap_err();
+        assert!(err.contains("HAVING clause on a non-aggregate query"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_group_by_rejects_aggregate_expression() {
+        let path = temp_db_path("group_by_aggregate_expr_error");
         let mut db = Database::open(&path).unwrap();
 
         db.execute("CREATE TABLE t (id INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
 
         let err = db
-            .execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;")
+            .execute("SELECT COUNT(*) FROM t GROUP BY COUNT(*);")
             .unwrap_err();
-        assert!(err.contains("HAVING is not supported yet"));
+        assert!(err.contains("aggregate functions are not allowed in GROUP BY"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_group_by_without_from_uses_single_scalar_row() {
+        let path = temp_db_path("group_by_without_from");
+        let mut db = Database::open(&path).unwrap();
+
+        let result = db.execute("SELECT 2 + 2 GROUP BY 2 + 2;").unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(4)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }
