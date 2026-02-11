@@ -1,3 +1,0 @@
-created_at_unix=1770788598
-agent_id=codex
-task=WAL checkpoint and crash recovery
