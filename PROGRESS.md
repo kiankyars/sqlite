@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection for table-scan vs index paths for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality metadata for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -53,13 +53,16 @@ Latest completions:
 - Multi-column prefix/range planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now emits `IndexPrefixRange` for left-prefix equality predicates (with optional range bounds on the next index column), and SELECT/UPDATE/DELETE now evaluate those candidates against decoded tuple buckets from multi-column indexes; see `notes/multi-column-prefix-range-planner-execution.md`
 - Multi-column prefix/range scan-reduction heuristics in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now penalizes weak `IndexPrefixRange` probes that imply full composite-index scans, falls back to `TableScan` for low-selectivity prefix-only forms, and retains bounded prefix/range usage; see `notes/multi-column-prefix-range-scan-reduction.md`
 - Planner statistics-driven cost model for table-scan vs index-path selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — added `plan_where_with_stats`/`plan_select_with_stats` plus runtime table/index cardinality hints from `ralph-sqlite`, with legacy static heuristics preserved when stats are absent; see `notes/planner-statistics-cost-model.md`
+- Persisted planner statistics metadata in `crates/storage` + `crates/ralph-sqlite` (Agent 4) — schema now persists table/index planner stats entries, planner stats now load from persisted metadata instead of per-query scans, and write paths refresh/drop stats metadata on CREATE/INSERT/UPDATE/DELETE/DROP; see `notes/persisted-planner-statistics.md`
 
 Recommended next step:
-- Add persisted planner statistics (histogram/fanout metadata) to improve selectivity and cost estimates beyond runtime cardinality hints.
+- Add histogram/fanout planner statistics (especially for multi-column prefix/range predicates) and feed them into cost estimation.
 
 Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT/FULL OUTER JOIN merged verification): pass, 0 failed (161 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (RIGHT/FULL OUTER JOIN merged verification, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-storage -p ralph-sqlite` (persisted planner statistics metadata): pass, 0 failed (146 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (persisted planner statistics metadata, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT JOIN parser/execution support): pass, 0 failed (157 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (RIGHT JOIN parser/execution support, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (FULL OUTER JOIN parser/execution support): pass, 0 failed (157 tests).
@@ -204,6 +207,7 @@ Test pass rate:
 38. ~~Planner statistics-driven cost model for table scan vs index path selection~~ ✓
 39. ~~RIGHT JOIN parser/execution support~~ ✓
 40. ~~FULL OUTER JOIN parser/execution support~~ ✓
+41. ~~Persisted planner statistics metadata~~ ✓
 
 ## Completed Tasks
 
@@ -427,12 +431,17 @@ Test pass rate:
   - Kept legacy `plan_where`/`plan_select` behavior unchanged for call sites that do not provide stats
   - Wired `ralph-sqlite` to collect runtime table/index cardinality estimates and pass them to planner for SELECT/UPDATE/DELETE
   - Added planner coverage for stats-driven high-cardinality and low-cardinality path choices; see `notes/planner-statistics-cost-model.md`
+- [x] Persisted planner statistics metadata in schema + integration (agent 4)
+  - Added schema `ObjectType::Stats` metadata entries plus APIs to upsert/list/drop table and index planner stats
+  - Wired `Database::open` to load persisted table/index stats, and planner paths to consume persisted stats maps instead of per-query full scans
+  - Added write-path stats refresh + persistence for CREATE/INSERT/UPDATE/DELETE and stats cleanup on DROP TABLE/DROP INDEX
+  - Added storage + integration coverage; see `notes/persisted-planner-statistics.md`
 
 ## Known Issues
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
-- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection; persisted histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
+- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection with persisted row/distinct metadata; histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support

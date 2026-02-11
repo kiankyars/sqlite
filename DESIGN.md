@@ -22,7 +22,7 @@ ralph-sqlite (integration)
 **ralph-planner** — AST in, execution plan out.
 - Logical plan: relational algebra tree (Scan, Filter, Project, Join, Sort, Limit).
 - Physical plan: annotated with access methods (index scan vs. table scan), join strategies.
-- Optimizer: rule-based initially; cost-based later.
+- Optimizer: rule-based initially; cost-based later, with optional persisted cardinality stats hints.
 
 **ralph-executor** — Plan in, result rows out.
 - Volcano/iterator model: each plan node implements `open()`, `next()`, `close()`.
@@ -43,7 +43,7 @@ ralph-sqlite (integration)
 - Page 0 is the file header (magic number, page size, schema version, freelist pointer).
 - Tables are B+trees keyed by 64-bit rowid.
 - Indexes are B+trees keyed by indexed column value(s), with rowid as the value.
-- The schema table (sqlite_master equivalent) is stored in page 1.
+- The schema table (sqlite_master equivalent) is stored in page 1 and now also stores planner stats metadata entries.
 
 ## On-Disk Layout
 

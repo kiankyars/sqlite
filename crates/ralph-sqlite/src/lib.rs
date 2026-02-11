@@ -64,6 +64,8 @@ struct IndexMeta {
 struct TransactionSnapshot {
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
+    table_stats: HashMap<String, usize>,
+    index_stats: HashMap<String, PersistedIndexStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +75,19 @@ struct GroupState {
     scalar_row_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedIndexStats {
+    estimated_rows: usize,
+    estimated_distinct_keys: usize,
+}
+
 pub struct Database {
     db_path: PathBuf,
     pager: Pager,
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
+    table_stats: HashMap<String, usize>,
+    index_stats: HashMap<String, PersistedIndexStats>,
     in_explicit_txn: bool,
     tx_snapshot: Option<TransactionSnapshot>,
 }
@@ -89,13 +99,15 @@ impl Database {
         if pager.header().schema_root == 0 {
             Schema::initialize(&mut pager).map_err(|e| format!("initialize schema: {e}"))?;
         }
-        let (tables, indexes) = load_catalogs(&mut pager)?;
+        let (tables, indexes, table_stats, index_stats) = load_catalogs(&mut pager)?;
 
         Ok(Self {
             db_path,
             pager,
             tables,
             indexes,
+            table_stats,
+            index_stats,
             in_explicit_txn: false,
             tx_snapshot: None,
         })
@@ -125,6 +137,8 @@ impl Database {
         self.tx_snapshot = Some(TransactionSnapshot {
             tables: self.tables.clone(),
             indexes: self.indexes.clone(),
+            table_stats: self.table_stats.clone(),
+            index_stats: self.index_stats.clone(),
         });
         self.in_explicit_txn = true;
         Ok(ExecuteResult::Begin)
@@ -158,6 +172,8 @@ impl Database {
         self.pager = reopened;
         self.tables = snapshot.tables;
         self.indexes = snapshot.indexes;
+        self.table_stats = snapshot.table_stats;
+        self.index_stats = snapshot.index_stats;
         self.in_explicit_txn = false;
         self.tx_snapshot = None;
         Ok(ExecuteResult::Rollback)
@@ -209,13 +225,14 @@ impl Database {
         )
         .map_err(|e| format!("create table: {e}"))?;
         self.tables.insert(
-            table_key,
+            table_key.clone(),
             TableMeta {
                 name: stmt.table,
                 columns,
                 root_page,
             },
         );
+        self.refresh_and_persist_table_planner_stats(&table_key)?;
         self.commit_if_autocommit("create table")?;
         Ok(ExecuteResult::CreateTable)
     }
@@ -312,6 +329,7 @@ impl Database {
         }
 
         self.indexes.insert(index_key, index_meta);
+        self.refresh_and_persist_table_planner_stats(&table_key)?;
         self.commit_if_autocommit("create index")?;
         Ok(ExecuteResult::CreateIndex)
     }
@@ -347,6 +365,9 @@ impl Database {
             BTree::reclaim_tree(&mut self.pager, dropped.root_page)
                 .map_err(|e| format!("drop index '{}': reclaim pages: {e}", dropped.name))?;
             self.indexes.remove(index_key);
+            self.index_stats.remove(index_key);
+            Schema::drop_index_stats(&mut self.pager, index_key)
+                .map_err(|e| format!("drop planner stats for index '{}': {e}", dropped.name))?;
         }
 
         let dropped_table = Schema::drop_table(&mut self.pager, &table_meta.name)
@@ -361,6 +382,9 @@ impl Database {
             .map_err(|e| format!("drop table '{}': reclaim pages: {e}", dropped_table.name))?;
 
         self.tables.remove(&table_key);
+        self.table_stats.remove(&table_key);
+        Schema::drop_table_stats(&mut self.pager, &table_meta.name)
+            .map_err(|e| format!("drop planner stats for table '{}': {e}", table_meta.name))?;
         self.commit_if_autocommit("drop table")?;
         Ok(ExecuteResult::DropTable)
     }
@@ -385,6 +409,9 @@ impl Database {
             .map_err(|e| format!("drop index '{}': reclaim pages: {e}", dropped_index.name))?;
 
         self.indexes.remove(&index_key);
+        self.index_stats.remove(&index_key);
+        Schema::drop_index_stats(&mut self.pager, &index_key)
+            .map_err(|e| format!("drop planner stats for index '{}': {e}", index_key))?;
         debug_assert_eq!(
             index_meta.root_page, dropped_index.root_page,
             "in-memory and schema root pages diverged for dropped index '{}'",
@@ -447,6 +474,7 @@ impl Database {
             }
         }
 
+        self.refresh_and_persist_table_planner_stats(&table_key)?;
         self.commit_if_autocommit("insert")?;
 
         Ok(ExecuteResult::Insert { rows_affected })
@@ -556,7 +584,7 @@ impl Database {
         let table_indexes = self.indexes_for_table(&table_key);
 
         let planner_indexes = self.planner_indexes_for_table(&table_key);
-        let planner_stats = self.planner_stats_for_table(&meta, &planner_indexes);
+        let planner_stats = self.planner_stats_for_table(&table_key, &planner_indexes);
         let access_path = plan_where_with_stats(
             stmt.where_clause.as_ref(),
             &meta.name,
@@ -607,6 +635,9 @@ impl Database {
             }
         }
 
+        if rows_affected > 0 {
+            self.refresh_and_persist_table_planner_stats(&table_key)?;
+        }
         self.commit_if_autocommit("update")?;
 
         Ok(ExecuteResult::Update { rows_affected })
@@ -622,7 +653,7 @@ impl Database {
         let table_indexes = self.indexes_for_table(&table_key);
 
         let planner_indexes = self.planner_indexes_for_table(&table_key);
-        let planner_stats = self.planner_stats_for_table(&meta, &planner_indexes);
+        let planner_stats = self.planner_stats_for_table(&table_key, &planner_indexes);
         let access_path = plan_where_with_stats(
             stmt.where_clause.as_ref(),
             &meta.name,
@@ -652,6 +683,9 @@ impl Database {
             }
         }
 
+        if rows_affected > 0 {
+            self.refresh_and_persist_table_planner_stats(&table_key)?;
+        }
         self.commit_if_autocommit("delete")?;
 
         Ok(ExecuteResult::Delete { rows_affected })
@@ -695,7 +729,7 @@ impl Database {
         let table_meta = table_ctx.as_ref().map(|(_, meta)| meta);
         let access_path = if let Some((table_key, meta)) = table_ctx.as_ref() {
             let planner_indexes = self.planner_indexes_for_table(table_key);
-            let planner_stats = self.planner_stats_for_table(meta, &planner_indexes);
+            let planner_stats = self.planner_stats_for_table(table_key, &planner_indexes);
             plan_select_with_stats(&stmt, &meta.name, &planner_indexes, Some(&planner_stats))
                 .access_path
         } else {
@@ -1261,33 +1295,79 @@ impl Database {
     }
 
     fn planner_stats_for_table(
-        &mut self,
-        table_meta: &TableMeta,
+        &self,
+        table_key: &str,
         planner_indexes: &[IndexInfo],
     ) -> PlannerStats {
-        let estimated_table_rows = self.estimate_tree_entry_count(table_meta.root_page).ok();
+        let estimated_table_rows = self.table_stats.get(table_key).copied();
         let mut index_stats = Vec::new();
 
         for planner_index in planner_indexes {
             let idx_key = normalize_identifier(&planner_index.name);
-            let Some(root_page) = self.indexes.get(&idx_key).map(|meta| meta.root_page) else {
+            let Some(stats) = self.index_stats.get(&idx_key) else {
                 continue;
             };
-            if let Ok((estimated_rows, estimated_distinct_keys)) =
-                self.estimate_index_cardinality(root_page)
-            {
-                index_stats.push(PlannerIndexStats {
-                    index_name: planner_index.name.clone(),
-                    estimated_rows,
-                    estimated_distinct_keys,
-                });
-            }
+            index_stats.push(PlannerIndexStats {
+                index_name: planner_index.name.clone(),
+                estimated_rows: stats.estimated_rows,
+                estimated_distinct_keys: stats.estimated_distinct_keys,
+            });
         }
 
         PlannerStats {
             estimated_table_rows,
             index_stats,
         }
+    }
+
+    fn refresh_and_persist_table_planner_stats(&mut self, table_key: &str) -> Result<(), String> {
+        let table_meta = self
+            .tables
+            .get(table_key)
+            .cloned()
+            .ok_or_else(|| format!("table metadata not found for '{}'", table_key))?;
+
+        let estimated_table_rows = self.estimate_tree_entry_count(table_meta.root_page)?;
+        Schema::upsert_table_stats(&mut self.pager, &table_meta.name, estimated_table_rows)
+            .map_err(|e| format!("persist table planner stats '{}': {e}", table_meta.name))?;
+        self.table_stats
+            .insert(table_key.to_string(), estimated_table_rows);
+
+        let index_entries: Vec<(String, String, PageNum)> = self
+            .indexes
+            .iter()
+            .filter(|(_, index_meta)| index_meta.table_key == table_key)
+            .map(|(index_key, index_meta)| {
+                (
+                    index_key.clone(),
+                    index_meta.table_name.clone(),
+                    index_meta.root_page,
+                )
+            })
+            .collect();
+
+        for (index_key, index_table_name, index_root_page) in index_entries {
+            let (estimated_rows, estimated_distinct_keys) =
+                self.estimate_index_cardinality(index_root_page)?;
+            Schema::upsert_index_stats(
+                &mut self.pager,
+                &index_key,
+                &index_table_name,
+                estimated_rows,
+                estimated_distinct_keys,
+            )
+            .map_err(|e| format!("persist index planner stats '{}': {e}", index_key))?;
+
+            self.index_stats.insert(
+                index_key,
+                PersistedIndexStats {
+                    estimated_rows,
+                    estimated_distinct_keys,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn estimate_tree_entry_count(&mut self, root_page: PageNum) -> Result<usize, String> {
@@ -1900,7 +1980,15 @@ fn ordered_range_key_bounds(
 
 fn load_catalogs(
     pager: &mut Pager,
-) -> Result<(HashMap<String, TableMeta>, HashMap<String, IndexMeta>), String> {
+) -> Result<
+    (
+        HashMap<String, TableMeta>,
+        HashMap<String, IndexMeta>,
+        HashMap<String, usize>,
+        HashMap<String, PersistedIndexStats>,
+    ),
+    String,
+> {
     let mut tables = HashMap::new();
     let table_entries = Schema::list_tables(pager).map_err(|e| format!("load tables: {e}"))?;
     for mut table in table_entries {
@@ -1977,7 +2065,33 @@ fn load_catalogs(
         );
     }
 
-    Ok((tables, indexes))
+    let mut table_stats = HashMap::new();
+    let table_stats_entries =
+        Schema::list_table_stats(pager).map_err(|e| format!("load table stats: {e}"))?;
+    for stats in table_stats_entries {
+        let table_key = normalize_identifier(&stats.table_name);
+        if tables.contains_key(&table_key) {
+            table_stats.insert(table_key, stats.estimated_rows);
+        }
+    }
+
+    let mut index_stats = HashMap::new();
+    let index_stats_entries =
+        Schema::list_index_stats(pager).map_err(|e| format!("load index stats: {e}"))?;
+    for stats in index_stats_entries {
+        let index_key = normalize_identifier(&stats.index_name);
+        if indexes.contains_key(&index_key) {
+            index_stats.insert(
+                index_key,
+                PersistedIndexStats {
+                    estimated_rows: stats.estimated_rows,
+                    estimated_distinct_keys: stats.estimated_distinct_keys,
+                },
+            );
+        }
+    }
+
+    Ok((tables, indexes, table_stats, index_stats))
 }
 
 fn create_index_stmt_from_sql(sql: &str) -> Option<CreateIndexStmt> {
@@ -4672,6 +4786,8 @@ mod tests {
             .unwrap_err()
             .contains("no such table"));
         assert!(!db.indexes.contains_key("idx_users_age"));
+        assert!(!db.table_stats.contains_key("users"));
+        assert!(!db.index_stats.contains_key("idx_users_age"));
         assert!(db.pager.header().freelist_count > freelist_before);
 
         assert_eq!(
@@ -4720,6 +4836,7 @@ mod tests {
         let dropped = db.execute("DROP INDEX idx_users_age;").unwrap();
         assert_eq!(dropped, ExecuteResult::DropIndex);
         assert!(!db.indexes.contains_key("idx_users_age"));
+        assert!(!db.index_stats.contains_key("idx_users_age"));
         assert!(db.pager.header().freelist_count > freelist_before);
 
         let selected = db
@@ -4899,6 +5016,74 @@ mod tests {
             }
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn planner_stats_persist_across_reopen() {
+        let path = temp_db_path("planner_stats_reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+                .unwrap();
+            db.execute("CREATE INDEX idx_users_age ON users(age);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 30), (2, 20), (3, 30);")
+                .unwrap();
+
+            assert_eq!(db.table_stats.get("users").copied(), Some(3));
+            assert_eq!(
+                db.index_stats.get("idx_users_age").copied(),
+                Some(PersistedIndexStats {
+                    estimated_rows: 3,
+                    estimated_distinct_keys: 2,
+                })
+            );
+        }
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.table_stats.get("users").copied(), Some(3));
+        assert_eq!(
+            reopened.index_stats.get("idx_users_age").copied(),
+            Some(PersistedIndexStats {
+                estimated_rows: 3,
+                estimated_distinct_keys: 2,
+            })
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn planner_stats_refresh_on_write_statements() {
+        let path = temp_db_path("planner_stats_write_refresh");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10), (2, 10), (3, 20);")
+            .unwrap();
+        db.execute("UPDATE users SET age = 20 WHERE id = 1;")
+            .unwrap();
+        db.execute("DELETE FROM users WHERE id = 2;").unwrap();
+
+        assert_eq!(db.table_stats.get("users").copied(), Some(2));
+        assert_eq!(
+            db.index_stats.get("idx_users_age").copied(),
+            Some(PersistedIndexStats {
+                estimated_rows: 2,
+                estimated_distinct_keys: 1,
+            })
+        );
+
+        let index_stats = Schema::list_index_stats(&mut db.pager).unwrap();
+        assert_eq!(index_stats.len(), 1);
+        assert_eq!(index_stats[0].index_name, "idx_users_age");
+        assert_eq!(index_stats[0].estimated_rows, 2);
+        assert_eq!(index_stats[0].estimated_distinct_keys, 1);
 
         cleanup(&path);
     }
