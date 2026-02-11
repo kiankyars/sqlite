@@ -40,6 +40,21 @@ pub enum SelectColumn {
 pub struct FromClause {
     pub table: String,
     pub alias: Option<String>,
+    pub joins: Vec<JoinClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: String,
+    pub alias: Option<String>,
+    pub condition: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -327,6 +327,7 @@ mod tests {
             from: Some(FromClause {
                 table: "t".to_string(),
                 alias: None,
+                joins: Vec::new(),
             }),
             where_clause: None,
             group_by: Vec::new(),

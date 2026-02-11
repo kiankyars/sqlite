@@ -50,7 +50,7 @@ Fast mode selects a deterministic 10% subset of tests using md5sum-based hashing
 ## Scope
 
 ### In scope
-- SQL parsing (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
+- SQL parsing (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, JOIN)
 - Single-file database storage (SQLite-compatible page format)
 - B+tree tables (rowid) and secondary indexes
 - Basic query planning and optimization

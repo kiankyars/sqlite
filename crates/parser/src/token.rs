@@ -91,6 +91,9 @@ pub enum Keyword {
     Check,
     Group,
     Having,
+    Join,
+    Inner,
+    Cross,
 }
 
 impl Keyword {
@@ -148,6 +151,9 @@ impl Keyword {
             "CHECK" => Some(Keyword::Check),
             "GROUP" => Some(Keyword::Group),
             "HAVING" => Some(Keyword::Having),
+            "JOIN" => Some(Keyword::Join),
+            "INNER" => Some(Keyword::Inner),
+            "CROSS" => Some(Keyword::Cross),
             _ => None,
         }
     }

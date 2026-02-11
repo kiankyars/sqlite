@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column `UNIQUE` secondary index enforcement, SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column `UNIQUE` secondary index enforcement, SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -38,11 +38,17 @@ Latest completions:
 - Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable
 - Ordered range index seeks for text bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — text index keys now use an order-preserving 8-byte prefix encoding so `IndexRange` plans can seek on text bounds (with value-level filtering retained for strict bound semantics)
 - Single-column `UNIQUE` index execution in `crates/ralph-sqlite` (Agent codex) — `CREATE UNIQUE INDEX` now builds/enforces unique secondary indexes, `INSERT`/`UPDATE` reject duplicate non-`NULL` keys with SQLite-style errors, and index uniqueness now persists across reopen via schema SQL parsing
+- INNER JOIN / CROSS JOIN execution in `crates/parser` + `crates/ralph-sqlite` (Agent opus) — parser now supports `JOIN`, `INNER JOIN`, `CROSS JOIN`, and comma cross join syntax with ON conditions and table aliases; execution performs nested-loop cross-product joins with ON/WHERE filtering, qualified column resolution, and full ORDER BY/LIMIT support
 
 Recommended next step:
 - Improve text index key encoding beyond fixed 8-byte prefixes to reduce collision-heavy scans for long shared prefixes while preserving order.
 
 Test pass rate:
+- `cargo test --workspace` (INNER JOIN / CROSS JOIN execution): pass, 0 failed (205 tests).
+- `cargo test -p ralph-parser` (INNER JOIN / CROSS JOIN parser): pass, 0 failed (65 tests).
+- `cargo test -p ralph-sqlite` (INNER JOIN / CROSS JOIN execution): pass, 0 failed (58 tests).
+- `./test.sh --fast` (INNER JOIN / CROSS JOIN execution, seed: 1): pass, 0 failed, 4 skipped (deterministic sample).
+- `./test.sh` (full, INNER JOIN / CROSS JOIN execution): 5/5 passed.
 - `cargo test -p ralph-executor -p ralph-sqlite` (ordered text range index seeks): pass, 0 failed (56 tests).
 - `cargo test --workspace` (single-column UNIQUE index execution): pass, 0 failed (189 tests).
 - `cargo test -p ralph-sqlite` (single-column UNIQUE index execution): pass, 0 failed (49 tests).
@@ -134,6 +140,7 @@ Test pass rate:
 26. ~~B+tree interior occupancy rebalance~~ ✓
 27. ~~Ordered text range index seeks~~ ✓
 28. ~~Single-column UNIQUE index execution~~ ✓
+29. ~~INNER JOIN / CROSS JOIN execution~~ ✓
 
 ## Completed Tasks
 
@@ -300,6 +307,11 @@ Test pass rate:
   - `INSERT`/`UPDATE` now enforce unique secondary index constraints for non-`NULL` values
   - Unique-index enforcement now persists across reopen by parsing index schema SQL on catalog load
   - Added integration coverage; see `notes/unique-index-execution.md`
+- [x] INNER JOIN / CROSS JOIN execution (agent opus)
+  - Added `Join`, `Inner`, `Cross` keywords and `JoinClause`/`JoinType` AST types
+  - Parser now supports `FROM a, b`, `FROM a JOIN b ON ...`, `FROM a INNER JOIN b ON ...`, `FROM a CROSS JOIN b`, multi-table chains, and table aliases
+  - Execution performs nested-loop cross-product joins with ON/WHERE filtering and table-qualified column resolution
+  - Added 6 parser tests and 9 integration tests; see `notes/inner-join-execution.md`
 
 ## Known Issues
 
@@ -307,7 +319,7 @@ Test pass rate:
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text uses an 8-byte prefix key encoding, so long shared prefixes can still cause collision-heavy scans within matched key ranges.
-- No JOIN support (single-table FROM only)
+- JOIN support is limited to INNER JOIN and CROSS JOIN; LEFT/RIGHT/FULL OUTER JOIN not implemented. Join execution uses nested-loop cross products with no index-driven optimization. Aggregate queries (GROUP BY/HAVING) are not supported with joins yet.
 - No subquery support
 - Multi-column secondary index execution is not supported yet; UNIQUE enforcement is currently limited to single-column indexes.
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

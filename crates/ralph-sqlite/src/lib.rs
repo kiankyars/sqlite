@@ -654,6 +654,13 @@ impl Database {
             return Err("aggregate functions are not allowed in GROUP BY".to_string());
         }
 
+        // Dispatch to join-specific path when FROM has joins
+        if let Some(from) = &stmt.from {
+            if !from.joins.is_empty() {
+                return self.execute_select_join(stmt);
+            }
+        }
+
         let table_ctx = if let Some(from) = &stmt.from {
             let table_key = normalize_identifier(&from.table);
             let table_meta = self
@@ -1136,6 +1143,184 @@ impl Database {
         }
 
         Ok(rows)
+    }
+
+    /// Read all rows from a table via full scan, returning decoded rows.
+    fn read_all_rows(&mut self, meta: &TableMeta) -> Result<Vec<Vec<Value>>, String> {
+        let scan = TableScan::new(&mut self.pager, meta.root_page);
+        let rows = ralph_executor::execute(Box::new(scan)).map_err(|e| e.to_string())?;
+        for row in &rows {
+            if row.len() != meta.columns.len() {
+                return Err(format!(
+                    "row column count {} does not match table schema {}",
+                    row.len(),
+                    meta.columns.len()
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Execute a join query, producing a synthetic joined meta and joined rows.
+    fn execute_join(
+        &mut self,
+        from: &ralph_parser::ast::FromClause,
+    ) -> Result<(TableMeta, Vec<Vec<Value>>), String> {
+        // Resolve left table
+        let left_key = normalize_identifier(&from.table);
+        let left_meta = self
+            .tables
+            .get(&left_key)
+            .cloned()
+            .ok_or_else(|| format!("no such table '{}'", from.table))?;
+        let left_rows = self.read_all_rows(&left_meta)?;
+
+        // Build joined meta starting from left table
+        let left_alias = from
+            .alias
+            .as_deref()
+            .unwrap_or(&from.table);
+        let mut joined_columns: Vec<String> = left_meta.columns.clone();
+        let mut table_ranges: Vec<(String, usize, usize)> =
+            vec![(left_alias.to_string(), 0, left_meta.columns.len())];
+        let mut current_rows = left_rows;
+
+        for join in &from.joins {
+            let right_key = normalize_identifier(&join.table);
+            let right_meta = self
+                .tables
+                .get(&right_key)
+                .cloned()
+                .ok_or_else(|| format!("no such table '{}'", join.table))?;
+            let right_rows = self.read_all_rows(&right_meta)?;
+
+            let right_alias = join
+                .alias
+                .as_deref()
+                .unwrap_or(&join.table);
+            let right_col_start = joined_columns.len();
+            joined_columns.extend(right_meta.columns.iter().cloned());
+            table_ranges.push((
+                right_alias.to_string(),
+                right_col_start,
+                right_col_start + right_meta.columns.len(),
+            ));
+
+            // Build the synthetic meta for the full joined table so far
+            // so we can evaluate the ON condition
+            let synthetic_meta = TableMeta {
+                name: String::new(),
+                columns: joined_columns.clone(),
+                root_page: 0,
+            };
+
+            // Nested-loop join: cross product with optional ON filter
+            let mut new_rows = Vec::new();
+            for left_row in &current_rows {
+                for right_row in &right_rows {
+                    let mut combined: Vec<Value> =
+                        Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend_from_slice(left_row);
+                    combined.extend_from_slice(right_row);
+
+                    if let Some(on_expr) = &join.condition {
+                        let matches = eval_join_expr(
+                            on_expr,
+                            &synthetic_meta,
+                            &combined,
+                            &table_ranges,
+                        )?;
+                        if !is_truthy(&matches) {
+                            continue;
+                        }
+                    }
+                    new_rows.push(combined);
+                }
+            }
+            current_rows = new_rows;
+        }
+
+        let joined_meta = TableMeta {
+            name: String::new(),
+            columns: joined_columns,
+            root_page: 0,
+        };
+
+        Ok((joined_meta, current_rows))
+    }
+
+    /// Execute a SELECT with JOIN clauses.
+    fn execute_select_join(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        let from = stmt.from.as_ref().unwrap();
+        let (joined_meta, mut joined_rows) = self.execute_join(from)?;
+
+        // Build table_ranges for qualified column resolution
+        let mut table_ranges: Vec<(String, usize, usize)> = Vec::new();
+        {
+            let left_key = normalize_identifier(&from.table);
+            let left_meta = self.tables.get(&left_key).cloned().unwrap();
+            let left_alias = from.alias.as_deref().unwrap_or(&from.table);
+            table_ranges.push((left_alias.to_string(), 0, left_meta.columns.len()));
+            let mut offset = left_meta.columns.len();
+            for join in &from.joins {
+                let right_key = normalize_identifier(&join.table);
+                let right_meta = self.tables.get(&right_key).cloned().unwrap();
+                let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+                table_ranges.push((right_alias.to_string(), offset, offset + right_meta.columns.len()));
+                offset += right_meta.columns.len();
+            }
+        }
+
+        // Apply WHERE filter
+        if let Some(where_expr) = &stmt.where_clause {
+            joined_rows.retain(|row| {
+                match eval_join_expr(where_expr, &joined_meta, row, &table_ranges) {
+                    Ok(v) => is_truthy(&v),
+                    Err(_) => false,
+                }
+            });
+        }
+
+        // Project columns
+        let mut rows_with_order_keys: Vec<(Vec<Value>, Vec<Value>)> =
+            Vec::with_capacity(joined_rows.len());
+        for row in &joined_rows {
+            let projected = project_join_row(&stmt.columns, &joined_meta, row, &table_ranges)?;
+            let order_keys =
+                evaluate_join_order_by_keys(&stmt.order_by, &joined_meta, row, &table_ranges)?;
+            rows_with_order_keys.push((projected, order_keys));
+        }
+
+        // ORDER BY
+        if !stmt.order_by.is_empty() {
+            rows_with_order_keys.sort_by(|(_, left_keys), (_, right_keys)| {
+                compare_order_keys(left_keys, right_keys, &stmt.order_by)
+            });
+        }
+
+        let mut rows: Vec<Vec<Value>> = rows_with_order_keys
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+
+        // OFFSET
+        let offset = eval_optional_usize_expr(stmt.offset.as_ref())?;
+        if offset > 0 {
+            if offset >= rows.len() {
+                rows.clear();
+            } else {
+                rows = rows.into_iter().skip(offset).collect();
+            }
+        }
+
+        // LIMIT
+        if let Some(limit) = eval_optional_limit_expr(stmt.limit.as_ref())? {
+            rows.truncate(limit);
+        }
+
+        let columns = select_join_output_columns(&stmt.columns, &joined_meta, &table_ranges)?;
+
+        Ok(ExecuteResult::Select(QueryResult { columns, rows }))
     }
 
     fn validate_unique_constraints_for_insert_rows(
@@ -2108,6 +2293,77 @@ fn default_expr_name(expr: &Expr, idx: usize) -> String {
     }
 }
 
+fn project_join_row(
+    columns: &[SelectColumn],
+    meta: &TableMeta,
+    row: &[Value],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut projected = Vec::new();
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns => projected.extend_from_slice(row),
+            SelectColumn::Expr { expr, .. } => {
+                projected.push(eval_join_expr(expr, meta, row, table_ranges)?)
+            }
+        }
+    }
+    Ok(projected)
+}
+
+fn evaluate_join_order_by_keys(
+    order_by: &[OrderByItem],
+    meta: &TableMeta,
+    row: &[Value],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        keys.push(eval_join_expr(&item.expr, meta, row, table_ranges)?);
+    }
+    Ok(keys)
+}
+
+fn select_join_output_columns(
+    columns: &[SelectColumn],
+    meta: &TableMeta,
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for (idx, col) in columns.iter().enumerate() {
+        match col {
+            SelectColumn::AllColumns => {
+                // For joins, qualify column names when there are name collisions
+                let mut seen = HashSet::new();
+                let mut duplicates = HashSet::new();
+                for col_name in &meta.columns {
+                    let lower = col_name.to_ascii_lowercase();
+                    if !seen.insert(lower.clone()) {
+                        duplicates.insert(lower);
+                    }
+                }
+                for (table_alias, start, end) in table_ranges {
+                    for col_name in &meta.columns[*start..*end] {
+                        if duplicates.contains(&col_name.to_ascii_lowercase()) {
+                            names.push(format!("{}.{}", table_alias, col_name));
+                        } else {
+                            names.push(col_name.clone());
+                        }
+                    }
+                }
+            }
+            SelectColumn::Expr { expr, alias } => {
+                if let Some(alias) = alias {
+                    names.push(alias.clone());
+                } else {
+                    names.push(default_expr_name(expr, idx));
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
 fn eval_optional_limit_expr(expr: Option<&Expr>) -> Result<Option<usize>, String> {
     expr.map(eval_usize_expr).transpose()
 }
@@ -2202,6 +2458,123 @@ fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Val
             let mut found = false;
             for item in list {
                 let candidate = eval_expr(item, row_ctx)?;
+                if values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
+        }
+        Expr::FunctionCall { name, .. } => Err(format!("function '{name}' is not supported yet")),
+    }
+}
+
+/// Evaluate an expression in a joined-row context with table-qualified column resolution.
+///
+/// `table_ranges` maps (table_alias, start_col_idx, end_col_idx) to locate which
+/// slice of `row` belongs to which table.
+fn eval_join_expr(
+    expr: &Expr,
+    meta: &TableMeta,
+    row: &[Value],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Value, String> {
+    match expr {
+        Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
+        Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
+        Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
+        Expr::Null => Ok(Value::Null),
+        Expr::Paren(inner) => eval_join_expr(inner, meta, row, table_ranges),
+        Expr::ColumnRef { table, column } => {
+            if column == "*" {
+                return Err("'*' cannot be used as a scalar expression".to_string());
+            }
+            if let Some(table_qualifier) = table {
+                // Qualified: find the table range and resolve within it
+                let (_, start, end) = table_ranges
+                    .iter()
+                    .find(|(alias, _, _)| alias.eq_ignore_ascii_case(table_qualifier))
+                    .ok_or_else(|| format!("unknown table or alias '{}'", table_qualifier))?;
+                let range_cols = &meta.columns[*start..*end];
+                let local_idx = range_cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown column '{}' in table '{}'",
+                            column, table_qualifier
+                        )
+                    })?;
+                Ok(row[start + local_idx].clone())
+            } else {
+                // Unqualified: search all table ranges, error if ambiguous
+                let mut found: Option<usize> = None;
+                for (_, start, end) in table_ranges {
+                    for (i, col) in meta.columns[*start..*end].iter().enumerate() {
+                        if col.eq_ignore_ascii_case(column) {
+                            if found.is_some() {
+                                return Err(format!("ambiguous column name '{}'", column));
+                            }
+                            found = Some(start + i);
+                        }
+                    }
+                }
+                let idx =
+                    found.ok_or_else(|| format!("unknown column '{}'", column))?;
+                Ok(row[idx].clone())
+            }
+        }
+        Expr::UnaryOp { op, expr } => {
+            let v = eval_join_expr(expr, meta, row, table_ranges)?;
+            match op {
+                UnaryOperator::Negate => match v {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err("cannot negate non-numeric value".to_string()),
+                },
+                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&v)) as i64)),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lhs = eval_join_expr(left, meta, row, table_ranges)?;
+            let rhs = eval_join_expr(right, meta, row, table_ranges)?;
+            eval_binary_op(&lhs, *op, &rhs)
+        }
+        Expr::IsNull { expr, negated } => {
+            let v = eval_join_expr(expr, meta, row, table_ranges)?;
+            let is_null = matches!(v, Value::Null);
+            let result = if *negated { !is_null } else { is_null };
+            Ok(Value::Integer(result as i64))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_join_expr(expr, meta, row, table_ranges)?;
+            let low_v = eval_join_expr(low, meta, row, table_ranges)?;
+            let high_v = eval_join_expr(high, meta, row, table_ranges)?;
+            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let between = ge_low && le_high;
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = eval_join_expr(expr, meta, row, table_ranges)?;
+            let mut found = false;
+            for item in list {
+                let candidate = eval_join_expr(item, meta, row, table_ranges)?;
                 if values_equal(&value, &candidate) {
                     found = true;
                     break;
@@ -3894,6 +4267,314 @@ mod tests {
             indexed_rowids(&mut db, "idx_t_category", &Value::Text("b".to_string())),
             vec![2]
         );
+
+        cleanup(&path);
+    }
+
+    // ── JOIN tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn select_cross_join_comma_syntax() {
+        let path = temp_db_path("cross_join_comma");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE a (id INTEGER, x TEXT);").unwrap();
+        db.execute("CREATE TABLE b (id INTEGER, y TEXT);").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 'a1'), (2, 'a2');")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (10, 'b1'), (20, 'b2');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT a.x, b.y FROM a, b ORDER BY a.x, b.y;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows.len(), 4); // 2 x 2 = 4
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("a1".into()), Value::Text("b1".into())],
+                        vec![Value::Text("a1".into()), Value::Text("b2".into())],
+                        vec![Value::Text("a2".into()), Value::Text("b1".into())],
+                        vec![Value::Text("a2".into()), Value::Text("b2".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_inner_join_on() {
+        let path = temp_db_path("inner_join_on");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (2, 'sprocket');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT users.name, orders.product FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.name, orders.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("alice".into()), Value::Text("gadget".into())],
+                        vec![Value::Text("alice".into()), Value::Text("widget".into())],
+                        vec![Value::Text("bob".into()), Value::Text("sprocket".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_inner_join_with_where() {
+        let path = temp_db_path("inner_join_where");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER, val INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER, ref_id INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+        db.execute("INSERT INTO t2 VALUES (100, 1, 'x'), (200, 2, 'y'), (300, 3, 'z');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT t1.val, t2.label FROM t1 JOIN t2 ON t1.id = t2.ref_id WHERE t1.val > 15 ORDER BY t1.val;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(20), Value::Text("y".into())],
+                        vec![Value::Integer(30), Value::Text("z".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_with_alias() {
+        let path = temp_db_path("join_alias");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE employees (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE departments (emp_id INTEGER, dept TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'alice'), (2, 'bob');")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (1, 'eng'), (2, 'sales');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT e.name, d.dept FROM employees AS e JOIN departments AS d ON e.id = d.emp_id ORDER BY e.name;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("alice".into()), Value::Text("eng".into())],
+                        vec![Value::Text("bob".into()), Value::Text("sales".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_cross_join_explicit() {
+        let path = temp_db_path("cross_join_explicit");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE x (a INTEGER);").unwrap();
+        db.execute("CREATE TABLE y (b INTEGER);").unwrap();
+        db.execute("INSERT INTO x VALUES (1), (2);").unwrap();
+        db.execute("INSERT INTO y VALUES (10), (20);").unwrap();
+
+        let result = db
+            .execute("SELECT x.a, y.b FROM x CROSS JOIN y ORDER BY x.a, y.b;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows.len(), 4);
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Integer(10)],
+                        vec![Value::Integer(1), Value::Integer(20)],
+                        vec![Value::Integer(2), Value::Integer(10)],
+                        vec![Value::Integer(2), Value::Integer(20)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_star_expands_all_columns() {
+        let path = temp_db_path("join_star");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE p (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE q (pid INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1, 'alice');").unwrap();
+        db.execute("INSERT INTO q VALUES (1, 99);").unwrap();
+
+        let result = db
+            .execute("SELECT * FROM p JOIN q ON p.id = q.pid;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.columns.len(), 4); // id, name, pid, score
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(1),
+                        Value::Text("alice".into()),
+                        Value::Integer(1),
+                        Value::Integer(99),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_with_limit() {
+        let path = temp_db_path("join_limit");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE m (id INTEGER);").unwrap();
+        db.execute("CREATE TABLE n (id INTEGER);").unwrap();
+        db.execute("INSERT INTO m VALUES (1), (2), (3);").unwrap();
+        db.execute("INSERT INTO n VALUES (10), (20);").unwrap();
+
+        let result = db
+            .execute("SELECT m.id, n.id FROM m, n ORDER BY m.id, n.id LIMIT 3;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows.len(), 3);
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Integer(10)],
+                        vec![Value::Integer(1), Value::Integer(20)],
+                        vec![Value::Integer(2), Value::Integer(10)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_unqualified_column_resolution() {
+        let path = temp_db_path("join_unqualified_col");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE s (sid INTEGER, sname TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE r (rid INTEGER, sid_ref INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO s VALUES (1, 'one');").unwrap();
+        db.execute("INSERT INTO r VALUES (100, 1);").unwrap();
+
+        // sname is unambiguous — only in table s
+        let result = db
+            .execute(
+                "SELECT sname, rid FROM s JOIN r ON s.sid = r.sid_ref;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("one".into()), Value::Integer(100)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_three_way_join() {
+        let path = temp_db_path("three_way_join");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER, val TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (t1id INTEGER, extra INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE t3 (t2extra INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'hello');").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 42);").unwrap();
+        db.execute("INSERT INTO t3 VALUES (42, 'found');").unwrap();
+
+        let result = db
+            .execute(
+                "SELECT t1.val, t3.label FROM t1 JOIN t2 ON t1.id = t2.t1id JOIN t3 ON t2.extra = t3.t2extra;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Text("hello".into()),
+                        Value::Text("found".into()),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

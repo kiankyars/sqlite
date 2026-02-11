@@ -168,15 +168,90 @@ impl Parser {
 
     fn parse_from_clause(&mut self) -> Result<FromClause, String> {
         let table = self.expect_ident()?;
-        let alias = if self.at_keyword(Keyword::As) {
+        let alias = self.parse_optional_table_alias()?;
+        let mut joins = Vec::new();
+
+        loop {
+            if self.peek() == &Token::Comma {
+                // FROM a, b  →  implicit CROSS JOIN
+                self.advance();
+                let join_table = self.expect_ident()?;
+                let join_alias = self.parse_optional_table_alias()?;
+                joins.push(JoinClause {
+                    join_type: JoinType::Cross,
+                    table: join_table,
+                    alias: join_alias,
+                    condition: None,
+                });
+            } else if let Some(join_type) = self.peek_join_type() {
+                self.consume_join_keywords(join_type)?;
+                let join_table = self.expect_ident()?;
+                let join_alias = self.parse_optional_table_alias()?;
+                let condition = if self.at_keyword(Keyword::On) {
+                    self.advance();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                joins.push(JoinClause {
+                    join_type,
+                    table: join_table,
+                    alias: join_alias,
+                    condition,
+                });
+            } else {
+                break;
+            }
+        }
+
+        Ok(FromClause {
+            table,
+            alias,
+            joins,
+        })
+    }
+
+    fn parse_optional_table_alias(&mut self) -> Result<Option<String>, String> {
+        if self.at_keyword(Keyword::As) {
             self.advance();
-            Some(self.expect_ident()?)
+            Ok(Some(self.expect_ident()?))
         } else if matches!(self.peek(), Token::Ident(_)) {
-            Some(self.expect_ident()?)
+            Ok(Some(self.expect_ident()?))
         } else {
-            None
-        };
-        Ok(FromClause { table, alias })
+            Ok(None)
+        }
+    }
+
+    fn peek_join_type(&self) -> Option<JoinType> {
+        match self.peek() {
+            Token::Keyword(Keyword::Join) => Some(JoinType::Inner),
+            Token::Keyword(Keyword::Inner) => Some(JoinType::Inner),
+            Token::Keyword(Keyword::Cross) => Some(JoinType::Cross),
+            _ => None,
+        }
+    }
+
+    fn consume_join_keywords(&mut self, join_type: JoinType) -> Result<(), String> {
+        match self.peek() {
+            Token::Keyword(Keyword::Join) => {
+                self.advance();
+                Ok(())
+            }
+            Token::Keyword(Keyword::Inner) => {
+                self.advance();
+                self.expect_keyword(Keyword::Join)?;
+                Ok(())
+            }
+            Token::Keyword(Keyword::Cross) => {
+                self.advance();
+                self.expect_keyword(Keyword::Join)?;
+                Ok(())
+            }
+            other => Err(format!(
+                "expected JOIN keyword for {:?} join, found {:?}",
+                join_type, other
+            )),
+        }
     }
 
     fn parse_order_by_list(&mut self) -> Result<Vec<OrderByItem>, String> {
@@ -1434,6 +1509,101 @@ mod tests {
                 }
                 _ => panic!("expected Expr"),
             },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join_with_comma() {
+        let stmt = parse("SELECT * FROM a, b;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Cross);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_none());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_on() {
+        let stmt = parse("SELECT * FROM a JOIN b ON a.id = b.id;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Inner);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_explicit() {
+        let stmt = parse("SELECT * FROM a INNER JOIN b ON a.x = b.x;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Inner);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join_explicit() {
+        let stmt = parse("SELECT * FROM a CROSS JOIN b;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].join_type, JoinType::Cross);
+                assert_eq!(from.joins[0].table, "b");
+                assert!(from.joins[0].condition.is_none());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_aliases() {
+        let stmt = parse("SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "users");
+                assert_eq!(from.alias.as_deref(), Some("u"));
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].table, "orders");
+                assert_eq!(from.joins[0].alias.as_deref(), Some("o"));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_multi_table_join() {
+        let stmt = parse("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id;");
+        match stmt {
+            Stmt::Select(s) => {
+                let from = s.from.unwrap();
+                assert_eq!(from.table, "a");
+                assert_eq!(from.joins.len(), 2);
+                assert_eq!(from.joins[0].table, "b");
+                assert_eq!(from.joins[1].table, "c");
+            }
             _ => panic!("expected Select"),
         }
     }
