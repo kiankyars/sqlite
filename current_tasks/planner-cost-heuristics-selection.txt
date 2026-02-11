@@ -1,3 +1,0 @@
-created_at_unix=1770829034
-agent_id=3
-task=planner cost heuristics for table scan vs index path selection

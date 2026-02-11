@@ -70,8 +70,21 @@ pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -
 }
 
 fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
+    let index_path = choose_index_access_raw(expr, table_name, indexes)?;
+    if estimated_access_path_cost(&index_path) >= estimated_table_scan_cost() {
+        None
+    } else {
+        Some(index_path)
+    }
+}
+
+fn choose_index_access_raw(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
     match expr {
-        Expr::Paren(inner) => choose_index_access(inner, table_name, indexes),
+        Expr::Paren(inner) => choose_index_access_raw(inner, table_name, indexes),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
@@ -80,8 +93,8 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
             let eq_path = choose_index_eq_access(expr, table_name, indexes);
             let and_path = choose_index_and_access(expr, table_name, indexes);
             choose_preferred_and_path(eq_path, and_path).or_else(|| {
-                choose_index_access(left, table_name, indexes)
-                    .or_else(|| choose_index_access(right, table_name, indexes))
+                choose_index_access_raw(left, table_name, indexes)
+                    .or_else(|| choose_index_access_raw(right, table_name, indexes))
             })
         }
         Expr::BinaryOp {
@@ -91,6 +104,40 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
         _ => choose_index_eq_access(expr, table_name, indexes)
             .or_else(|| choose_index_in_access(expr, table_name, indexes))
             .or_else(|| choose_index_range_access(expr, table_name, indexes)),
+    }
+}
+
+fn estimated_table_scan_cost() -> usize {
+    100
+}
+
+fn estimated_access_path_cost(path: &AccessPath) -> usize {
+    match path {
+        AccessPath::TableScan => estimated_table_scan_cost(),
+        AccessPath::IndexEq { columns, .. } => {
+            if columns.len() > 1 {
+                10
+            } else {
+                14
+            }
+        }
+        AccessPath::IndexRange { lower, upper, .. } => match (lower.is_some(), upper.is_some()) {
+            (true, true) => 24,
+            (true, false) | (false, true) => 40,
+            (false, false) => 95,
+        },
+        AccessPath::IndexOr { branches } => {
+            6 + branches
+                .iter()
+                .map(|branch| estimated_access_path_cost(branch) + 3)
+                .sum::<usize>()
+        }
+        AccessPath::IndexAnd { branches } => {
+            8 + branches
+                .iter()
+                .map(|branch| estimated_access_path_cost(branch) + 3)
+                .sum::<usize>()
+        }
     }
 }
 
@@ -1025,5 +1072,63 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn plan_where_keeps_index_for_small_in_probe_fanout() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score IN (1, 2, 3, 4, 5);");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert!(matches!(
+            path,
+            AccessPath::IndexOr { branches } if branches.len() == 5
+        ));
+    }
+
+    #[test]
+    fn plan_where_falls_back_for_large_in_probe_fanout() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score IN (1, 2, 3, 4, 5, 6);");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn plan_where_falls_back_for_high_cost_index_intersection() {
+        let indexes = vec![
+            IndexInfo {
+                name: "idx_t_c1".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c1".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_c2".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c2".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_c3".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c3".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_c4".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c4".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_c5".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c5".to_string()],
+            },
+            IndexInfo {
+                name: "idx_t_c6".to_string(),
+                table: "t".to_string(),
+                columns: vec!["c6".to_string()],
+            },
+        ];
+        let where_expr = parse_where(
+            "SELECT * FROM t WHERE c1 = 1 AND c2 = 2 AND c3 = 3 AND c4 = 4 AND c5 = 5 AND c6 = 6;",
+        );
+        let path = plan_where(where_expr.as_ref(), "t", &indexes);
+        assert_eq!(path, AccessPath::TableScan);
     }
 }

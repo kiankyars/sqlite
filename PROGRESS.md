@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality) plus simple cost heuristics for table-scan vs index-path selection for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -47,11 +47,15 @@ Latest completions:
 - LEFT JOIN parser/execution support in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `LEFT JOIN` and `LEFT OUTER JOIN`, and join execution now preserves unmatched left rows via right-side NULL extension; see `notes/left-join-execution.md`
 - `IN` multi-probe planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now maps indexable `col IN (...)` predicates to deduplicated equality probe unions (`IndexEq`/`IndexOr`), and SELECT/UPDATE/DELETE reuse existing candidate-row union/dedup paths for index-driven execution; see `notes/in-multi-probe-planner-execution.md`
 - Multi-index `AND`-intersection planning/execution in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits `IndexAnd` for multi-term indexable conjunctions, execution now intersects branch-selected rowids before table lookup for SELECT/UPDATE/DELETE candidate reads, and composite equality indexes remain preferred when available; see `notes/multi-index-and-intersection-selection.md`
+- Planner cost heuristics for table-scan vs index-path selection in `crates/planner` (Agent 3) — planner now estimates static access-path costs and falls back to `TableScan` for high-fanout `IndexOr`/`IndexAnd` shapes while keeping small fanout index probes; see `notes/planner-cost-heuristics-selection.md`
 
 Recommended next step:
-- Add simple cost heuristics so complex predicates can choose between table scans, single-index probes, and composed index plans.
+- Add planner/execution support for multi-column index prefix/range predicates.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner cost heuristics): pass, 0 failed (29 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner cost heuristics compatibility): pass, 0 failed (82 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner cost heuristics, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-sqlite` (multi-index AND-intersection support): pass, 0 failed (100 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (multi-index AND-intersection support, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (LEFT JOIN parser/execution support): pass, 0 failed (140 tests).
@@ -175,6 +179,7 @@ Test pass rate:
 33. ~~Planner/execution support for multi-column index equality predicates~~ ✓
 34. ~~LEFT JOIN parser/execution support~~ ✓
 35. ~~Planner/execution support for multi-index AND-intersection predicates~~ ✓
+36. ~~Simple planner cost heuristics for table scan vs index path selection~~ ✓
 
 ## Completed Tasks
 
@@ -377,12 +382,16 @@ Test pass rate:
   - Added `AccessPath::IndexAnd` planning for indexable conjunctions in `crates/planner` with composite-equality preference preserved
   - Added `ralph-sqlite` candidate-row intersection logic that intersects rowids from each planned index branch before table lookup
   - Added planner + integration coverage for SELECT/UPDATE/DELETE; see `notes/multi-index-and-intersection-selection.md`
+- [x] Planner cost heuristics for table scan vs index path selection (agent 3)
+  - Added static access-path cost estimation in `crates/planner` for `IndexEq`, `IndexRange`, `IndexOr`, and `IndexAnd`
+  - Planner now rejects index paths whose estimated cost is not better than a table scan baseline
+  - Added planner coverage for small-vs-large `IN (...)` fanout and high-cost index intersection fallback; see `notes/planner-cost-heuristics-selection.md`
 
 ## Known Issues
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
-- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, and full-tuple equality predicates on multi-column secondary indexes; cost-based planning and partial-prefix/range plans for multi-column indexes are not implemented.
+- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality predicates on multi-column secondary indexes, and simple static cost heuristics for table-scan vs index-path selection; statistics-driven cost-based planning and partial-prefix/range plans for multi-column indexes are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support includes INNER JOIN, CROSS JOIN, and LEFT JOIN; RIGHT/FULL OUTER JOIN are not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support
