@@ -1,0 +1,3 @@
+created_at_unix=1770819034
+agent_id=opus
+task=Fix LIKE operator to use correct SQL pattern matching semantics (%, _, case-insensitive)
