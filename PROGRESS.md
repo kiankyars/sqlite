@@ -44,8 +44,8 @@ Recommended next step:
 
 Test pass rate:
 - `cargo test -p ralph-executor -p ralph-sqlite` (ordered text range index seeks): pass, 0 failed (56 tests).
-- `cargo test --workspace` (single-column UNIQUE index execution): pass, 0 failed (188 tests).
-- `cargo test -p ralph-sqlite` (single-column UNIQUE index execution): pass, 0 failed (48 tests).
+- `cargo test --workspace` (single-column UNIQUE index execution): pass, 0 failed (189 tests).
+- `cargo test -p ralph-sqlite` (single-column UNIQUE index execution): pass, 0 failed (49 tests).
 - `./test.sh --fast` (single-column UNIQUE index execution, AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (ordered range index seek keying): pass, 0 failed (13 tests).
 - `cargo test -p ralph-planner` (post-range-seek sanity): pass, 0 failed (13 tests).
