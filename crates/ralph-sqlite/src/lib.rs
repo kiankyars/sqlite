@@ -12,8 +12,8 @@ use ralph_executor::{
 };
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
-    DropTableStmt, Expr, InsertStmt, OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName,
-    UnaryOperator, UpdateStmt,
+    DropTableStmt, Expr, InsertStmt, JoinType, OrderByItem, SelectColumn, SelectStmt, Stmt,
+    TypeName, UnaryOperator, UpdateStmt,
 };
 use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
@@ -1268,9 +1268,10 @@ impl Database {
                 root_page: 0,
             };
 
-            // Nested-loop join: cross product with optional ON filter
+            // Nested-loop join with optional ON filter and LEFT null-extension.
             let mut new_rows = Vec::new();
             for left_row in &current_rows {
+                let mut matched = false;
                 for right_row in &right_rows {
                     let mut combined: Vec<Value> =
                         Vec::with_capacity(left_row.len() + right_row.len());
@@ -1284,6 +1285,14 @@ impl Database {
                             continue;
                         }
                     }
+                    matched = true;
+                    new_rows.push(combined);
+                }
+                if join.join_type == JoinType::Left && !matched {
+                    let mut combined =
+                        Vec::with_capacity(left_row.len() + right_meta.columns.len());
+                    combined.extend_from_slice(left_row);
+                    combined.extend((0..right_meta.columns.len()).map(|_| Value::Null));
                     new_rows.push(combined);
                 }
             }
@@ -5459,6 +5468,77 @@ mod tests {
                         vec![Value::Text("bob".into()), Value::Text("sprocket".into())],
                     ]
                 );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_left_join_preserves_unmatched_left_rows() {
+        let path = temp_db_path("left_join_unmatched");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (2, 'sprocket');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.name, o.product \
+                 FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id \
+                 ORDER BY u.id, o.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("alice".into()), Value::Text("gadget".into())],
+                        vec![Value::Text("alice".into()), Value::Text("widget".into())],
+                        vec![Value::Text("bob".into()), Value::Text("sprocket".into())],
+                        vec![Value::Text("charlie".into()), Value::Null],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_left_join_where_can_match_null_extended_rows() {
+        let path = temp_db_path("left_join_where_null_extended");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (2, 'sprocket');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.name \
+                 FROM users AS u LEFT OUTER JOIN orders AS o ON u.id = o.user_id \
+                 WHERE o.product IS NULL \
+                 ORDER BY u.id;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Text("charlie".into())]]);
             }
             _ => panic!("expected SELECT result"),
         }

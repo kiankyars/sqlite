@@ -55,6 +55,7 @@ pub struct JoinClause {
 pub enum JoinType {
     Inner,
     Cross,
+    Left,
 }
 
 #[derive(Debug, Clone, PartialEq)]

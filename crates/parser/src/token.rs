@@ -31,7 +31,7 @@ pub enum Token {
     Comma,
     Semicolon,
     Dot,
-    Pipe,        // ||  (string concat)
+    Pipe, // ||  (string concat)
 
     // End of input
     Eof,
@@ -94,6 +94,8 @@ pub enum Keyword {
     Join,
     Inner,
     Cross,
+    Left,
+    Outer,
 }
 
 impl Keyword {
@@ -154,6 +156,8 @@ impl Keyword {
             "JOIN" => Some(Keyword::Join),
             "INNER" => Some(Keyword::Inner),
             "CROSS" => Some(Keyword::Cross),
+            "LEFT" => Some(Keyword::Left),
+            "OUTER" => Some(Keyword::Outer),
             _ => None,
         }
     }
