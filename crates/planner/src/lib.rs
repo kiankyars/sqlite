@@ -374,7 +374,9 @@ fn choose_preferred_and_path(
             }
 
             if matches!(&eq_path, AccessPath::IndexPrefixRange { .. }) {
-                if estimated_access_path_cost(&eq_path) <= estimated_access_path_cost(&and_path) {
+                if estimated_access_path_cost(&eq_path, None)
+                    <= estimated_access_path_cost(&and_path, None)
+                {
                     return Some(eq_path);
                 }
                 return Some(and_path);
