@@ -37,7 +37,5 @@ index bucket.
 
 - `cargo test -p ralph-executor`: pass.
 - `cargo test -p ralph-planner`: pass.
+- `cargo test -p ralph-sqlite`: pass.
 - `./test.sh --fast` (seed: 3): pass (sample skipped build/unit sections).
-- `cargo test -p ralph-sqlite`: blocked in this workspace by pre-existing
-  parser working-tree changes (`DropIndexStmt` missing), unrelated to this
-  task.
