@@ -32,6 +32,7 @@ Latest completions:
 - DROP INDEX SQL execution in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `DROP INDEX [IF EXISTS]`, integration now executes index drops via schema removal plus `BTree::reclaim_tree` page reclamation, and query paths fall back to table scans after index removal
 
 Test pass rate:
+- `./test.sh` (full, DROP INDEX execution): pass, 5/5 passed.
 - `cargo test --workspace` (DROP INDEX execution): pass, 0 failed (156 tests).
 - `cargo test -p ralph-parser -p ralph-sqlite` (DROP INDEX execution): pass, 0 failed.
 - `./test.sh --fast` (DROP INDEX execution, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
