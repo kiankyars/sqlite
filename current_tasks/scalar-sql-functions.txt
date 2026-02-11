@@ -1,0 +1,3 @@
+created_at_unix=1770837000
+agent_id=opus
+task=Implement scalar SQL functions (LENGTH, UPPER, LOWER, TYPEOF, ABS, SUBSTR, REPLACE, TRIM, COALESCE, IFNULL, NULLIF, HEX, QUOTE, INSTR, LTRIM, RTRIM, MIN/MAX scalar)
