@@ -96,6 +96,7 @@ pub enum Keyword {
     Cross,
     Left,
     Right,
+    Full,
     Outer,
 }
 
@@ -159,6 +160,7 @@ impl Keyword {
             "CROSS" => Some(Keyword::Cross),
             "LEFT" => Some(Keyword::Left),
             "RIGHT" => Some(Keyword::Right),
+            "FULL" => Some(Keyword::Full),
             "OUTER" => Some(Keyword::Outer),
             _ => None,
         }

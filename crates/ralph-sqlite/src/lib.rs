@@ -1483,12 +1483,12 @@ impl Database {
 
             // Nested-loop join with optional ON filter and outer-join null-extension.
             let mut new_rows = Vec::new();
-            let mut matched_right = if join.join_type == JoinType::Right {
-                vec![false; right_rows.len()]
+            let mut right_matched = if matches!(join.join_type, JoinType::Right | JoinType::Full)
+            {
+                Some(vec![false; right_rows.len()])
             } else {
-                Vec::new()
+                None
             };
-            let left_col_count = synthetic_meta.columns.len() - right_meta.columns.len();
             for left_row in &current_rows {
                 let mut matched = false;
                 for (right_idx, right_row) in right_rows.iter().enumerate() {
@@ -1505,12 +1505,12 @@ impl Database {
                         }
                     }
                     matched = true;
-                    if join.join_type == JoinType::Right {
-                        matched_right[right_idx] = true;
+                    if let Some(flags) = right_matched.as_mut() {
+                        flags[right_idx] = true;
                     }
                     new_rows.push(combined);
                 }
-                if join.join_type == JoinType::Left && !matched {
+                if matches!(join.join_type, JoinType::Left | JoinType::Full) && !matched {
                     let mut combined =
                         Vec::with_capacity(left_row.len() + right_meta.columns.len());
                     combined.extend_from_slice(left_row);
@@ -1519,13 +1519,17 @@ impl Database {
                 }
             }
 
-            if join.join_type == JoinType::Right {
+            if matches!(join.join_type, JoinType::Right | JoinType::Full) {
+                let left_width = right_col_start;
+                let flags =
+                    right_matched.expect("RIGHT/FULL JOIN requires right-side match tracking");
                 for (right_idx, right_row) in right_rows.iter().enumerate() {
-                    if matched_right[right_idx] {
+                    if flags[right_idx] {
                         continue;
                     }
-                    let mut combined = Vec::with_capacity(left_col_count + right_row.len());
-                    combined.extend((0..left_col_count).map(|_| Value::Null));
+
+                    let mut combined = Vec::with_capacity(left_width + right_row.len());
+                    combined.extend((0..left_width).map(|_| Value::Null));
                     combined.extend_from_slice(right_row);
                     new_rows.push(combined);
                 }
@@ -6386,6 +6390,92 @@ mod tests {
         match result {
             ExecuteResult::Select(q) => {
                 assert_eq!(q.rows, vec![vec![Value::Text("orphan".into())]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_full_outer_join_preserves_unmatched_rows_from_both_sides() {
+        let path = temp_db_path("full_outer_join_unmatched");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (1, 'widget'), (1, 'gadget'), (4, 'orphan-order');",
+        )
+        .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.id, o.user_id, o.product \
+                 FROM users AS u FULL OUTER JOIN orders AS o ON u.id = o.user_id \
+                 ORDER BY (u.id IS NULL), u.id, o.user_id, o.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Text("gadget".into()),
+                        ],
+                        vec![
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Text("widget".into()),
+                        ],
+                        vec![Value::Integer(2), Value::Null, Value::Null],
+                        vec![Value::Integer(3), Value::Null, Value::Null],
+                        vec![
+                            Value::Null,
+                            Value::Integer(4),
+                            Value::Text("orphan-order".into()),
+                        ],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_full_outer_join_where_can_match_right_null_extended_rows() {
+        let path = temp_db_path("full_outer_join_where_null_extended_right");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (4, 'orphan-order');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT o.product \
+                 FROM users AS u FULL JOIN orders AS o ON u.id = o.user_id \
+                 WHERE u.id IS NULL \
+                 ORDER BY o.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Text("orphan-order".into())]]);
             }
             _ => panic!("expected SELECT result"),
         }

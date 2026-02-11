@@ -57,6 +57,7 @@ pub enum JoinType {
     Cross,
     Left,
     Right,
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq)]
