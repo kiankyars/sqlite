@@ -9,8 +9,10 @@
 //! - B+tree implementation for tables and indexes
 //! - WAL and transaction support
 
+pub mod btree;
 pub mod header;
 pub mod pager;
 
+pub use btree::BTree;
 pub use header::FileHeader;
 pub use pager::Pager;
