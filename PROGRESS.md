@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, core scalar SQL function execution, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality + prefix fanout metadata for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN / RIGHT JOIN / FULL OUTER JOIN execution (with index-probed nested-loop for INNER/LEFT joins on indexed equality ON conditions), WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, core scalar SQL function execution, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection with persisted planner cardinality + prefix fanout metadata for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -58,9 +58,10 @@ Latest completions:
 - LIKE operator fix in `crates/executor` + `crates/ralph-sqlite` (Agent opus) — replaced naive `String::contains` LIKE implementation with correct SQL pattern matching: `%` matches zero-or-more chars, `_` matches one char, case-insensitive ASCII matching per SQLite defaults, and NULL operand propagation; see `notes/like-operator-fix.md`
 - Planner histogram/fanout statistics for multi-column prefix/range costing in `crates/storage` + `crates/planner` + `crates/ralph-sqlite` (Agent codex) — persisted index stats now include per-prefix distinct-count vectors, stats-aware `IndexPrefixRange` costing now estimates eq-prefix fanout and range selectivity from prefix-level distributions, and write-path stats refresh now recomputes/persists prefix distinct counts; see `notes/planner-histogram-fanout-stats.md`
 - Scalar SQL function execution in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — added core scalar functions (`LENGTH`/`UPPER`/`LOWER`/`TYPEOF`/`ABS`/`COALESCE`/`IFNULL`/`NULLIF`/`SUBSTR`/`INSTR`/`REPLACE`/`TRIM`/`LTRIM`/`RTRIM`) and wired scalar-call evaluation across regular/join/grouped/aggregate expression paths; scalar wrappers over aggregate calls now evaluate correctly (for example `COALESCE(MAX(v), 0)`); see `notes/scalar-sql-functions.md`
+- Join index probe optimization in `crates/ralph-sqlite` (Agent opus) — INNER/LEFT joins now use index-probed nested-loop when the ON condition is a simple equality on an indexed right-table column; RIGHT/FULL outer joins and non-equality ON conditions fall back to full-scan nested-loop; see `notes/join-index-probe-optimization.md`
 
 Recommended next step:
-- Add index-driven JOIN probe optimization for equality `ON` predicates to reduce nested-loop full scans.
+- Extend join index probes to support AND conjunctions in ON conditions and multi-column indexes.
 
 Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-storage -p ralph-sqlite` (planner histogram/fanout stats): pass, 0 failed (191 tests).
@@ -72,6 +73,9 @@ Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-executor` (LIKE operator fix): pass, 0 failed (22 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-sqlite` (LIKE operator fix): pass, 0 failed (95 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 ./test.sh --fast` (LIKE operator fix, seed: 2): pass, 0 failed, 4 skipped (deterministic sample).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test --workspace` (join index probe optimization): pass, 0 failed (281 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (join index probe optimization): pass, 0 failed (101 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (join index probe optimization, seed: 1): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner stats selectivity/cost refinement): pass, 0 failed (38 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner stats selectivity/cost refinement, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT/FULL OUTER JOIN merged verification): pass, 0 failed (161 tests).
@@ -227,6 +231,7 @@ Test pass rate:
 43. ~~LIKE operator correctness fix~~ ✓
 44. ~~Planner histogram/fanout statistics for multi-column prefix/range cost estimation~~ ✓
 45. ~~Core scalar SQL function execution~~ ✓
+46. ~~Join index probe optimization for INNER/LEFT joins~~ ✓
 
 ## Completed Tasks
 
@@ -455,6 +460,12 @@ Test pass rate:
   - Wired `Database::open` to load persisted table/index stats, and planner paths to consume persisted stats maps instead of per-query full scans
   - Added write-path stats refresh + persistence for CREATE/INSERT/UPDATE/DELETE and stats cleanup on DROP TABLE/DROP INDEX
   - Added storage + integration coverage; see `notes/persisted-planner-statistics.md`
+- [x] Join index probe optimization for INNER/LEFT joins (agent opus)
+  - Join execution now uses index-probed nested-loop when the ON condition is a simple equality (`col = expr`) on a single-column indexed column of the right table
+  - INNER JOIN and LEFT JOIN paths probe the right-table index per left row instead of scanning all right rows
+  - RIGHT JOIN and FULL OUTER JOIN fall back to full-scan nested-loop (unmatched-right tracking requires all right rows)
+  - Non-equality and compound ON conditions fall back to full-scan nested-loop
+  - Added 9 integration tests; see `notes/join-index-probe-optimization.md`
 
 - [x] LIKE operator correctness fix (agent opus)
   - Replaced naive `String::contains` with DP-based `sql_like_match` supporting `%` (zero-or-more) and `_` (single-char) wildcards
@@ -473,7 +484,7 @@ Test pass rate:
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection with persisted row/distinct metadata; histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
-- JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. Join execution uses nested-loop cross products with no index-driven optimization.
+- JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. INNER/LEFT joins now use index-probed nested-loop when the ON condition is a simple equality on a single-column indexed right-table column; RIGHT/FULL outer joins and compound/non-equality ON conditions still use full-scan nested-loop.
 - Core scalar SQL functions are implemented, but scalar multi-argument `MIN`/`MAX` and SQLite `HEX`/`QUOTE` behaviors are not yet implemented.
 - No subquery support
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

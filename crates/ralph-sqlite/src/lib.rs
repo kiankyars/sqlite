@@ -96,6 +96,15 @@ struct JoinIndexProbePlan {
     left_probe_col_idx: usize,
 }
 
+/// Describes an index-probed join: for each left row, evaluate `left_expr` and
+/// probe the right table's index to find matching rows instead of scanning all
+/// right-table rows.
+#[derive(Debug, Clone)]
+struct JoinIndexProbe {
+    index_meta: IndexMeta,
+    left_expr: Expr,
+}
+
 pub struct Database {
     db_path: PathBuf,
     pager: Pager,
@@ -1542,6 +1551,13 @@ impl Database {
     }
 
     /// Execute a join query, producing a synthetic joined meta and joined rows.
+    ///
+    /// When the ON condition is a simple equality between a column in the right
+    /// table that has a single-column index and an expression over the left side,
+    /// this function uses an index-probed nested-loop join instead of scanning all
+    /// right-table rows for every left row.  For RIGHT/FULL outer joins the
+    /// optimisation is skipped because unmatched-right tracking requires access to
+    /// all right rows.
     fn execute_join(
         &mut self,
         from: &ralph_parser::ast::FromClause,
@@ -1569,7 +1585,6 @@ impl Database {
                 .get(&right_key)
                 .cloned()
                 .ok_or_else(|| format!("no such table '{}'", join.table))?;
-            let right_rows = self.read_all_rows(&right_meta)?;
 
             let right_alias = join.alias.as_deref().unwrap_or(&join.table);
             let right_col_start = joined_columns.len();
@@ -1588,58 +1603,47 @@ impl Database {
                 root_page: 0,
             };
 
-            // Nested-loop join with optional ON filter and outer-join null-extension.
-            let mut new_rows = Vec::new();
-            let mut right_matched = if matches!(join.join_type, JoinType::Right | JoinType::Full) {
-                Some(vec![false; right_rows.len()])
+            // Try index-probed join for INNER/LEFT (not RIGHT/FULL — those need
+            // all right rows for unmatched tracking).
+            let use_index_probe =
+                !matches!(join.join_type, JoinType::Right | JoinType::Full);
+            let probe = if use_index_probe {
+                self.analyze_join_index_probe(
+                    join.condition.as_ref(),
+                    &right_key,
+                    right_alias,
+                    &table_ranges,
+                    &joined_columns,
+                )
             } else {
                 None
             };
-            for left_row in &current_rows {
-                let mut matched = false;
-                for (right_idx, right_row) in right_rows.iter().enumerate() {
-                    let mut combined: Vec<Value> =
-                        Vec::with_capacity(left_row.len() + right_row.len());
-                    combined.extend_from_slice(left_row);
-                    combined.extend_from_slice(right_row);
 
-                    if let Some(on_expr) = &join.condition {
-                        let matches =
-                            eval_join_expr(on_expr, &synthetic_meta, &combined, &table_ranges)?;
-                        if !is_truthy(&matches) {
-                            continue;
-                        }
-                    }
-                    matched = true;
-                    if let Some(flags) = right_matched.as_mut() {
-                        flags[right_idx] = true;
-                    }
-                    new_rows.push(combined);
-                }
-                if matches!(join.join_type, JoinType::Left | JoinType::Full) && !matched {
-                    let mut combined =
-                        Vec::with_capacity(left_row.len() + right_meta.columns.len());
-                    combined.extend_from_slice(left_row);
-                    combined.extend((0..right_meta.columns.len()).map(|_| Value::Null));
-                    new_rows.push(combined);
-                }
-            }
-
-            if matches!(join.join_type, JoinType::Right | JoinType::Full) {
-                let left_width = right_col_start;
-                let flags =
-                    right_matched.expect("RIGHT/FULL JOIN requires right-side match tracking");
-                for (right_idx, right_row) in right_rows.iter().enumerate() {
-                    if flags[right_idx] {
-                        continue;
-                    }
-
-                    let mut combined = Vec::with_capacity(left_width + right_row.len());
-                    combined.extend((0..left_width).map(|_| Value::Null));
-                    combined.extend_from_slice(right_row);
-                    new_rows.push(combined);
-                }
-            }
+            let new_rows = if let Some(probe) = probe {
+                // Index-probed nested-loop join
+                self.execute_join_with_index_probe(
+                    &current_rows,
+                    &right_meta,
+                    &join.join_type,
+                    join.condition.as_ref(),
+                    &synthetic_meta,
+                    &table_ranges,
+                    &probe,
+                )?
+            } else {
+                // Fall back to full-scan nested-loop join
+                let right_rows = self.read_all_rows(&right_meta)?;
+                self.execute_join_nested_loop(
+                    &current_rows,
+                    &right_rows,
+                    &right_meta,
+                    right_col_start,
+                    &join.join_type,
+                    join.condition.as_ref(),
+                    &synthetic_meta,
+                    &table_ranges,
+                )?
+            };
             current_rows = new_rows;
         }
 
@@ -1650,6 +1654,265 @@ impl Database {
         };
 
         Ok((joined_meta, current_rows))
+    }
+
+    /// Full-scan nested-loop join (original algorithm).
+    fn execute_join_nested_loop(
+        &mut self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        right_meta: &TableMeta,
+        right_col_start: usize,
+        join_type: &JoinType,
+        on_expr: Option<&Expr>,
+        synthetic_meta: &TableMeta,
+        table_ranges: &[(String, usize, usize)],
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let mut new_rows = Vec::new();
+        let mut right_matched = if matches!(join_type, JoinType::Right | JoinType::Full) {
+            Some(vec![false; right_rows.len()])
+        } else {
+            None
+        };
+
+        for left_row in left_rows {
+            let mut matched = false;
+            for (right_idx, right_row) in right_rows.iter().enumerate() {
+                let mut combined: Vec<Value> =
+                    Vec::with_capacity(left_row.len() + right_row.len());
+                combined.extend_from_slice(left_row);
+                combined.extend_from_slice(right_row);
+
+                if let Some(on_expr) = on_expr {
+                    let matches =
+                        eval_join_expr(on_expr, synthetic_meta, &combined, table_ranges)?;
+                    if !is_truthy(&matches) {
+                        continue;
+                    }
+                }
+                matched = true;
+                if let Some(flags) = right_matched.as_mut() {
+                    flags[right_idx] = true;
+                }
+                new_rows.push(combined);
+            }
+            if matches!(join_type, JoinType::Left | JoinType::Full) && !matched {
+                let mut combined =
+                    Vec::with_capacity(left_row.len() + right_meta.columns.len());
+                combined.extend_from_slice(left_row);
+                combined.extend((0..right_meta.columns.len()).map(|_| Value::Null));
+                new_rows.push(combined);
+            }
+        }
+
+        if matches!(join_type, JoinType::Right | JoinType::Full) {
+            let left_width = right_col_start;
+            let flags =
+                right_matched.expect("RIGHT/FULL JOIN requires right-side match tracking");
+            for (right_idx, right_row) in right_rows.iter().enumerate() {
+                if flags[right_idx] {
+                    continue;
+                }
+                let mut combined = Vec::with_capacity(left_width + right_row.len());
+                combined.extend((0..left_width).map(|_| Value::Null));
+                combined.extend_from_slice(right_row);
+                new_rows.push(combined);
+            }
+        }
+        Ok(new_rows)
+    }
+
+    /// Index-probed nested-loop join.
+    ///
+    /// For each left row, evaluates the probe expression to get a value, then
+    /// uses the index on the right table to find matching rowids, decodes those
+    /// rows, and combines them.  Any residual ON condition terms are still
+    /// evaluated on the combined row.  Used for INNER/LEFT joins only.
+    fn execute_join_with_index_probe(
+        &mut self,
+        left_rows: &[Vec<Value>],
+        right_meta: &TableMeta,
+        join_type: &JoinType,
+        on_expr: Option<&Expr>,
+        synthetic_meta: &TableMeta,
+        table_ranges: &[(String, usize, usize)],
+        probe: &JoinIndexProbe,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let mut new_rows = Vec::new();
+
+        for left_row in left_rows {
+            // Evaluate the left-side expression to get the probe value
+            let probe_value = eval_join_expr(
+                &probe.left_expr,
+                synthetic_meta,
+                // We only need the left portion for evaluation; pad with Nulls
+                // for the right portion so column resolution doesn't panic.
+                &{
+                    let mut padded = left_row.clone();
+                    padded.extend(
+                        (0..right_meta.columns.len()).map(|_| Value::Null),
+                    );
+                    padded
+                },
+                table_ranges,
+            )?;
+
+            // Probe the index to get matching right-table rowids
+            let rowids = self.index_eq_rowids(&probe.index_meta, &[probe_value])?;
+
+            // Look up right-table rows by rowid
+            let right_entries =
+                self.lookup_table_entries_by_rowids(right_meta.root_page, rowids)?;
+
+            let mut matched = false;
+            for entry in &right_entries {
+                let right_row = decode_row(&entry.payload).map_err(|e| e.to_string())?;
+                let mut combined: Vec<Value> =
+                    Vec::with_capacity(left_row.len() + right_row.len());
+                combined.extend_from_slice(left_row);
+                combined.extend_from_slice(&right_row);
+
+                // Apply any residual ON condition
+                if let Some(on_expr) = on_expr {
+                    let matches =
+                        eval_join_expr(on_expr, synthetic_meta, &combined, table_ranges)?;
+                    if !is_truthy(&matches) {
+                        continue;
+                    }
+                }
+                matched = true;
+                new_rows.push(combined);
+            }
+
+            // LEFT JOIN null-extension for unmatched left rows
+            if matches!(join_type, JoinType::Left) && !matched {
+                let mut combined =
+                    Vec::with_capacity(left_row.len() + right_meta.columns.len());
+                combined.extend_from_slice(left_row);
+                combined.extend((0..right_meta.columns.len()).map(|_| Value::Null));
+                new_rows.push(combined);
+            }
+        }
+
+        Ok(new_rows)
+    }
+
+    /// Analyze a join ON condition to detect an indexable equality probe on the
+    /// right table.
+    ///
+    /// Detects patterns like `right.indexed_col = <left-expr>` (or reversed)
+    /// where the right column has a single-column index.  Returns `Some` with
+    /// the probe metadata, or `None` to fall back to a full scan.
+    fn analyze_join_index_probe(
+        &self,
+        on_expr: Option<&Expr>,
+        right_table_key: &str,
+        right_alias: &str,
+        table_ranges: &[(String, usize, usize)],
+        joined_columns: &[String],
+    ) -> Option<JoinIndexProbe> {
+        let on_expr = on_expr?;
+
+        // Only handle simple equality: `expr = expr`
+        let (left_side, right_side) = match on_expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => (left.as_ref(), right.as_ref()),
+            _ => return None,
+        };
+
+        // Try both orientations: left=right_col, right=left_expr  and vice versa
+        if let Some(probe) = self.try_index_probe_for_sides(
+            right_side,
+            left_side,
+            right_table_key,
+            right_alias,
+            table_ranges,
+            joined_columns,
+        ) {
+            return Some(probe);
+        }
+        self.try_index_probe_for_sides(
+            left_side,
+            right_side,
+            right_table_key,
+            right_alias,
+            table_ranges,
+            joined_columns,
+        )
+    }
+
+    /// Check if `candidate_right` is a column reference to a single-column
+    /// indexed column of the right table and `candidate_left` only references
+    /// columns from previous (left-side) tables.
+    fn try_index_probe_for_sides(
+        &self,
+        candidate_right: &Expr,
+        candidate_left: &Expr,
+        right_table_key: &str,
+        right_alias: &str,
+        table_ranges: &[(String, usize, usize)],
+        joined_columns: &[String],
+    ) -> Option<JoinIndexProbe> {
+        // candidate_right must be a column ref on the right table
+        let right_col_name = match candidate_right {
+            Expr::ColumnRef {
+                table: Some(qualifier),
+                column,
+            } if qualifier.eq_ignore_ascii_case(right_alias) => column,
+            Expr::ColumnRef {
+                table: None,
+                column,
+            } => {
+                // Unqualified: must be unambiguous and belong to the right table
+                let right_range = table_ranges
+                    .iter()
+                    .find(|(alias, _, _)| alias.eq_ignore_ascii_case(right_alias))?;
+                let range_cols = &joined_columns[right_range.1..right_range.2];
+                if !range_cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+                    return None;
+                }
+                // Check ambiguity: ensure no other table has this column
+                let mut count = 0usize;
+                for (_, start, end) in table_ranges {
+                    for c in &joined_columns[*start..*end] {
+                        if c.eq_ignore_ascii_case(column) {
+                            count += 1;
+                        }
+                    }
+                }
+                if count != 1 {
+                    return None; // ambiguous
+                }
+                column
+            }
+            _ => return None,
+        };
+
+        // candidate_left must only reference columns that are NOT in the right table
+        if expr_references_table(candidate_left, right_alias, table_ranges, joined_columns) {
+            return None;
+        }
+
+        // Find a single-column index on right_table_key.right_col_name
+        let right_col_lower = right_col_name.to_ascii_lowercase();
+        for (_, idx_meta) in &self.indexes {
+            if idx_meta.table_key != right_table_key {
+                continue;
+            }
+            if idx_meta.columns.len() != 1 {
+                continue;
+            }
+            if idx_meta.columns[0].eq_ignore_ascii_case(&right_col_lower) {
+                return Some(JoinIndexProbe {
+                    index_meta: idx_meta.clone(),
+                    left_expr: candidate_left.clone(),
+                });
+            }
+        }
+        None
     }
 
     /// Execute a SELECT with JOIN clauses.
@@ -3710,6 +3973,71 @@ fn is_truthy(value: &Value) -> bool {
         Value::Integer(i) => *i != 0,
         Value::Real(f) => *f != 0.0,
         Value::Text(s) => !s.is_empty(),
+    }
+}
+
+/// Returns `true` if `expr` contains any column reference that resolves to a
+/// column in the table identified by `target_alias`.
+fn expr_references_table(
+    expr: &Expr,
+    target_alias: &str,
+    table_ranges: &[(String, usize, usize)],
+    joined_columns: &[String],
+) -> bool {
+    match expr {
+        Expr::ColumnRef {
+            table: Some(qualifier),
+            ..
+        } => qualifier.eq_ignore_ascii_case(target_alias),
+        Expr::ColumnRef {
+            table: None,
+            column,
+        } => {
+            // Unqualified column — check if the only table that owns it is
+            // the target table.  If it's ambiguous or belongs to another
+            // table we conservatively return true only if the target table
+            // is one of the owners.
+            let target_range = table_ranges
+                .iter()
+                .find(|(alias, _, _)| alias.eq_ignore_ascii_case(target_alias));
+            if let Some((_, start, end)) = target_range {
+                joined_columns[*start..*end]
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(column))
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_table(left, target_alias, table_ranges, joined_columns)
+                || expr_references_table(right, target_alias, table_ranges, joined_columns)
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Paren(inner) | Expr::IsNull { expr: inner, .. } => {
+            expr_references_table(inner, target_alias, table_ranges, joined_columns)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_references_table(inner, target_alias, table_ranges, joined_columns)
+                || expr_references_table(low, target_alias, table_ranges, joined_columns)
+                || expr_references_table(high, target_alias, table_ranges, joined_columns)
+        }
+        Expr::InList { expr: inner, list, .. } => {
+            expr_references_table(inner, target_alias, table_ranges, joined_columns)
+                || list
+                    .iter()
+                    .any(|e| expr_references_table(e, target_alias, table_ranges, joined_columns))
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|a| expr_references_table(a, target_alias, table_ranges, joined_columns)),
+        Expr::IntegerLiteral(_)
+        | Expr::FloatLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Null => false,
     }
 }
 
@@ -7250,6 +7578,307 @@ mod tests {
         match result {
             ExecuteResult::Select(q) => {
                 assert_eq!(q.rows, vec![vec![Value::Text("abc".to_string())]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    // ── Join index probe optimization tests ──────────────────────────────
+
+    #[test]
+    fn inner_join_index_probe_reversed_on_condition() {
+        let path = temp_db_path("join_index_probe_reversed");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE departments (id INTEGER, dept TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE employees (dept_id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_emp_dept ON employees(dept_id);")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (1, 'eng'), (2, 'sales');")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'alice'), (1, 'bob'), (2, 'charlie');")
+            .unwrap();
+
+        // ON condition has right column on left side: employees.dept_id = departments.id
+        let result = db
+            .execute(
+                "SELECT d.dept, e.name \
+                 FROM departments AS d JOIN employees AS e ON e.dept_id = d.id \
+                 ORDER BY d.dept, e.name;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("eng".into()), Value::Text("alice".into())],
+                        vec![Value::Text("eng".into()), Value::Text("bob".into())],
+                        vec![Value::Text("sales".into()), Value::Text("charlie".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn left_join_uses_index_probe_preserves_unmatched() {
+        let path = temp_db_path("join_index_probe_left");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_orders_uid ON orders(user_id);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (2, 'sprocket');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.name, o.product \
+                 FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id \
+                 ORDER BY u.id;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("alice".into()), Value::Text("widget".into())],
+                        vec![Value::Text("bob".into()), Value::Text("sprocket".into())],
+                        vec![Value::Text("charlie".into()), Value::Null],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn right_join_falls_back_to_full_scan_with_index() {
+        let path = temp_db_path("join_index_probe_right_fallback");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_orders_uid ON orders(user_id);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice');").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'widget'), (99, 'mystery');")
+            .unwrap();
+
+        // RIGHT JOIN must still produce unmatched right rows even with an index
+        let result = db
+            .execute(
+                "SELECT u.name, o.product \
+                 FROM users AS u RIGHT JOIN orders AS o ON u.id = o.user_id \
+                 ORDER BY o.product;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Null, Value::Text("mystery".into())],
+                        vec![Value::Text("alice".into()), Value::Text("widget".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn join_index_probe_with_no_matching_rows() {
+        let path = temp_db_path("join_index_probe_no_match");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE a (id INTEGER);").unwrap();
+        db.execute("CREATE TABLE b (a_id INTEGER, val TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_b_aid ON b(a_id);").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2);").unwrap();
+        db.execute("INSERT INTO b VALUES (99, 'no-match');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT a.id, b.val FROM a JOIN b ON a.id = b.a_id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows.len(), 0);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn join_index_probe_with_duplicate_values() {
+        let path = temp_db_path("join_index_probe_duplicates");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE parents (id INTEGER);").unwrap();
+        db.execute("CREATE TABLE children (parent_id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_children_pid ON children(parent_id);")
+            .unwrap();
+        db.execute("INSERT INTO parents VALUES (1), (1), (2);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO children VALUES (1, 'a'), (1, 'b'), (2, 'c');",
+        )
+        .unwrap();
+
+        // parent_id=1 appears twice in parents, and has 2 children → 4 matches + 1 for id=2
+        let result = db
+            .execute(
+                "SELECT p.id, c.name \
+                 FROM parents AS p JOIN children AS c ON p.id = c.parent_id \
+                 ORDER BY p.id, c.name;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("a".into())],
+                        vec![Value::Integer(1), Value::Text("a".into())],
+                        vec![Value::Integer(1), Value::Text("b".into())],
+                        vec![Value::Integer(1), Value::Text("b".into())],
+                        vec![Value::Integer(2), Value::Text("c".into())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn join_index_probe_with_text_key() {
+        let path = temp_db_path("join_index_probe_text");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t1 (tag TEXT);").unwrap();
+        db.execute("CREATE TABLE t2 (tag TEXT, val INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_t2_tag ON t2(tag);").unwrap();
+        db.execute("INSERT INTO t1 VALUES ('x'), ('y');").unwrap();
+        db.execute("INSERT INTO t2 VALUES ('x', 10), ('y', 20), ('z', 30);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT t1.tag, t2.val FROM t1 JOIN t2 ON t1.tag = t2.tag ORDER BY t1.tag;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("x".into()), Value::Integer(10)],
+                        vec![Value::Text("y".into()), Value::Integer(20)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn join_without_index_falls_back_to_full_scan() {
+        let path = temp_db_path("join_no_index_fallback");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE a (id INTEGER, x TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER, y TEXT);")
+            .unwrap();
+        // No index created on b
+        db.execute("INSERT INTO a VALUES (1, 'a1'), (2, 'a2');")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (1, 'b1'), (3, 'b3');")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT a.x, b.y FROM a JOIN b ON a.id = b.id ORDER BY a.x;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("a1".into()), Value::Text("b1".into())],]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn join_index_probe_with_group_by_aggregate() {
+        let path = temp_db_path("join_index_probe_group");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE categories (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE products (cat_id INTEGER, price INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_products_cat ON products(cat_id);")
+            .unwrap();
+        db.execute("INSERT INTO categories VALUES (1, 'A'), (2, 'B');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO products VALUES (1, 10), (1, 20), (2, 30);",
+        )
+        .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT c.name, SUM(p.price) \
+                 FROM categories AS c JOIN products AS p ON c.id = p.cat_id \
+                 GROUP BY c.name \
+                 ORDER BY c.name;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("A".into()), Value::Integer(30)],
+                        vec![Value::Text("B".into()), Value::Integer(30)],
+                    ]
+                );
             }
             _ => panic!("expected SELECT result"),
         }
