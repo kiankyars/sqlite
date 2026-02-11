@@ -191,7 +191,7 @@ impl<'a> IndexEqScan<'a> {
 impl<'a> Operator for IndexEqScan<'a> {
     fn open(&mut self) -> ExecResult<()> {
         let key = index_key_for_value(&self.value)?;
-        
+
         // 1. Scan Index
         let rowids = {
             let mut index_tree = BTree::new(self.pager, self.index_root);
@@ -628,10 +628,25 @@ pub fn decode_index_payload(payload: &[u8]) -> ExecResult<Vec<IndexBucket>> {
 }
 
 pub fn index_key_for_value(value: &Value) -> ExecResult<i64> {
+    if let Some(ordered) = ordered_index_key_for_value(value) {
+        return Ok(ordered);
+    }
+
     let mut encoded = Vec::new();
     encode_value(value, &mut encoded)?;
     let hash = fnv1a64(&encoded);
     Ok(i64::from_be_bytes(hash.to_be_bytes()))
+}
+
+/// Returns an order-preserving B+tree key for values that support true range
+/// seeks. Non-orderable values return `None` and should use hash-based index
+/// probing.
+pub fn ordered_index_key_for_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Integer(i) => Some(ordered_numeric_key(*i as f64)),
+        Value::Real(f) if !f.is_nan() => Some(ordered_numeric_key(*f)),
+        _ => None,
+    }
 }
 
 pub fn encode_value(value: &Value, out: &mut Vec<u8>) -> ExecResult<()> {
@@ -668,6 +683,17 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+fn ordered_numeric_key(value: f64) -> i64 {
+    let bits = value.to_bits();
+    let sortable_u64 = if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    let sortable_i64 = sortable_u64 ^ (1u64 << 63);
+    i64::from_be_bytes(sortable_i64.to_be_bytes())
 }
 
 pub fn decode_value(buf: &[u8], offset: &mut usize) -> ExecResult<Value> {
@@ -880,5 +906,19 @@ mod tests {
         let columns = vec!["known".to_string()];
         let err = eval_expr(&col("missing"), Some((&row, columns.as_slice()))).unwrap_err();
         assert_eq!(err.to_string(), "unknown column 'missing'");
+    }
+
+    #[test]
+    fn ordered_index_key_is_monotonic_for_numeric_values() {
+        let k1 = ordered_index_key_for_value(&Value::Integer(-10)).unwrap();
+        let k2 = ordered_index_key_for_value(&Value::Real(0.5)).unwrap();
+        let k3 = ordered_index_key_for_value(&Value::Integer(42)).unwrap();
+        assert!(k1 < k2);
+        assert!(k2 < k3);
+    }
+
+    #[test]
+    fn ordered_index_key_ignores_text_values() {
+        assert!(ordered_index_key_for_value(&Value::Text("x".to_string())).is_none());
     }
 }

@@ -34,11 +34,16 @@ Latest completions:
 - SELECT `GROUP BY` / `HAVING` parser support in `crates/parser` (Agent 4) — added SELECT AST fields for grouping/filtering clauses, parser support for `GROUP BY ...` and `HAVING ...`, and integration guards in `crates/ralph-sqlite` to return explicit unsupported errors until grouped execution is implemented
 - B+tree delete leaf occupancy rebalance in `crates/storage` (Agent codex) — delete underflow now triggers on low logical leaf occupancy (not only empty pages), with sibling merge when combined pages fit and sibling redistribution plus parent separator-key updates when they do not
 - SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
+- Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable (with scan-all fallback for non-orderable bounds such as text)
 
 Recommended next step:
-- Replace hash-bucket range scans with true ordered range index seeks (planner/executor/storage index format alignment).
+- Move secondary-index keying for non-numeric values to an order-preserving encoding so range predicates can avoid full index scans for text-like bounds.
 
 Test pass rate:
+- `cargo test -p ralph-executor` (ordered range index seek keying): pass, 0 failed (13 tests).
+- `cargo test -p ralph-planner` (post-range-seek sanity): pass, 0 failed (13 tests).
+- `cargo test -p ralph-sqlite` (ordered range index seeks): pass, 0 failed (41 tests).
+- `./test.sh --fast` (ordered range index seeks, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (B+tree leaf occupancy rebalance): pass, 0 failed (53 tests).
 - `./test.sh --fast` (B+tree leaf occupancy rebalance, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-sqlite` (GROUP BY/HAVING execution semantics): pass, 0 failed (38 tests).
@@ -116,6 +121,7 @@ Test pass rate:
 22. ~~DROP INDEX SQL execution + index-tree page reclamation~~ ✓
 23. ~~SELECT `GROUP BY` / `HAVING` parser support + integration guardrails~~ ✓
 24. ~~SELECT `GROUP BY` / `HAVING` execution semantics~~ ✓
+25. ~~Ordered range index seeks for index range predicates~~ ✓
 
 ## Completed Tasks
 
@@ -265,6 +271,10 @@ Test pass rate:
   - Added grouped expression evaluation that supports aggregate and non-aggregate projection expressions per group
   - Added aggregate-query HAVING behavior for no-`GROUP BY` queries and SQLite-style non-aggregate HAVING error reporting
   - Added integration coverage for grouped aggregates, grouped dedup projection, no-`GROUP BY` HAVING, `GROUP BY` aggregate-expression rejection, and scalar no-`FROM` grouping; see `notes/group-by-having-execution.md`
+- [x] Ordered range index seeks for index range predicates (agent codex)
+  - `index_key_for_value` now emits order-preserving keys for numeric values while preserving hash-key fallback for non-orderable values
+  - `IndexRange` candidate reads now use `BTree::scan_range` for orderable bounds, with full index scan fallback otherwise
+  - Added executor and integration coverage; see `notes/ordered-range-index-seeks.md`
 
 ## Known Issues
 
@@ -272,7 +282,7 @@ Test pass rate:
 - B+tree delete occupancy rebalance is implemented for leaf pages; interior pages still compact only empty-node underflow and do not yet enforce occupancy-based redistribution/merge thresholds.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
-- Range index planning currently does full index-bucket scans because secondary index keys are hash-based; true ordered range seeks are not implemented.
+- Range index planning now uses ordered key-range scans for numeric bounds and falls back to full index-bucket scans for non-orderable bounds (for example text), because those values still use hash keys.
 - No JOIN support (single-table FROM only)
 - No subquery support
 - Multi-column and UNIQUE index execution are not supported yet.

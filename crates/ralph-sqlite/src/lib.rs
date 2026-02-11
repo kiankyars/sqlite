@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ralph_executor::{
-    self, decode_index_payload, decode_row, encode_value, index_key_for_value, Filter, IndexBucket,
-    IndexEqScan, Operator, TableScan, Value,
+    self, decode_index_payload, decode_row, encode_value, index_key_for_value,
+    ordered_index_key_for_value, Filter, IndexBucket, IndexEqScan, Operator, TableScan, Value,
 };
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
@@ -942,9 +942,19 @@ impl Database {
         upper: Option<(&Value, bool)>,
     ) -> Result<Vec<i64>, String> {
         let mut idx_tree = BTree::new(&mut self.pager, index_root);
-        let index_entries = idx_tree
-            .scan_all()
-            .map_err(|e| format!("index scan: {e}"))?;
+        let index_entries = if let Some((min_key, max_key)) = ordered_range_key_bounds(lower, upper)
+        {
+            if min_key > max_key {
+                return Ok(Vec::new());
+            }
+            idx_tree
+                .scan_range(min_key, max_key)
+                .map_err(|e| format!("index range scan: {e}"))?
+        } else {
+            idx_tree
+                .scan_all()
+                .map_err(|e| format!("index scan: {e}"))?
+        };
 
         let mut rowids = Vec::new();
         let mut seen = HashSet::new();
@@ -1095,6 +1105,21 @@ impl Database {
 
         Ok(rows)
     }
+}
+
+fn ordered_range_key_bounds(
+    lower: Option<(&Value, bool)>,
+    upper: Option<(&Value, bool)>,
+) -> Option<(i64, i64)> {
+    let min_key = match lower {
+        Some((value, _)) => ordered_index_key_for_value(value)?,
+        None => i64::MIN,
+    };
+    let max_key = match upper {
+        Some((value, _)) => ordered_index_key_for_value(value)?,
+        None => i64::MAX,
+    };
+    Some((min_key, max_key))
 }
 
 fn load_catalogs(
@@ -3281,6 +3306,53 @@ mod tests {
         }
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn select_supports_index_range_predicates_with_real_values() {
+        let path = temp_db_path("select_index_range_real");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE metrics (id INTEGER, score REAL);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_metrics_score ON metrics(score);")
+            .unwrap();
+        db.execute("INSERT INTO metrics VALUES (1, 1.0), (2, 1.5), (3, 2.5), (4, 3.0);")
+            .unwrap();
+
+        let selected = db
+            .execute("SELECT id FROM metrics WHERE score > 1.0 AND score < 3.0 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ordered_range_key_bounds_falls_back_for_text_bounds() {
+        let bounds = ordered_range_key_bounds(
+            Some((&Value::Text("a".to_string()), true)),
+            Some((&Value::Text("z".to_string()), true)),
+        );
+        assert!(bounds.is_none());
+    }
+
+    #[test]
+    fn ordered_range_key_bounds_maps_numeric_values() {
+        let bounds = ordered_range_key_bounds(
+            Some((&Value::Integer(10), true)),
+            Some((&Value::Real(20.0), false)),
+        )
+        .unwrap();
+        assert!(bounds.0 < bounds.1);
     }
 
     #[test]
