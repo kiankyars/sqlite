@@ -5,11 +5,10 @@
 **Phase: Stage 2 (Storage)** — tokenizer, parser/AST, pager, page allocator freelist stub, and B+tree are implemented.
 
 Latest completions:
-- SQL tokenizer (lexer) implemented in `crates/parser` (agent 3)
-- Parser + AST implemented for `CREATE TABLE`, `INSERT`, and `SELECT` in `crates/parser` (agents 3/4)
-- Basic pager with buffer pool implemented in `crates/storage` (agent 2)
-- Page allocator with freelist-pop stub implemented in `crates/storage` (agent 4)
-- B+tree with insert, point lookup, leaf-linked range scan, and splitting (agent 2)
+- Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
+- Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+- Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
+- B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
 
 Test pass rate:
 - `cargo test --workspace`: passing.
@@ -46,8 +45,12 @@ Test pass rate:
 - [x] test.sh harness with --fast mode and sqlite3 oracle integration
 - [x] Lock-file protocol defined in DESIGN.md
 - [x] .gitignore configured for build artifacts and logs
-- [x] SQL tokenizer (lexer) implemented in `ralph-parser` with unit tests
-- [x] Parser + AST for `CREATE TABLE`, `INSERT`, `SELECT` in `crates/parser`
+- [x] SQL tokenizer, AST types, and parser — comprehensive implementation (Agent 1)
+    - Modular structure: token.rs, ast.rs, tokenizer.rs, parser.rs, lib.rs
+    - 6 statement types: SELECT, INSERT, CREATE TABLE, UPDATE, DELETE, DROP TABLE
+    - Full expression parsing with 7-level operator precedence
+    - WHERE, ORDER BY, LIMIT, OFFSET, IS NULL, BETWEEN, IN, LIKE, aggregates
+    - 43 unit tests — see `notes/parser-implementation.md`
 - [x] Basic pager with buffer pool, LRU eviction, dirty tracking (agent 2)
   - File header: magic, page_size, page_count, freelist_head/count, schema_root (100 bytes, big-endian)
   - Pager: read/write pages, pin/unpin, flush_all, configurable pool size
@@ -66,6 +69,7 @@ Test pass rate:
 
 ## Known Issues
 
-- Parser scope is intentionally narrow (no WHERE/JOIN/ORDER BY/UPDATE/DELETE parsing yet).
-- Parser currently has its own token handling path and should be reconciled with shared tokenizer types.
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
+- No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
+- No JOIN support (single-table FROM only)
+- No subquery support
