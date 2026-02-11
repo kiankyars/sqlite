@@ -5072,6 +5072,135 @@ mod tests {
     }
 
     #[test]
+    fn select_supports_index_in_predicates() {
+        let path = temp_db_path("select_index_in");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 20), (2, 20, 30), (3, 10, 40), (4, 30, 45), (5, 20, 50);",
+        )
+        .unwrap();
+
+        let stmt =
+            match ralph_parser::parse("SELECT id FROM users WHERE score IN (10, 30, 10) ORDER BY id;")
+                .unwrap()
+            {
+                Stmt::Select(stmt) => stmt,
+                other => panic!("expected SELECT statement, got {other:?}"),
+            };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
+        assert_eq!(
+            access_path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(10)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_users_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(30)],
+                    },
+                ],
+            }
+        );
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE score IN (10, 30, 10) ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1)],
+                        vec![Value::Integer(3)],
+                        vec![Value::Integer(4)],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_index_for_in_predicate() {
+        let path = temp_db_path("update_index_in");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER, label TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 10, 'c'), (4, 30, 'd');",
+        )
+        .unwrap();
+
+        let updated = db
+            .execute("UPDATE users SET label = 'hit' WHERE score IN (10, 30, 10);")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 3 });
+
+        let selected = db
+            .execute("SELECT id, label FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("hit".to_string())],
+                        vec![Value::Integer(2), Value::Text("b".to_string())],
+                        vec![Value::Integer(3), Value::Text("hit".to_string())],
+                        vec![Value::Integer(4), Value::Text("hit".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_index_for_in_predicate() {
+        let path = temp_db_path("delete_index_in");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 10), (2, 20), (3, 10), (4, 30);")
+            .unwrap();
+
+        let deleted = db
+            .execute("DELETE FROM users WHERE score IN (10, 30, 10);")
+            .unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 3 });
+
+        let selected = db.execute("SELECT id FROM users;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn update_uses_index_for_or_predicate() {
         let path = temp_db_path("update_index_or");
         let mut db = Database::open(&path).unwrap();

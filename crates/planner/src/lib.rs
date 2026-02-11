@@ -70,6 +70,9 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
     if let Some(eq_path) = choose_index_eq_access(expr, table_name, indexes) {
         return Some(eq_path);
     }
+    if let Some(in_path) = choose_index_in_access(expr, table_name, indexes) {
+        return Some(in_path);
+    }
 
     match expr {
         Expr::Paren(inner) => choose_index_access(inner, table_name, indexes),
@@ -85,6 +88,66 @@ fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> 
         } => choose_index_or_access(expr, table_name, indexes),
         _ => choose_index_range_access(expr, table_name, indexes),
     }
+}
+
+fn choose_index_in_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> Option<AccessPath> {
+    let Expr::InList {
+        expr,
+        list,
+        negated,
+    } = expr
+    else {
+        return None;
+    };
+    if *negated || list.is_empty() {
+        return None;
+    }
+
+    let (col_table, col_name) = match expr.as_ref() {
+        Expr::ColumnRef { table, column } => (table.as_deref(), column.as_str()),
+        _ => return None,
+    };
+    if let Some(qualifier) = col_table {
+        if !qualifier.eq_ignore_ascii_case(table_name) {
+            return None;
+        }
+    }
+
+    let index = find_matching_single_column_index(table_name, col_name, indexes)?;
+    let mut values = Vec::new();
+    for item in list {
+        if expr_contains_column_ref(item) {
+            return None;
+        }
+        if !values.iter().any(|existing| existing == item) {
+            values.push(item.clone());
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+
+    if values.len() == 1 {
+        return Some(AccessPath::IndexEq {
+            index_name: index.name.clone(),
+            columns: vec![index.columns[0].clone()],
+            value_exprs: values,
+        });
+    }
+
+    let branches = values
+        .into_iter()
+        .map(|value_expr| AccessPath::IndexEq {
+            index_name: index.name.clone(),
+            columns: vec![index.columns[0].clone()],
+            value_exprs: vec![value_expr],
+        })
+        .collect();
+    Some(AccessPath::IndexOr { branches })
 }
 
 fn choose_index_eq_access(
@@ -600,6 +663,57 @@ mod tests {
     }
 
     #[test]
+    fn chooses_index_or_for_in_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score IN (42, 9, 42);");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn chooses_single_probe_index_for_single_value_in_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score IN (42);");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(
+            plan.access_path,
+            AccessPath::IndexEq {
+                index_name: "idx_t_score".to_string(),
+                columns: vec!["score".to_string()],
+                value_exprs: vec![Expr::IntegerLiteral(42)],
+            }
+        );
+    }
+
+    #[test]
+    fn falls_back_for_negated_in_predicate() {
+        let stmt = parse_select("SELECT * FROM t WHERE score NOT IN (42, 9);");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(plan.access_path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn falls_back_for_in_predicate_with_row_dependent_item() {
+        let stmt = parse_select("SELECT * FROM t WHERE score IN (age, 9);");
+        let plan = plan_select(&stmt, "t", &default_indexes());
+        assert_eq!(plan.access_path, AccessPath::TableScan);
+    }
+
+    #[test]
     fn chooses_index_or_for_mixed_or_predicate() {
         let stmt = parse_select("SELECT * FROM t WHERE score = 42 OR age > 9;");
         let plan = plan_select(&stmt, "t", &default_indexes());
@@ -727,6 +841,29 @@ mod tests {
                     AccessPath::IndexEq {
                         index_name: "idx_t_age".to_string(),
                         columns: vec!["age".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(9)],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_chooses_index_for_in_predicate() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score IN (42, 9);");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexOr {
+                branches: vec![
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        columns: vec!["score".to_string()],
+                        value_exprs: vec![Expr::IntegerLiteral(42)],
+                    },
+                    AccessPath::IndexEq {
+                        index_name: "idx_t_score".to_string(),
+                        columns: vec!["score".to_string()],
                         value_exprs: vec![Expr::IntegerLiteral(9)],
                     },
                 ],
