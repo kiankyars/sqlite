@@ -8,6 +8,7 @@ Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
 - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
 - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
+- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
 - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
 - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
 - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
@@ -26,6 +27,7 @@ Latest completions:
 - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
 
 Test pass rate:
+- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
@@ -94,6 +96,10 @@ Test pass rate:
   - `allocate_page()` now reuses freelist head pages before extending the file
   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
   - Reused pages are zeroed before return; header freelist metadata is updated and validated
+- [x] Freelist management API in pager (agent 3)
+  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
+  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
+  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
 - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
   - Insert with automatic leaf/interior node splitting
   - Point lookup via tree traversal
@@ -176,7 +182,7 @@ Test pass rate:
 
 ## Known Issues
 
-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
+- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
 - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
 - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.

@@ -216,6 +216,46 @@ impl Pager {
         Ok(page_num)
     }
 
+    /// Add an existing page to the freelist so it can be reused by future
+    /// allocations.
+    pub fn free_page(&mut self, page_num: PageNum) -> io::Result<()> {
+        if page_num == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot free header page 0",
+            ));
+        }
+        if page_num >= self.header.page_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "page {} out of range (page_count={})",
+                    page_num, self.header.page_count
+                ),
+            ));
+        }
+        if self.freelist_contains(page_num)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("page {} is already on freelist", page_num),
+            ));
+        }
+
+        let next_head = self.header.freelist_head;
+        self.ensure_loaded(page_num)?;
+        let ts = self.next_access();
+        let frame = self.pool.get_mut(&page_num).unwrap();
+        frame.data.fill(0);
+        frame.data[0..4].copy_from_slice(&next_head.to_be_bytes());
+        frame.dirty = true;
+        frame.last_access = ts;
+
+        self.header.freelist_head = page_num;
+        self.header.freelist_count = self.header.freelist_count.saturating_add(1);
+        self.header_dirty = true;
+        Ok(())
+    }
+
     /// Commit all dirty pages through WAL and then apply them to the database file.
     pub fn commit(&mut self) -> io::Result<()> {
         self.flush_all()
@@ -382,6 +422,51 @@ impl Pager {
             }
         }
         Ok(())
+    }
+
+    /// Returns true when the page is already linked on the freelist.
+    fn freelist_contains(&mut self, target: PageNum) -> io::Result<bool> {
+        let mut current = self.header.freelist_head;
+        let mut seen = 0u32;
+        while current != 0 {
+            if current >= self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "freelist page {} out of range (page_count={})",
+                        current, self.header.page_count
+                    ),
+                ));
+            }
+            if current == target {
+                return Ok(true);
+            }
+
+            self.ensure_loaded(current)?;
+            let next = {
+                let frame = self.pool.get(&current).unwrap();
+                u32::from_be_bytes(frame.data[0..4].try_into().unwrap())
+            };
+            if next != 0 && next >= self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "freelist next pointer {} out of range (page_count={})",
+                        next, self.header.page_count
+                    ),
+                ));
+            }
+
+            current = next;
+            seen = seen.saturating_add(1);
+            if seen > self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "freelist loop detected",
+                ));
+            }
+        }
+        Ok(false)
     }
 
     /// Increment and return the access counter.
@@ -668,6 +753,88 @@ mod tests {
         assert_eq!(reused, 1);
         let page = pager.read_page(reused).unwrap();
         assert!(page.iter().all(|b| *b == 0));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn free_page_adds_to_freelist_and_allocate_reuses_it() {
+        let path = temp_db_path("freelist_free_and_reuse.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let p1 = pager.allocate_page().unwrap();
+        let p2 = pager.allocate_page().unwrap();
+        let p3 = pager.allocate_page().unwrap();
+        assert_eq!((p1, p2, p3), (1, 2, 3));
+
+        pager.free_page(p2).unwrap();
+        pager.free_page(p3).unwrap();
+        assert_eq!(pager.header().freelist_head, p3);
+        assert_eq!(pager.header().freelist_count, 2);
+
+        let reused_1 = pager.allocate_page().unwrap();
+        let reused_2 = pager.allocate_page().unwrap();
+        assert_eq!((reused_1, reused_2), (p3, p2));
+        assert_eq!(pager.header().freelist_head, 0);
+        assert_eq!(pager.header().freelist_count, 0);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn free_page_rejects_invalid_and_duplicate_pages() {
+        let path = temp_db_path("freelist_free_invalid.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let p1 = pager.allocate_page().unwrap();
+        let p2 = pager.allocate_page().unwrap();
+        assert_eq!((p1, p2), (1, 2));
+
+        let err = pager.free_page(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = pager.free_page(99).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        pager.free_page(p1).unwrap();
+        pager.free_page(p2).unwrap();
+        let err = pager.free_page(p1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn free_page_persists_across_reopen() {
+        let path = temp_db_path("freelist_free_persist.db");
+        cleanup(&path);
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let p1 = pager.allocate_page().unwrap();
+            let p2 = pager.allocate_page().unwrap();
+            let p3 = pager.allocate_page().unwrap();
+            assert_eq!((p1, p2, p3), (1, 2, 3));
+
+            pager.free_page(p2).unwrap();
+            pager.free_page(p3).unwrap();
+            pager.flush_all().unwrap();
+        }
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            assert_eq!(pager.header().freelist_head, 3);
+            assert_eq!(pager.header().freelist_count, 2);
+
+            let reused_1 = pager.allocate_page().unwrap();
+            let reused_2 = pager.allocate_page().unwrap();
+            assert_eq!((reused_1, reused_2), (3, 2));
+            assert_eq!(pager.header().freelist_head, 0);
+            assert_eq!(pager.header().freelist_count, 0);
+            assert_eq!(pager.page_count(), 4);
+        }
 
         cleanup(&path);
     }
