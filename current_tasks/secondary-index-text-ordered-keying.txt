@@ -1,0 +1,3 @@
+created_at_unix=1770811461
+agent_id=codex
+task=Implement order-preserving secondary-index keying for text values and text range seeks
