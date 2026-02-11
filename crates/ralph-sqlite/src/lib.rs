@@ -14,7 +14,7 @@ use ralph_executor::{
     self, decode_index_payload, decode_row, encode_value, index_key_for_value, Filter, IndexBucket,
     IndexEqScan, Operator, TableScan, Value,
 };
-use ralph_planner::{plan_select, AccessPath, IndexInfo};
+use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
 
@@ -393,10 +393,9 @@ impl Database {
         let assignments = resolve_update_assignments(&meta, &stmt.assignments)?;
         let table_indexes = self.indexes_for_table(&table_key);
 
-        let entries = {
-            let mut tree = BTree::new(&mut self.pager, meta.root_page);
-            tree.scan_all().map_err(|e| format!("scan table: {e}"))?
-        };
+        let planner_indexes = self.planner_indexes_for_table(&table_key);
+        let access_path = plan_where(stmt.where_clause.as_ref(), &meta.name, &planner_indexes);
+        let entries = self.read_candidate_entries(&meta, &access_path)?;
         let mut rows_affected = 0usize;
 
         for entry in entries {
@@ -449,10 +448,9 @@ impl Database {
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
         let table_indexes = self.indexes_for_table(&table_key);
 
-        let entries = {
-            let mut tree = BTree::new(&mut self.pager, meta.root_page);
-            tree.scan_all().map_err(|e| format!("scan table: {e}"))?
-        };
+        let planner_indexes = self.planner_indexes_for_table(&table_key);
+        let access_path = plan_where(stmt.where_clause.as_ref(), &meta.name, &planner_indexes);
+        let entries = self.read_candidate_entries(&meta, &access_path)?;
         let mut rows_affected = 0usize;
 
         for entry in entries {
@@ -592,6 +590,75 @@ impl Database {
         let columns = select_output_columns(&stmt.columns, table_meta)?;
 
         Ok(ExecuteResult::Select(QueryResult { columns, rows }))
+    }
+
+    /// Read candidate B+tree entries using the given access path.
+    ///
+    /// When an index equality path is available, only the rowids matching the
+    /// index probe are fetched from the table B+tree (instead of a full scan).
+    /// The caller is still responsible for applying the full WHERE predicate on
+    /// the returned entries because the index may over-select (hash collisions,
+    /// AND predicates with additional terms, etc.).
+    fn read_candidate_entries(
+        &mut self,
+        meta: &TableMeta,
+        access_path: &AccessPath,
+    ) -> Result<Vec<ralph_storage::btree::Entry>, String> {
+        match access_path {
+            AccessPath::TableScan => {
+                let mut tree = BTree::new(&mut self.pager, meta.root_page);
+                tree.scan_all().map_err(|e| format!("scan table: {e}"))
+            }
+            AccessPath::IndexEq {
+                index_name,
+                value_expr,
+                ..
+            } => {
+                let idx_key = normalize_identifier(index_name);
+                let index_meta = self
+                    .indexes
+                    .get(&idx_key)
+                    .cloned()
+                    .ok_or_else(|| format!("index '{}' not found", index_name))?;
+
+                let value = eval_expr(value_expr, None)?;
+                let key = index_key_for_value(&value).map_err(|e| e.to_string())?;
+
+                let rowids = {
+                    let mut idx_tree = BTree::new(&mut self.pager, index_meta.root_page);
+                    match idx_tree
+                        .lookup(key)
+                        .map_err(|e| format!("index lookup: {e}"))?
+                    {
+                        Some(payload) => {
+                            let buckets =
+                                decode_index_payload(&payload).map_err(|e| e.to_string())?;
+                            buckets
+                                .into_iter()
+                                .filter(|b| values_equal(&b.value, &value))
+                                .flat_map(|b| b.rowids)
+                                .collect::<Vec<i64>>()
+                        }
+                        None => Vec::new(),
+                    }
+                };
+
+                let mut entries = Vec::with_capacity(rowids.len());
+                for rowid in rowids {
+                    let mut table_tree = BTree::new(&mut self.pager, meta.root_page);
+                    if let Some(payload) = table_tree
+                        .lookup(rowid)
+                        .map_err(|e| format!("table lookup: {e}"))?
+                    {
+                        entries.push(ralph_storage::btree::Entry {
+                            key: rowid,
+                            payload,
+                        });
+                    }
+                }
+                Ok(entries)
+            }
+        }
     }
 
     fn planner_indexes_for_table(&self, table_key: &str) -> Vec<IndexInfo> {
@@ -2111,6 +2178,185 @@ mod tests {
         assert_eq!(db.execute("BEGIN;").unwrap(), ExecuteResult::Begin);
         let nested_begin_err = db.execute("BEGIN;").unwrap_err();
         assert!(nested_begin_err.contains("already active"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_uses_index_for_where_predicate() {
+        let path = temp_db_path("update_index_selection");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT, score INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);",
+        )
+        .unwrap();
+
+        // UPDATE with WHERE on indexed column — planner should use IndexEq
+        let result = db
+            .execute("UPDATE users SET name = 'updated' WHERE score = 10;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, name, score FROM users ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![
+                            Value::Integer(1),
+                            Value::Text("updated".to_string()),
+                            Value::Integer(10),
+                        ],
+                        vec![
+                            Value::Integer(2),
+                            Value::Text("bob".to_string()),
+                            Value::Integer(20),
+                        ],
+                        vec![
+                            Value::Integer(3),
+                            Value::Text("updated".to_string()),
+                            Value::Integer(10),
+                        ],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Verify index is still consistent after update
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_score", &Value::Integer(10)),
+            vec![1, 3]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_score", &Value::Integer(20)),
+            vec![2]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_uses_index_for_where_predicate() {
+        let path = temp_db_path("delete_index_selection");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT, score INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_score ON users(score);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 10);",
+        )
+        .unwrap();
+
+        // DELETE with WHERE on indexed column — planner should use IndexEq
+        let result = db
+            .execute("DELETE FROM users WHERE score = 10;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Delete { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, name, score FROM users;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(2),
+                        Value::Text("bob".to_string()),
+                        Value::Integer(20),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Verify index entries were cleaned up
+        let key = index_key_for_value(&Value::Integer(10)).unwrap();
+        let mut idx_tree = BTree::new(
+            &mut db.pager,
+            db.indexes
+                .get(&normalize_identifier("idx_users_score"))
+                .unwrap()
+                .root_page,
+        );
+        assert!(idx_tree.lookup(key).unwrap().is_none());
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_score", &Value::Integer(20)),
+            vec![2]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_with_indexed_column_change_maintains_index() {
+        let path = temp_db_path("update_indexed_col_change");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, category TEXT);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_t_category ON t(category);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a');",
+        )
+        .unwrap();
+
+        // Update the indexed column value via index-driven selection
+        let result = db
+            .execute("UPDATE t SET category = 'c' WHERE category = 'a';")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db
+            .execute("SELECT id, category FROM t ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("c".to_string())],
+                        vec![Value::Integer(2), Value::Text("b".to_string())],
+                        vec![Value::Integer(3), Value::Text("c".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Verify old index entries are gone and new ones exist
+        let key_a = index_key_for_value(&Value::Text("a".to_string())).unwrap();
+        let mut idx_tree = BTree::new(
+            &mut db.pager,
+            db.indexes
+                .get(&normalize_identifier("idx_t_category"))
+                .unwrap()
+                .root_page,
+        );
+        assert!(idx_tree.lookup(key_a).unwrap().is_none());
+        drop(idx_tree);
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_t_category", &Value::Text("c".to_string())),
+            vec![1, 3]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_t_category", &Value::Text("b".to_string())),
+            vec![2]
+        );
 
         cleanup(&path);
     }

@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -23,6 +23,7 @@ Latest completions:
 - B+tree delete rebalance/merge for empty-node underflow with root compaction in `crates/storage` (Agent codex)
 - Query planner index selection in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now selects index equality access paths for simple `WHERE` predicates, SELECT execution consumes planner output for indexed rowid lookup, and UPDATE/DELETE maintain secondary index entries
 - Checkpoint + crash recovery in `crates/storage` (Agent codex) — pager now replays committed WAL frames on open, reloads recovered header state, and exposes `Pager::checkpoint()` to truncate WAL after checkpointing committed frames
+- UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
 
 Test pass rate:
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
@@ -46,6 +47,8 @@ Test pass rate:
 - `./test.sh --fast` (task #11 verification, AGENT_ID=11): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-storage` (task #16 implementation): pass, 0 failed (35 tests).
 - `cargo test --workspace` (task #16 implementation): pass, 0 failed.
+- `cargo test --workspace` (UPDATE/DELETE index selection): pass, 0 failed (131 tests).
+- `./test.sh` (full, UPDATE/DELETE index selection): 5/5 passed.
 
 ## Prioritized Task Backlog
 
@@ -165,6 +168,11 @@ Test pass rate:
   - Added startup header reload after WAL replay so in-memory header metadata reflects recovered page 0 state
   - Added `Pager::checkpoint() -> io::Result<usize>` to flush pending dirty pages, checkpoint committed WAL frames, and truncate WAL
   - Added storage tests for committed-frame recovery, uncommitted-tail ignore behavior, checkpoint WAL truncation, and recovered header reload
+- [x] UPDATE/DELETE planner-driven index selection (agent opus)
+  - Added `plan_where(where_clause, table_name, indexes) -> AccessPath` general-purpose planner API
+  - Updated `execute_update` and `execute_delete` to call planner and use `read_candidate_entries` helper for index-driven row selection
+  - Full WHERE predicate still re-applied after index probe for correctness
+  - Added 3 planner tests and 3 integration tests; see `notes/update-delete-index-selection.md`
 
 ## Known Issues
 
@@ -172,7 +180,7 @@ Test pass rate:
 - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
 - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
-- UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
+- UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.
 - Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)

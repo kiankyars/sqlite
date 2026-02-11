@@ -6,6 +6,20 @@
 
 use ralph_parser::ast::{BinaryOperator, Expr, SelectStmt};
 
+/// Plan an access path from an arbitrary WHERE clause.
+///
+/// This is the general-purpose entry point used by UPDATE, DELETE, and any
+/// statement that needs to decide between a full table scan and an index lookup.
+pub fn plan_where(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    indexes: &[IndexInfo],
+) -> AccessPath {
+    where_clause
+        .and_then(|expr| choose_index_access(expr, table_name, indexes))
+        .unwrap_or(AccessPath::TableScan)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexInfo {
     pub name: String,
@@ -211,5 +225,37 @@ mod tests {
         let stmt = parse_select("SELECT * FROM t WHERE id = 1;");
         let plan = plan_select(&stmt, "t", &default_indexes());
         assert_eq!(plan.access_path, AccessPath::TableScan);
+    }
+
+    fn parse_where(sql: &str) -> Option<Expr> {
+        let stmt = parse_select(sql);
+        stmt.where_clause
+    }
+
+    #[test]
+    fn plan_where_returns_table_scan_without_where() {
+        let path = plan_where(None, "t", &default_indexes());
+        assert_eq!(path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn plan_where_chooses_index_for_equality() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 42;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(
+            path,
+            AccessPath::IndexEq {
+                index_name: "idx_t_score".to_string(),
+                column: "score".to_string(),
+                value_expr: Expr::IntegerLiteral(42),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_where_falls_back_for_non_indexed_column() {
+        let where_expr = parse_where("SELECT * FROM t WHERE id = 1;");
+        let path = plan_where(where_expr.as_ref(), "t", &default_indexes());
+        assert_eq!(path, AccessPath::TableScan);
     }
 }
