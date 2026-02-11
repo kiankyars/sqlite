@@ -55,11 +55,16 @@ Latest completions:
 - Planner statistics-driven cost model for table-scan vs index-path selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — added `plan_where_with_stats`/`plan_select_with_stats` plus runtime table/index cardinality hints from `ralph-sqlite`, with legacy static heuristics preserved when stats are absent; see `notes/planner-statistics-cost-model.md`
 - Persisted planner statistics metadata in `crates/storage` + `crates/ralph-sqlite` (Agent 4) — schema now persists table/index planner stats entries, planner stats now load from persisted metadata instead of per-query scans, and write paths refresh/drop stats metadata on CREATE/INSERT/UPDATE/DELETE/DROP; see `notes/persisted-planner-statistics.md`
 - Planner stats selectivity/cost refinement in `crates/planner` (Agent codex) — stats-aware `AND` path preference now compares candidate costs before picking `IndexAnd` vs simpler equality paths, and stats-based `IndexOr`/`IndexAnd` row estimation now combines branch selectivities using probability unions/intersections instead of sum/min heuristics; see `notes/planner-stats-selectivity-cost-refinement.md`
+- LIKE operator fix in `crates/executor` + `crates/ralph-sqlite` (Agent opus) — replaced naive `String::contains` LIKE implementation with correct SQL pattern matching: `%` matches zero-or-more chars, `_` matches one char, case-insensitive ASCII matching per SQLite defaults, and NULL operand propagation; see `notes/like-operator-fix.md`
 
 Recommended next step:
 - Add histogram/fanout planner statistics (especially for multi-column prefix/range predicates) and feed them into cost estimation.
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test --workspace` (LIKE operator fix): pass, 0 failed (282 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-executor` (LIKE operator fix): pass, 0 failed (22 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 cargo test -p ralph-sqlite` (LIKE operator fix): pass, 0 failed (95 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target-2 ./test.sh --fast` (LIKE operator fix, seed: 2): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner stats selectivity/cost refinement): pass, 0 failed (38 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner stats selectivity/cost refinement, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-parser -p ralph-sqlite` (RIGHT/FULL OUTER JOIN merged verification): pass, 0 failed (161 tests).
@@ -212,6 +217,7 @@ Test pass rate:
 40. ~~FULL OUTER JOIN parser/execution support~~ ✓
 41. ~~Persisted planner statistics metadata~~ ✓
 42. ~~Planner stats selectivity/cost refinement~~ ✓
+43. ~~LIKE operator correctness fix~~ ✓
 
 ## Completed Tasks
 
@@ -440,6 +446,12 @@ Test pass rate:
   - Wired `Database::open` to load persisted table/index stats, and planner paths to consume persisted stats maps instead of per-query full scans
   - Added write-path stats refresh + persistence for CREATE/INSERT/UPDATE/DELETE and stats cleanup on DROP TABLE/DROP INDEX
   - Added storage + integration coverage; see `notes/persisted-planner-statistics.md`
+
+- [x] LIKE operator correctness fix (agent opus)
+  - Replaced naive `String::contains` with DP-based `sql_like_match` supporting `%` (zero-or-more) and `_` (single-char) wildcards
+  - Added case-insensitive ASCII matching per SQLite default behavior
+  - Added NULL operand propagation (LIKE with NULL returns NULL)
+  - Added 7 executor unit tests and 3 integration tests; see `notes/like-operator-fix.md`
 
 ## Known Issues
 

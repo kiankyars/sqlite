@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ralph_executor::{
     self, decode_index_payload, decode_row, encode_value, index_key_for_value,
-    ordered_index_key_for_value, Filter, IndexBucket, IndexEqScan, Operator, TableScan, Value,
+    ordered_index_key_for_value, sql_like_match, Filter, IndexBucket, IndexEqScan, Operator,
+    TableScan, Value,
 };
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
@@ -3553,9 +3554,12 @@ fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value,
         And => Ok(Value::Integer((is_truthy(lhs) && is_truthy(rhs)) as i64)),
         Or => Ok(Value::Integer((is_truthy(lhs) || is_truthy(rhs)) as i64)),
         Like => {
+            if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+                return Ok(Value::Null);
+            }
             let haystack = value_to_string(lhs);
-            let needle = value_to_string(rhs).replace('%', "");
-            Ok(Value::Integer(haystack.contains(&needle) as i64))
+            let pattern = value_to_string(rhs);
+            Ok(Value::Integer(sql_like_match(&haystack, &pattern) as i64))
         }
         Concat => Ok(Value::Text(format!(
             "{}{}",
@@ -6989,6 +6993,146 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("without GROUP BY"));
+
+        cleanup(&path);
+    }
+
+    // ── LIKE operator integration tests ──────────────────────────────
+
+    #[test]
+    fn like_filters_rows_with_pattern_matching() {
+        let path = temp_db_path("like_pattern");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE fruits (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO fruits VALUES (1, 'apple'), (2, 'apricot'), (3, 'banana'), (4, 'avocado');",
+        )
+        .unwrap();
+
+        // Prefix match
+        let result = db
+            .execute("SELECT name FROM fruits WHERE name LIKE 'ap%' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Text("apple".to_string())],
+                        vec![Value::Text("apricot".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Suffix match
+        let result = db
+            .execute("SELECT name FROM fruits WHERE name LIKE '%ana' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("banana".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Contains match
+        let result = db
+            .execute("SELECT name FROM fruits WHERE name LIKE '%ric%' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("apricot".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Underscore single-char match: 'a___e' = 5 chars matches 'apple'
+        let result = db
+            .execute("SELECT name FROM fruits WHERE name LIKE 'a___e' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("apple".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        // Case-insensitive
+        let result = db
+            .execute("SELECT name FROM fruits WHERE name LIKE 'APPLE' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("apple".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn not_like_filters_rows_inversely() {
+        let path = temp_db_path("not_like_pattern");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE items (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'abc'), (2, 'def'), (3, 'abx');")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT name FROM items WHERE name NOT LIKE 'ab%' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Text("def".to_string())]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn like_with_null_returns_no_match() {
+        let path = temp_db_path("like_null");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, val TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL), (2, 'abc');")
+            .unwrap();
+
+        // NULL LIKE pattern -> NULL (not truthy), so only 'abc' matches
+        let result = db
+            .execute("SELECT val FROM t WHERE val LIKE 'a%' ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Text("abc".to_string())]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

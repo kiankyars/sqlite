@@ -475,9 +475,12 @@ fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> ExecResult<Va
         And => Ok(Value::Integer((is_truthy(lhs) && is_truthy(rhs)) as i64)),
         Or => Ok(Value::Integer((is_truthy(lhs) || is_truthy(rhs)) as i64)),
         Like => {
+            if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+                return Ok(Value::Null);
+            }
             let haystack = value_to_string(lhs);
-            let needle = value_to_string(rhs).replace('%', "");
-            Ok(Value::Integer(haystack.contains(&needle) as i64))
+            let pattern = value_to_string(rhs);
+            Ok(Value::Integer(sql_like_match(&haystack, &pattern) as i64))
         }
         Concat => Ok(Value::Text(format!(
             "{}{}",
@@ -537,6 +540,46 @@ fn value_to_string(value: &Value) -> String {
         Value::Real(f) => f.to_string(),
         Value::Text(s) => s.clone(),
     }
+}
+
+/// SQL LIKE pattern matching (case-insensitive for ASCII, per SQLite default).
+///
+/// `%` matches any sequence of zero or more characters.
+/// `_` matches any single character.
+pub fn sql_like_match(haystack: &str, pattern: &str) -> bool {
+    let h: Vec<char> = haystack.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    like_dp(&h, &p)
+}
+
+fn like_dp(h: &[char], p: &[char]) -> bool {
+    let (hn, pn) = (h.len(), p.len());
+    // dp[j] = true means p[0..j] matches h[0..i] for the current i
+    let mut dp = vec![false; pn + 1];
+    dp[0] = true;
+    // Leading '%' chars can match empty string
+    for j in 0..pn {
+        if p[j] == '%' {
+            dp[j + 1] = dp[j];
+        } else {
+            break;
+        }
+    }
+    for i in 0..hn {
+        let mut new_dp = vec![false; pn + 1];
+        for j in 0..pn {
+            if p[j] == '%' {
+                // '%' matches zero chars (new_dp[j]) or one more char (dp[j+1])
+                new_dp[j + 1] = new_dp[j] || dp[j + 1];
+            } else if p[j] == '_' {
+                new_dp[j + 1] = dp[j];
+            } else {
+                new_dp[j + 1] = dp[j] && p[j].eq_ignore_ascii_case(&h[i]);
+            }
+        }
+        dp = new_dp;
+    }
+    dp[pn]
 }
 
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
@@ -988,5 +1031,71 @@ mod tests {
             }
             prev = Some(key);
         }
+    }
+
+    // ── LIKE pattern matching tests ──────────────────────────────────
+
+    #[test]
+    fn like_exact_match() {
+        assert!(sql_like_match("hello", "hello"));
+        assert!(!sql_like_match("hello", "world"));
+    }
+
+    #[test]
+    fn like_case_insensitive() {
+        assert!(sql_like_match("Hello", "hello"));
+        assert!(sql_like_match("hello", "HELLO"));
+        assert!(sql_like_match("HeLLo", "hEllO"));
+    }
+
+    #[test]
+    fn like_percent_wildcard() {
+        assert!(sql_like_match("hello world", "hello%"));
+        assert!(sql_like_match("hello world", "%world"));
+        assert!(sql_like_match("hello world", "%lo wo%"));
+        assert!(sql_like_match("hello world", "%"));
+        assert!(sql_like_match("", "%"));
+        assert!(!sql_like_match("hello", "hello%world"));
+    }
+
+    #[test]
+    fn like_underscore_wildcard() {
+        assert!(sql_like_match("a", "_"));
+        assert!(sql_like_match("abc", "a_c"));
+        assert!(!sql_like_match("abc", "a_"));
+        assert!(sql_like_match("abc", "___"));
+        assert!(!sql_like_match("ab", "___"));
+    }
+
+    #[test]
+    fn like_combined_wildcards() {
+        assert!(sql_like_match("apple", "a___e"));
+        assert!(sql_like_match("abcde", "a%e"));
+        assert!(sql_like_match("ae", "a%e"));
+        assert!(sql_like_match("apple pie", "a%_e"));
+        assert!(sql_like_match("apple", "%pp%"));
+    }
+
+    #[test]
+    fn like_empty_patterns() {
+        assert!(sql_like_match("", ""));
+        assert!(!sql_like_match("a", ""));
+        assert!(!sql_like_match("", "_"));
+        assert!(sql_like_match("", "%"));
+    }
+
+    #[test]
+    fn like_null_operands_return_null() {
+        let null = Value::Null;
+        let text = Value::Text("abc".to_string());
+        let pat = Value::Text("%".to_string());
+        assert_eq!(
+            eval_binary_op(&null, BinaryOperator::Like, &pat).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_binary_op(&text, BinaryOperator::Like, &null).unwrap(),
+            Value::Null
+        );
     }
 }
