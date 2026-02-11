@@ -12,6 +12,7 @@ Latest completions:
 - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
 - B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
 - End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
+- Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
@@ -33,7 +34,7 @@ Test pass rate:
 10. Volcano iterator model (Scan, Filter, Project)
 11. Expression evaluation
 12. ~~UPDATE and DELETE execution~~ ✓
-13. Secondary indexes (CREATE INDEX)
+13. ~~Secondary indexes (CREATE INDEX)~~ ✓
 14. Query planner (index selection)
 15. WAL write path and commit
 16. Checkpoint and crash recovery
@@ -85,6 +86,12 @@ Test pass rate:
   - Added `ExecuteResult::Update { rows_affected }` and `ExecuteResult::Delete { rows_affected }`
   - Reused expression evaluation for `WHERE` predicates and UPDATE assignment values
   - Added integration tests: update with WHERE, delete with WHERE, and full-table update/delete
+- [x] Secondary indexes (`CREATE INDEX`) in parser + integration layer (agent 4)
+  - Added `CREATE INDEX` / `CREATE UNIQUE INDEX` parser support with `IF NOT EXISTS`
+  - Added `Database` execution support for `CREATE INDEX` (single-column indexes)
+  - Index build backfills existing rows; `INSERT` now maintains indexes for indexed tables
+  - Added index payload encoding that handles duplicate values and hash-bucket collisions
+  - 2 new integration tests and 3 parser tests; see `notes/secondary-indexes.md`
 
 ## Known Issues
 
@@ -95,3 +102,5 @@ Test pass rate:
 - No JOIN support (single-table FROM only)
 - No subquery support
 - Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
+- Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
+- Multi-column and UNIQUE index execution are not supported yet.

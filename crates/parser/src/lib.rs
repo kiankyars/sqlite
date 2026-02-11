@@ -101,6 +101,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_index() {
+        let stmt = parse("CREATE INDEX idx_t_x ON t(x);").unwrap();
+        match stmt {
+            Stmt::CreateIndex(ci) => {
+                assert_eq!(ci.index, "idx_t_x");
+                assert_eq!(ci.table, "t");
+                assert_eq!(ci.columns, vec!["x".to_string()]);
+                assert!(!ci.unique);
+                assert!(!ci.if_not_exists);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
     fn test_roundtrip_complex() {
         // A more complex query to verify end-to-end parsing
         let stmt = parse(

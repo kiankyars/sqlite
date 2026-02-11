@@ -6,6 +6,7 @@ pub enum Stmt {
     Select(SelectStmt),
     Insert(InsertStmt),
     CreateTable(CreateTableStmt),
+    CreateIndex(CreateIndexStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     DropTable(DropTableStmt),
@@ -53,6 +54,15 @@ pub struct CreateTableStmt {
     pub if_not_exists: bool,
     pub table: String,
     pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    pub if_not_exists: bool,
+    pub unique: bool,
+    pub index: String,
+    pub table: String,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

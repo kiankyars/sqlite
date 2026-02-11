@@ -240,11 +240,22 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Stmt, String> {
         self.expect_keyword(Keyword::Create)?;
+        let unique = if self.at_keyword(Keyword::Unique) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
         match self.peek() {
             Token::Keyword(Keyword::Table) => {
+                if unique {
+                    return Err("UNIQUE is only valid with CREATE INDEX".to_string());
+                }
                 Ok(Stmt::CreateTable(self.parse_create_table()?))
             }
-            other => Err(format!("expected TABLE after CREATE, found {:?}", other)),
+            Token::Keyword(Keyword::Index) => Ok(Stmt::CreateIndex(self.parse_create_index(unique)?)),
+            other => Err(format!("expected TABLE or INDEX after CREATE, found {:?}", other)),
         }
     }
 
@@ -338,6 +349,40 @@ impl Parser {
             name,
             type_name,
             constraints,
+        })
+    }
+
+    fn parse_create_index(&mut self, unique: bool) -> Result<CreateIndexStmt, String> {
+        self.expect_keyword(Keyword::Index)?;
+
+        let if_not_exists = if self.at_keyword(Keyword::If) {
+            self.advance();
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+
+        let index = self.expect_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.expect_ident()?;
+        self.expect_token(&Token::LeftParen)?;
+
+        let mut columns = Vec::new();
+        columns.push(self.expect_ident()?);
+        while self.peek() == &Token::Comma {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+
+        self.expect_token(&Token::RightParen)?;
+        Ok(CreateIndexStmt {
+            if_not_exists,
+            unique,
+            index,
+            table,
+            columns,
         })
     }
 
@@ -904,6 +949,36 @@ mod tests {
                 assert_eq!(ct.table, "t");
             }
             _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_create_index() {
+        let stmt = parse("CREATE INDEX idx_users_name ON users(name);");
+        match stmt {
+            Stmt::CreateIndex(ci) => {
+                assert!(!ci.unique);
+                assert!(!ci.if_not_exists);
+                assert_eq!(ci.index, "idx_users_name");
+                assert_eq!(ci.table, "users");
+                assert_eq!(ci.columns, vec!["name".to_string()]);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_create_unique_index_if_not_exists() {
+        let stmt = parse("CREATE UNIQUE INDEX IF NOT EXISTS idx_t_a_b ON t(a, b);");
+        match stmt {
+            Stmt::CreateIndex(ci) => {
+                assert!(ci.unique);
+                assert!(ci.if_not_exists);
+                assert_eq!(ci.index, "idx_t_a_b");
+                assert_eq!(ci.table, "t");
+                assert_eq!(ci.columns, vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => panic!("expected CreateIndex"),
         }
     }
 

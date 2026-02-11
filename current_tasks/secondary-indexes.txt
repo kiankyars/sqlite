@@ -1,3 +1,0 @@
-created_at_unix=1770787764
-agent_id=4
-task=Secondary indexes (CREATE INDEX)

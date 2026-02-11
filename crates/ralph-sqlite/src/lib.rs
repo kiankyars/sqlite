@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ralph_parser::ast::{
-    Assignment, BinaryOperator, CreateTableStmt, DeleteStmt, Expr, InsertStmt, SelectColumn,
-    SelectStmt, Stmt, UnaryOperator, UpdateStmt,
+    Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
+    SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
 };
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
@@ -30,6 +30,7 @@ pub struct QueryResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecuteResult {
     CreateTable,
+    CreateIndex,
     Insert { rows_affected: usize },
     Update { rows_affected: usize },
     Delete { rows_affected: usize },
@@ -43,9 +44,25 @@ struct TableMeta {
     root_page: PageNum,
 }
 
+#[derive(Debug, Clone)]
+struct IndexMeta {
+    table_key: String,
+    table_name: String,
+    column: String,
+    column_idx: usize,
+    root_page: PageNum,
+}
+
+#[derive(Debug, Clone)]
+struct IndexBucket {
+    value: Value,
+    rowids: Vec<i64>,
+}
+
 pub struct Database {
     pager: Pager,
     tables: HashMap<String, TableMeta>,
+    indexes: HashMap<String, IndexMeta>,
 }
 
 impl Database {
@@ -54,6 +71,7 @@ impl Database {
         Ok(Self {
             pager,
             tables: HashMap::new(),
+            indexes: HashMap::new(),
         })
     }
 
@@ -61,6 +79,7 @@ impl Database {
         let stmt = ralph_parser::parse(sql).map_err(|e| format!("parse error: {e}"))?;
         match stmt {
             Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt),
+            Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
             Stmt::Update(update_stmt) => self.execute_update(update_stmt),
             Stmt::Delete(delete_stmt) => self.execute_delete(delete_stmt),
@@ -98,6 +117,70 @@ impl Database {
         Ok(ExecuteResult::CreateTable)
     }
 
+    fn execute_create_index(&mut self, stmt: CreateIndexStmt) -> Result<ExecuteResult, String> {
+        if stmt.unique {
+            return Err("UNIQUE indexes are not supported yet".to_string());
+        }
+        if stmt.columns.len() != 1 {
+            return Err("only single-column indexes are supported yet".to_string());
+        }
+
+        let index_key = normalize_identifier(&stmt.index);
+        if self.indexes.contains_key(&index_key) {
+            if stmt.if_not_exists {
+                return Ok(ExecuteResult::CreateIndex);
+            }
+            return Err(format!("index '{}' already exists", stmt.index));
+        }
+
+        let table_key = normalize_identifier(&stmt.table);
+        let table_meta = self
+            .tables
+            .get(&table_key)
+            .cloned()
+            .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
+
+        let column = stmt.columns[0].clone();
+        let column_idx = find_column_index(&table_meta, &column).ok_or_else(|| {
+            format!(
+                "unknown column '{}' in table '{}'",
+                column, table_meta.name
+            )
+        })?;
+
+        let root_page = BTree::create(&mut self.pager).map_err(|e| format!("create index: {e}"))?;
+        let mut table_tree = BTree::new(&mut self.pager, table_meta.root_page);
+        let table_entries = table_tree
+            .scan_all()
+            .map_err(|e| format!("scan table for index build: {e}"))?;
+        drop(table_tree);
+
+        let index_meta = IndexMeta {
+            table_key: table_key.clone(),
+            table_name: table_meta.name.clone(),
+            column,
+            column_idx,
+            root_page,
+        };
+        for entry in table_entries {
+            let row = decode_row(&entry.payload)?;
+            if row.len() != table_meta.columns.len() {
+                return Err(format!(
+                    "row column count {} does not match table schema {}",
+                    row.len(),
+                    table_meta.columns.len()
+                ));
+            }
+            self.index_insert_row(&index_meta, entry.key, &row)?;
+        }
+
+        self.indexes.insert(index_key, index_meta);
+        self.pager
+            .flush_all()
+            .map_err(|e| format!("flush create index: {e}"))?;
+        Ok(ExecuteResult::CreateIndex)
+    }
+
     fn execute_insert(&mut self, stmt: InsertStmt) -> Result<ExecuteResult, String> {
         let table_key = normalize_identifier(&stmt.table);
         let meta = self
@@ -107,7 +190,7 @@ impl Database {
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
 
         let target_columns = resolve_insert_columns(&meta, stmt.columns.as_ref())?;
-        let mut encoded_rows = Vec::with_capacity(stmt.values.len());
+        let mut evaluated_rows = Vec::with_capacity(stmt.values.len());
         for expr_row in &stmt.values {
             if expr_row.len() != target_columns.len() {
                 return Err(format!(
@@ -121,18 +204,30 @@ impl Database {
             for (expr, col_idx) in expr_row.iter().zip(target_columns.iter().copied()) {
                 row[col_idx] = eval_expr(expr, None)?;
             }
-            encoded_rows.push(encode_row(&row)?);
+            evaluated_rows.push(row);
         }
 
-        let rows_affected = encoded_rows.len();
-        let mut tree = BTree::new(&mut self.pager, meta.root_page);
-        let existing = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let rows_affected = evaluated_rows.len();
+        let mut table_tree = BTree::new(&mut self.pager, meta.root_page);
+        let existing = table_tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
         let mut next_rowid = existing.last().map(|e| e.key + 1).unwrap_or(1);
+        let mut inserted_rows = Vec::with_capacity(evaluated_rows.len());
 
-        for row in encoded_rows {
-            tree.insert(next_rowid, &row)
+        for row in evaluated_rows {
+            let encoded = encode_row(&row)?;
+            table_tree
+                .insert(next_rowid, &encoded)
                 .map_err(|e| format!("insert row: {e}"))?;
+            inserted_rows.push((next_rowid, row));
             next_rowid += 1;
+        }
+        drop(table_tree);
+
+        let table_indexes = self.indexes_for_table(&table_key);
+        for (rowid, row) in inserted_rows {
+            for index_meta in &table_indexes {
+                self.index_insert_row(index_meta, rowid, &row)?;
+            }
         }
 
         self.pager
@@ -140,6 +235,46 @@ impl Database {
             .map_err(|e| format!("flush insert: {e}"))?;
 
         Ok(ExecuteResult::Insert { rows_affected })
+    }
+
+    fn indexes_for_table(&self, table_key: &str) -> Vec<IndexMeta> {
+        self.indexes
+            .values()
+            .filter(|idx| idx.table_key == table_key)
+            .cloned()
+            .collect()
+    }
+
+    fn index_insert_row(&mut self, index_meta: &IndexMeta, rowid: i64, row: &[Value]) -> Result<(), String> {
+        let value = row.get(index_meta.column_idx).ok_or_else(|| {
+            format!(
+                "row missing indexed column '{}' for index on '{}'",
+                index_meta.column, index_meta.table_name
+            )
+        })?;
+
+        let key = index_key_for_value(value)?;
+        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
+        let mut buckets = match tree.lookup(key).map_err(|e| format!("lookup index entry: {e}"))? {
+            Some(payload) => decode_index_payload(&payload)?,
+            None => Vec::new(),
+        };
+
+        if let Some(existing) = buckets.iter_mut().find(|b| values_equal(&b.value, value)) {
+            if !existing.rowids.contains(&rowid) {
+                existing.rowids.push(rowid);
+            }
+        } else {
+            buckets.push(IndexBucket {
+                value: value.clone(),
+                rowids: vec![rowid],
+            });
+        }
+
+        let encoded = encode_index_payload(&buckets)?;
+        tree.insert(key, &encoded)
+            .map_err(|e| format!("insert index entry: {e}"))?;
+        Ok(())
     }
 
     fn execute_update(&mut self, stmt: UpdateStmt) -> Result<ExecuteResult, String> {
@@ -671,26 +806,7 @@ fn encode_row(row: &[Value]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(&col_count.to_be_bytes());
     for value in row {
-        match value {
-            Value::Null => out.push(TAG_NULL),
-            Value::Integer(i) => {
-                out.push(TAG_INTEGER);
-                out.extend_from_slice(&i.to_be_bytes());
-            }
-            Value::Real(f) => {
-                out.push(TAG_REAL);
-                out.extend_from_slice(&f.to_bits().to_be_bytes());
-            }
-            Value::Text(s) => {
-                let len: u32 = s
-                    .len()
-                    .try_into()
-                    .map_err(|_| "string value too large".to_string())?;
-                out.push(TAG_TEXT);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.extend_from_slice(s.as_bytes());
-            }
-        }
+        encode_value(value, &mut out)?;
     }
     Ok(out)
 }
@@ -704,37 +820,122 @@ fn decode_row(payload: &[u8]) -> Result<Vec<Value>, String> {
     let mut row = Vec::with_capacity(col_count);
 
     for _ in 0..col_count {
-        let tag = *payload
-            .get(offset)
-            .ok_or_else(|| "row payload truncated".to_string())?;
-        offset += 1;
-
-        match tag {
-            TAG_NULL => row.push(Value::Null),
-            TAG_INTEGER => {
-                let i = read_i64(payload, &mut offset)?;
-                row.push(Value::Integer(i));
-            }
-            TAG_REAL => {
-                let bits = read_u64(payload, &mut offset)?;
-                row.push(Value::Real(f64::from_bits(bits)));
-            }
-            TAG_TEXT => {
-                let len = read_u32(payload, &mut offset)? as usize;
-                let end = offset + len;
-                if end > payload.len() {
-                    return Err("row payload text out of bounds".to_string());
-                }
-                let s = std::str::from_utf8(&payload[offset..end])
-                    .map_err(|e| format!("invalid utf-8 text in row payload: {e}"))?;
-                row.push(Value::Text(s.to_string()));
-                offset = end;
-            }
-            other => return Err(format!("unknown value tag in row payload: {other}")),
-        }
+        row.push(decode_value(payload, &mut offset)?);
     }
 
     Ok(row)
+}
+
+fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
+    let bucket_count: u32 = buckets
+        .len()
+        .try_into()
+        .map_err(|_| "too many index buckets".to_string())?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&bucket_count.to_be_bytes());
+
+    for bucket in buckets {
+        encode_value(&bucket.value, &mut out)?;
+        let row_count: u32 = bucket
+            .rowids
+            .len()
+            .try_into()
+            .map_err(|_| "too many rowids in index bucket".to_string())?;
+        out.extend_from_slice(&row_count.to_be_bytes());
+        for rowid in &bucket.rowids {
+            out.extend_from_slice(&rowid.to_be_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+fn decode_index_payload(payload: &[u8]) -> Result<Vec<IndexBucket>, String> {
+    if payload.len() < 4 {
+        return Err("index payload too small".to_string());
+    }
+
+    let mut offset = 0usize;
+    let bucket_count = read_u32(payload, &mut offset)? as usize;
+    let mut buckets = Vec::with_capacity(bucket_count);
+    for _ in 0..bucket_count {
+        let value = decode_value(payload, &mut offset)?;
+        let row_count = read_u32(payload, &mut offset)? as usize;
+        let mut rowids = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            rowids.push(read_i64(payload, &mut offset)?);
+        }
+        buckets.push(IndexBucket { value, rowids });
+    }
+
+    Ok(buckets)
+}
+
+fn index_key_for_value(value: &Value) -> Result<i64, String> {
+    let mut encoded = Vec::new();
+    encode_value(value, &mut encoded)?;
+    let hash = fnv1a64(&encoded);
+    Ok(i64::from_be_bytes(hash.to_be_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        Value::Null => out.push(TAG_NULL),
+        Value::Integer(i) => {
+            out.push(TAG_INTEGER);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+        Value::Real(f) => {
+            out.push(TAG_REAL);
+            out.extend_from_slice(&f.to_bits().to_be_bytes());
+        }
+        Value::Text(s) => {
+            let len: u32 = s
+                .len()
+                .try_into()
+                .map_err(|_| "string value too large".to_string())?;
+            out.push(TAG_TEXT);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_value(buf: &[u8], offset: &mut usize) -> Result<Value, String> {
+    let tag = *buf
+        .get(*offset)
+        .ok_or_else(|| "payload truncated while reading value tag".to_string())?;
+    *offset += 1;
+    match tag {
+        TAG_NULL => Ok(Value::Null),
+        TAG_INTEGER => Ok(Value::Integer(read_i64(buf, offset)?)),
+        TAG_REAL => Ok(Value::Real(f64::from_bits(read_u64(buf, offset)?))),
+        TAG_TEXT => {
+            let len = read_u32(buf, offset)? as usize;
+            let end = *offset + len;
+            if end > buf.len() {
+                return Err("payload text out of bounds".to_string());
+            }
+            let s = std::str::from_utf8(&buf[*offset..end])
+                .map_err(|e| format!("invalid utf-8 text in payload: {e}"))?;
+            *offset = end;
+            Ok(Value::Text(s.to_string()))
+        }
+        other => Err(format!("unknown value tag in payload: {other}")),
+    }
 }
 
 fn read_u32(buf: &[u8], offset: &mut usize) -> Result<u32, String> {
@@ -790,6 +991,20 @@ mod tests {
 
     fn cleanup(path: &Path) {
         fs::remove_file(path).ok();
+    }
+
+    fn indexed_rowids(db: &mut Database, index_name: &str, value: &Value) -> Vec<i64> {
+        let idx_key = normalize_identifier(index_name);
+        let index_meta = db.indexes.get(&idx_key).unwrap().clone();
+        let key = index_key_for_value(value).unwrap();
+        let mut index_tree = BTree::new(&mut db.pager, index_meta.root_page);
+        let payload = index_tree.lookup(key).unwrap().unwrap();
+        let buckets = decode_index_payload(&payload).unwrap();
+        buckets
+            .into_iter()
+            .find(|bucket| values_equal(&bucket.value, value))
+            .map(|bucket| bucket.rowids)
+            .unwrap_or_default()
     }
 
     #[test]
@@ -923,6 +1138,31 @@ mod tests {
     }
 
     #[test]
+    fn create_index_backfills_existing_rows() {
+        let path = temp_db_path("index_backfill");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 7), (2, 9), (3, 7);")
+            .unwrap();
+
+        let result = db.execute("CREATE INDEX idx_t_score ON t(score);").unwrap();
+        assert_eq!(result, ExecuteResult::CreateIndex);
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_t_score", &Value::Integer(7)),
+            vec![1, 3]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_t_score", &Value::Integer(9)),
+            vec![2]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn delete_with_where_removes_matching_rows() {
         let path = temp_db_path("delete_with_where");
         let mut db = Database::open(&path).unwrap();
@@ -944,6 +1184,30 @@ mod tests {
             }
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn insert_updates_secondary_index() {
+        let path = temp_db_path("index_insert_maintenance");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 30), (2, 30), (3, 42);")
+            .unwrap();
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(30)),
+            vec![1, 2]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(42)),
+            vec![3]
+        );
 
         cleanup(&path);
     }
