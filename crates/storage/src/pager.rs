@@ -64,7 +64,7 @@ impl Pager {
             .truncate(false)
             .open(path)?;
 
-        let header = if exists {
+        let mut header = if exists {
             FileHeader::read_from(&mut file)?
         } else {
             let header = FileHeader::default();
@@ -77,8 +77,25 @@ impl Pager {
             header
         };
 
-        let page_size = header.page_size as usize;
-        let wal = Wal::open(path, header.page_size)?;
+        let mut page_size = header.page_size as usize;
+        let mut wal = Wal::open(path, header.page_size)?;
+
+        // Replay any committed WAL frames that were not checkpointed before the
+        // previous process exited. Truncate WAL afterward so startup is idempotent.
+        wal.recover(&mut file, page_size)?;
+
+        file.seek(SeekFrom::Start(0))?;
+        header = FileHeader::read_from(&mut file)?;
+        if header.page_size as usize != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "database page size {} changed during WAL recovery (expected {})",
+                    header.page_size, page_size
+                ),
+            ));
+        }
+        page_size = header.page_size as usize;
 
         Ok(Self {
             file,
@@ -202,6 +219,15 @@ impl Pager {
     /// Commit all dirty pages through WAL and then apply them to the database file.
     pub fn commit(&mut self) -> io::Result<()> {
         self.flush_all()
+    }
+
+    /// Checkpoint committed WAL frames into the database file and truncate WAL.
+    pub fn checkpoint(&mut self) -> io::Result<usize> {
+        let has_dirty_pages = self.header_dirty || self.pool.values().any(|frame| frame.dirty);
+        if has_dirty_pages {
+            self.flush_all()?;
+        }
+        self.wal.checkpoint(&mut self.file, self.page_size)
     }
 
     /// Pin a page (prevent eviction).
@@ -377,8 +403,9 @@ impl Pager {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
 
-    use crate::wal::{checksum32, wal_path_for, WAL_HEADER_SIZE, WAL_MAGIC};
+    use crate::wal::{checksum32, wal_path_for, Wal, WAL_HEADER_SIZE, WAL_MAGIC};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("ralph_pager_tests");
@@ -753,6 +780,151 @@ mod tests {
         let wal_len_after_second = fs::metadata(wal_path_for(&path)).unwrap().len();
 
         assert!(wal_len_after_second > wal_len_after_first);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_recovers_committed_wal_frames() {
+        let path = temp_db_path("wal_recover_on_open.db");
+        cleanup(&path);
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let page_num = pager.allocate_page().unwrap();
+            {
+                let page = pager.write_page(page_num).unwrap();
+                page[0..4].copy_from_slice(b"orig");
+            }
+            pager.commit().unwrap();
+        }
+
+        {
+            let mut wal = Wal::open(&path, crate::header::DEFAULT_PAGE_SIZE).unwrap();
+            let mut payload = vec![0u8; crate::header::DEFAULT_PAGE_SIZE as usize];
+            payload[0..4].copy_from_slice(b"reco");
+            wal.append_txn(100, &[(1, payload)]).unwrap();
+        }
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let page = pager.read_page(1).unwrap();
+            assert_eq!(&page[0..4], b"reco");
+        }
+
+        let wal_len = fs::metadata(wal_path_for(&path)).unwrap().len() as usize;
+        assert_eq!(wal_len, WAL_HEADER_SIZE);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_ignores_uncommitted_wal_tail() {
+        let path = temp_db_path("wal_recover_ignores_tail.db");
+        cleanup(&path);
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let page_num = pager.allocate_page().unwrap();
+            {
+                let page = pager.write_page(page_num).unwrap();
+                page[0..4].copy_from_slice(b"base");
+            }
+            pager.commit().unwrap();
+        }
+
+        let wal_path = wal_path_for(&path);
+        {
+            let mut wal_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            wal_file.seek(SeekFrom::End(0)).unwrap();
+
+            let txn_id = 101u64;
+            let page_num = 1u32;
+            let mut payload = vec![0u8; crate::header::DEFAULT_PAGE_SIZE as usize];
+            payload[0..4].copy_from_slice(b"tail");
+            let payload_len = payload.len() as u32;
+
+            let mut frame_header = Vec::with_capacity(1 + 8 + 4 + 4);
+            frame_header.push(1u8);
+            frame_header.extend_from_slice(&txn_id.to_be_bytes());
+            frame_header.extend_from_slice(&page_num.to_be_bytes());
+            frame_header.extend_from_slice(&payload_len.to_be_bytes());
+            let checksum = checksum32(&[&frame_header, &payload]);
+
+            wal_file.write_all(&frame_header).unwrap();
+            wal_file.write_all(&checksum.to_be_bytes()).unwrap();
+            wal_file.write_all(&payload).unwrap();
+            wal_file.sync_all().unwrap();
+        }
+
+        {
+            let mut pager = Pager::open(&path).unwrap();
+            let page = pager.read_page(1).unwrap();
+            assert_eq!(&page[0..4], b"base");
+        }
+
+        let wal_len = fs::metadata(wal_path_for(&path)).unwrap().len() as usize;
+        assert_eq!(wal_len, WAL_HEADER_SIZE);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_and_preserves_data() {
+        let path = temp_db_path("wal_checkpoint.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page_num = pager.allocate_page().unwrap();
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page[0..4].copy_from_slice(b"ckpt");
+        }
+        pager.commit().unwrap();
+
+        let wal_path = wal_path_for(&path);
+        let wal_len_before = fs::metadata(&wal_path).unwrap().len() as usize;
+        assert!(wal_len_before > WAL_HEADER_SIZE);
+
+        let checkpointed = pager.checkpoint().unwrap();
+        assert!(checkpointed >= 1);
+
+        let wal_len_after = fs::metadata(&wal_path).unwrap().len() as usize;
+        assert_eq!(wal_len_after, WAL_HEADER_SIZE);
+        drop(pager);
+
+        let mut reopened = Pager::open(&path).unwrap();
+        let page = reopened.read_page(page_num).unwrap();
+        assert_eq!(&page[0..4], b"ckpt");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_reloads_header_after_wal_recovery() {
+        let path = temp_db_path("wal_recover_header_page.db");
+        cleanup(&path);
+
+        let recovered_page0 = {
+            let mut pager = Pager::open(&path).unwrap();
+            pager.allocate_page().unwrap();
+            pager.commit().unwrap();
+
+            let mut recovered_page0 = pager.read_page(0).unwrap().to_vec();
+            let mut recovered_header = pager.header().clone();
+            recovered_header.schema_root = 77;
+            recovered_header.serialize(&mut recovered_page0);
+            recovered_page0
+        };
+
+        {
+            let mut wal = Wal::open(&path, crate::header::DEFAULT_PAGE_SIZE).unwrap();
+            wal.append_txn(200, &[(0, recovered_page0)]).unwrap();
+        }
+
+        let pager = Pager::open(&path).unwrap();
+        assert_eq!(pager.header().schema_root, 77);
         cleanup(&path);
     }
 }

@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented; schema persistence and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and basic query planner index selection are implemented; schema persistence remains.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -21,6 +21,7 @@ Latest completions:
 - Expression evaluation in `crates/executor` (Agent codex) — added parser-AST expression evaluation plus expression-backed `Filter`/`Project` constructors for row predicates and projection materialization
 - B+tree delete rebalance/merge for empty-node underflow with root compaction in `crates/storage` (Agent codex)
 - Query planner index selection in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now selects index equality access paths for simple `WHERE` predicates, SELECT execution consumes planner output for indexed rowid lookup, and UPDATE/DELETE maintain secondary index entries
+- Checkpoint + crash recovery in `crates/storage` (Agent codex) — pager now replays committed WAL frames on open, reloads recovered header state, and exposes `Pager::checkpoint()` to truncate WAL after checkpointing committed frames
 
 Test pass rate:
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
@@ -42,6 +43,8 @@ Test pass rate:
 - `cargo test -p ralph-executor` (task #11 implementation): pass, 0 failed (11 tests).
 - `cargo test --workspace` (task #11 implementation): pass, 0 failed.
 - `./test.sh --fast` (task #11 verification, AGENT_ID=11): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-storage` (task #16 implementation): pass, 0 failed (35 tests).
+- `cargo test --workspace` (task #16 implementation): pass, 0 failed.
 
 ## Prioritized Task Backlog
 
@@ -60,7 +63,7 @@ Test pass rate:
 13. ~~Secondary indexes (CREATE INDEX)~~ ✓
 14. ~~Query planner (index selection)~~ ✓
 15. ~~WAL write path and commit~~ ✓
-16. Checkpoint and crash recovery
+16. ~~Checkpoint and crash recovery~~ ✓
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
 18. ~~B+tree split/merge~~ ✓
 19. ~~ORDER BY, LIMIT, aggregates~~ ✓
@@ -149,11 +152,15 @@ Test pass rate:
   - Added `eval_expr(&Expr, row_ctx)` support for literals, column refs, unary/binary ops, `IS NULL`, `BETWEEN`, and `IN (...)`
   - Added `Filter::from_expr(...)` and `Project::from_exprs(...)` helpers to evaluate parser AST expressions in execution pipelines
   - Added executor tests for arithmetic/boolean evaluation, row-context column resolution, expression-backed filter/project, and unknown-column errors
+- [x] Checkpoint + crash recovery in `crates/storage` (agent codex)
+  - Added WAL replay during `Pager::open*()` so committed WAL frames are recovered into the DB file before serving reads
+  - Added startup header reload after WAL replay so in-memory header metadata reflects recovered page 0 state
+  - Added `Pager::checkpoint() -> io::Result<usize>` to flush pending dirty pages, checkpoint committed WAL frames, and truncate WAL
+  - Added storage tests for committed-frame recovery, uncommitted-tail ignore behavior, checkpoint WAL truncation, and recovered header reload
 
 ## Known Issues
 
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
-- WAL replay and checkpoint are not implemented yet (deferred to task #16).
 - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
 - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
