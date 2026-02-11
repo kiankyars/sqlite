@@ -2,13 +2,14 @@
 
 ## Current Status
 
-**Phase: Stage 2 (Storage)** — tokenizer, parser/AST, pager, page allocator freelist stub, and B+tree are implemented.
+**Phase: Stage 2 (Storage + basic SQL execution)** — tokenizer/parser, pager, B+tree, and basic end-to-end CREATE/INSERT/SELECT execution are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
 - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
 - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
 - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+- End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
 
 Test pass rate:
 - `cargo test --workspace`: passing.
@@ -25,7 +26,7 @@ Test pass rate:
 6. ~~B+tree insert and point lookup~~ ✓
 7. ~~B+tree leaf-linked range scan~~ ✓
 8. Schema table storage
-9. End-to-end: CREATE TABLE + INSERT + SELECT
+9. ~~End-to-end: CREATE TABLE + INSERT + SELECT~~ ✓
 10. Volcano iterator model (Scan, Filter, Project)
 11. Expression evaluation
 12. UPDATE and DELETE execution
@@ -66,6 +67,12 @@ Test pass rate:
   - Update (delete + re-insert) for existing keys
   - Tested with up to 200 entries (multi-level splits), reverse-order inserts, persistence after flush
   - 10 B+tree unit tests
+- [x] End-to-end SQL execution path for `CREATE TABLE`, `INSERT`, and `SELECT` in `crates/ralph-sqlite` (agent 4)
+  - Added `Database` API with SQL parsing + statement dispatch
+  - Rows are encoded into B+tree payloads with typed value tags (`NULL`, `INTEGER`, `REAL`, `TEXT`)
+  - Supports `SELECT *`, projected expressions, simple `WHERE`, and `LIMIT/OFFSET` (no `ORDER BY` yet)
+  - 3 new integration-focused unit tests in `crates/ralph-sqlite/src/lib.rs`
+  - See `notes/end-to-end-create-insert-select.md` for implementation details and limitations
 
 ## Known Issues
 
@@ -73,3 +80,4 @@ Test pass rate:
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
+- Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
