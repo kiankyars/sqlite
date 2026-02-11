@@ -162,4 +162,17 @@ mod tests {
             _ => panic!("expected Select"),
         }
     }
+
+    #[test]
+    fn test_parse_group_by_having() {
+        let stmt =
+            parse("SELECT score, COUNT(*) FROM users GROUP BY score HAVING COUNT(*) > 1;").unwrap();
+        match stmt {
+            Stmt::Select(s) => {
+                assert_eq!(s.group_by.len(), 1);
+                assert!(s.having.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, SELECT `ORDER BY`/`LIMIT`/aggregates (parser now includes `GROUP BY`/`HAVING` clauses), WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (equality + simple range) for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -31,8 +31,14 @@ Latest completions:
 - DROP TABLE execution + object-tree reclamation in `crates/ralph-sqlite` + `crates/storage` (Agent codex) — `DROP TABLE` now removes schema entries and dependent index metadata, then reclaims table/index B+tree pages through a new `BTree::reclaim_tree` helper so pages return to the freelist
 - DROP INDEX SQL execution in `crates/parser` + `crates/ralph-sqlite` (Agent codex) — parser now supports `DROP INDEX [IF EXISTS]`, integration now executes index drops via schema removal plus `BTree::reclaim_tree` page reclamation, and query paths fall back to table scans after index removal
 - Range predicate index selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — planner now emits `IndexRange` access paths for indexed `<`/`<=`/`>`/`>=`/`BETWEEN` predicates (including reversed comparisons), and SELECT/UPDATE candidate reads consume planner range paths with residual WHERE filtering
+- SELECT `GROUP BY` / `HAVING` parser support in `crates/parser` (Agent 4) — added SELECT AST fields for grouping/filtering clauses, parser support for `GROUP BY ...` and `HAVING ...`, and integration guards in `crates/ralph-sqlite` to return explicit unsupported errors until grouped execution is implemented
+
+Recommended next step:
+- Implement grouped SELECT execution semantics (`GROUP BY`/`HAVING`) in `crates/ralph-sqlite` and replace hash-bucket range scans with true ordered range index seeks.
 
 Test pass rate:
+- `cargo test -p ralph-parser -p ralph-planner -p ralph-sqlite` (GROUP BY/HAVING parser support): pass, 0 failed.
+- `./test.sh --fast` (GROUP BY/HAVING parser support, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh` (full, DROP INDEX execution): pass, 5/5 passed.
 - `cargo test --workspace` (DROP INDEX execution): pass, 0 failed (156 tests).
 - `cargo test -p ralph-parser -p ralph-sqlite` (DROP INDEX execution): pass, 0 failed.
@@ -101,6 +107,7 @@ Test pass rate:
 20. ~~Transactional dirty-page eviction isolation~~ ✓
 21. ~~DROP TABLE execution + schema/index page reclamation~~ ✓
 22. ~~DROP INDEX SQL execution + index-tree page reclamation~~ ✓
+23. ~~SELECT `GROUP BY` / `HAVING` parser support + integration guardrails~~ ✓
 
 ## Completed Tasks
 
@@ -236,6 +243,11 @@ Test pass rate:
   - Added `ExecuteResult::DropIndex` and integration execution path that removes schema metadata + in-memory catalog entries
   - Reuses `BTree::reclaim_tree` to reclaim dropped index pages to the freelist
   - Added parser + integration coverage; see `notes/drop-index-sql-execution.md`
+- [x] SELECT `GROUP BY` / `HAVING` parser support + integration guardrails (agent 4)
+  - Added `group_by` and `having` fields to `SelectStmt`
+  - Added parser support for `GROUP BY` expression lists and optional `HAVING` expressions
+  - Added `ralph-sqlite` guardrails that return explicit errors for grouped queries until grouped execution semantics are implemented
+  - Added parser/planner/integration tests; see `notes/group-by-having-parser.md`
 
 ## Known Issues
 
@@ -244,8 +256,7 @@ Test pass rate:
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
 - Range index planning currently does full index-bucket scans because secondary index keys are hash-based; true ordered range seeks are not implemented.
-- No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
 - Multi-column and UNIQUE index execution are not supported yet.
-- Aggregate queries do not support `GROUP BY`/`HAVING`; column references outside aggregate functions are rejected in aggregate SELECTs.
+- Aggregate queries do not support `GROUP BY`/`HAVING` execution yet; grouped SELECTs currently return explicit unsupported errors, and column references outside aggregate functions are still rejected in aggregate SELECTs.

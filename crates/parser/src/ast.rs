@@ -21,6 +21,8 @@ pub struct SelectStmt {
     pub columns: Vec<SelectColumn>,
     pub from: Option<FromClause>,
     pub where_clause: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,

@@ -329,6 +329,8 @@ mod tests {
                 alias: None,
             }),
             where_clause: None,
+            group_by: Vec::new(),
+            having: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,

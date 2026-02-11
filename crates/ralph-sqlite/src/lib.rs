@@ -599,6 +599,13 @@ impl Database {
     }
 
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        if !stmt.group_by.is_empty() {
+            return Err("GROUP BY is not supported yet".to_string());
+        }
+        if stmt.having.is_some() {
+            return Err("HAVING is not supported yet".to_string());
+        }
+
         let aggregate_select = select_uses_aggregates(&stmt);
         if let Some(where_expr) = stmt.where_clause.as_ref() {
             if expr_contains_aggregate(where_expr) {
@@ -2186,6 +2193,40 @@ mod tests {
 
         let err = db.execute("SELECT COUNT(*) + 1, id FROM t;").unwrap_err();
         assert!(err.contains("without GROUP BY"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_group_by_returns_not_supported_error() {
+        let path = temp_db_path("group_by_not_supported");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20);")
+            .unwrap();
+
+        let err = db
+            .execute("SELECT score, COUNT(*) FROM t GROUP BY score;")
+            .unwrap_err();
+        assert!(err.contains("GROUP BY is not supported yet"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_having_returns_not_supported_error() {
+        let path = temp_db_path("having_not_supported");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+
+        let err = db
+            .execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;")
+            .unwrap_err();
+        assert!(err.contains("HAVING is not supported yet"));
 
         cleanup(&path);
     }

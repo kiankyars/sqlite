@@ -92,6 +92,21 @@ impl Parser {
             None
         };
 
+        let group_by = if self.at_keyword(Keyword::Group) {
+            self.advance();
+            self.expect_keyword(Keyword::By)?;
+            self.parse_group_by_list()?
+        } else {
+            Vec::new()
+        };
+
+        let having = if self.at_keyword(Keyword::Having) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let order_by = if self.at_keyword(Keyword::Order) {
             self.advance();
             self.expect_keyword(Keyword::By)?;
@@ -118,6 +133,8 @@ impl Parser {
             columns,
             from,
             where_clause,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
@@ -168,6 +185,16 @@ impl Parser {
         while self.peek() == &Token::Comma {
             self.advance();
             items.push(self.parse_order_by_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_group_by_list(&mut self) -> Result<Vec<Expr>, String> {
+        let mut items = Vec::new();
+        items.push(self.parse_expr()?);
+        while self.peek() == &Token::Comma {
+            self.advance();
+            items.push(self.parse_expr()?);
         }
         Ok(items)
     }
@@ -1191,6 +1218,53 @@ mod tests {
                 assert_eq!(s.order_by.len(), 1);
                 assert!(s.order_by[0].descending);
                 assert_eq!(s.limit, Some(Expr::IntegerLiteral(10)));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_select_group_by() {
+        let stmt = parse("SELECT score, COUNT(*) FROM t GROUP BY score;");
+        match stmt {
+            Stmt::Select(s) => {
+                assert_eq!(s.group_by.len(), 1);
+                assert!(s.having.is_none());
+                assert!(matches!(
+                    s.group_by[0],
+                    Expr::ColumnRef {
+                        table: None,
+                        ref column
+                    } if column == "score"
+                ));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_select_group_by_having_order_by() {
+        let stmt = parse(
+            "SELECT score, COUNT(*) FROM t GROUP BY score HAVING COUNT(*) > 1 ORDER BY score ASC;",
+        );
+        match stmt {
+            Stmt::Select(s) => {
+                assert_eq!(s.group_by.len(), 1);
+                assert!(s.having.is_some());
+                assert_eq!(s.order_by.len(), 1);
+                assert!(!s.order_by[0].descending);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_select_having_without_group_by() {
+        let stmt = parse("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0;");
+        match stmt {
+            Stmt::Select(s) => {
+                assert!(s.group_by.is_empty());
+                assert!(s.having.is_some());
             }
             _ => panic!("expected Select"),
         }
