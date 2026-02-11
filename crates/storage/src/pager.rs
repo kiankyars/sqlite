@@ -9,6 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::header::FileHeader;
+use crate::wal::Wal;
 
 /// Default number of pages in the buffer pool.
 const DEFAULT_POOL_SIZE: usize = 256;
@@ -31,7 +32,9 @@ struct Frame {
 /// The pager manages page I/O between disk and a fixed-size buffer pool.
 pub struct Pager {
     file: File,
+    wal: Wal,
     header: FileHeader,
+    header_dirty: bool,
     page_size: usize,
     /// Buffer pool: page_num -> frame.
     pool: HashMap<PageNum, Frame>,
@@ -39,6 +42,8 @@ pub struct Pager {
     max_frames: usize,
     /// Monotonically increasing access counter for LRU.
     access_counter: u64,
+    /// Monotonically increasing transaction ID for WAL commits.
+    next_txn_id: u64,
 }
 
 impl Pager {
@@ -73,14 +78,18 @@ impl Pager {
         };
 
         let page_size = header.page_size as usize;
+        let wal = Wal::open(path, header.page_size)?;
 
         Ok(Self {
             file,
+            wal,
             header,
+            header_dirty: false,
             page_size,
             pool: HashMap::new(),
             max_frames,
             access_counter: 0,
+            next_txn_id: 1,
         })
     }
 
@@ -91,6 +100,7 @@ impl Pager {
 
     /// Returns a mutable reference to the file header.
     pub fn header_mut(&mut self) -> &mut FileHeader {
+        self.header_dirty = true;
         &mut self.header
     }
 
@@ -106,6 +116,9 @@ impl Pager {
 
     /// Read a page into the buffer pool and return a reference to its data.
     pub fn read_page(&mut self, page_num: PageNum) -> io::Result<&[u8]> {
+        if page_num == 0 && self.header_dirty {
+            self.stage_header_page()?;
+        }
         self.ensure_loaded(page_num)?;
         self.touch(page_num);
         Ok(&self.pool.get(&page_num).unwrap().data)
@@ -113,6 +126,9 @@ impl Pager {
 
     /// Get a mutable reference to a page's data. Marks the page as dirty.
     pub fn write_page(&mut self, page_num: PageNum) -> io::Result<&mut [u8]> {
+        if page_num == 0 && self.header_dirty {
+            self.stage_header_page()?;
+        }
         self.ensure_loaded(page_num)?;
         self.touch(page_num);
         let frame = self.pool.get_mut(&page_num).unwrap();
@@ -178,10 +194,14 @@ impl Pager {
             page_num
         };
 
-        // Update the header on disk.
-        self.flush_header()?;
+        self.header_dirty = true;
 
         Ok(page_num)
+    }
+
+    /// Commit all dirty pages through WAL and then apply them to the database file.
+    pub fn commit(&mut self) -> io::Result<()> {
+        self.flush_all()
     }
 
     /// Pin a page (prevent eviction).
@@ -200,19 +220,50 @@ impl Pager {
 
     /// Flush all dirty pages to disk.
     pub fn flush_all(&mut self) -> io::Result<()> {
-        let dirty_pages: Vec<PageNum> = self
+        if self.header_dirty {
+            self.stage_header_page()?;
+        }
+
+        let mut dirty_pages: Vec<PageNum> = self
             .pool
             .iter()
             .filter(|(_, f)| f.dirty)
             .map(|(&pn, _)| pn)
             .collect();
+        dirty_pages.sort_unstable();
 
-        for page_num in dirty_pages {
-            self.flush_page(page_num)?;
+        if dirty_pages.is_empty() {
+            self.file.sync_all()?;
+            return Ok(());
         }
 
-        self.flush_header()?;
+        let mut wal_pages = Vec::with_capacity(dirty_pages.len());
+        for page_num in &dirty_pages {
+            let data = self
+                .pool
+                .get(page_num)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "page not in buffer pool"))?
+                .data
+                .clone();
+            wal_pages.push((*page_num, data));
+        }
+
+        let txn_id = self.next_txn_id;
+        self.next_txn_id += 1;
+        self.wal.append_txn(txn_id, &wal_pages)?;
+
+        for (page_num, data) in wal_pages {
+            let offset = page_num as u64 * self.page_size as u64;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(&data)?;
+
+            if let Some(frame) = self.pool.get_mut(&page_num) {
+                frame.dirty = false;
+            }
+        }
+
         self.file.sync_all()?;
+        self.header_dirty = false;
         Ok(())
     }
 
@@ -230,22 +281,17 @@ impl Pager {
         Ok(())
     }
 
-    /// Write the file header to page 0.
-    fn flush_header(&mut self) -> io::Result<()> {
-        // If page 0 is in the pool, update it there.
-        if let Some(frame) = self.pool.get_mut(&0) {
-            self.header.serialize(&mut frame.data);
-            frame.dirty = true;
-            // Flush page 0.
-            let offset = 0u64;
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(&frame.data)?;
-            frame.dirty = false;
-        } else {
-            // Write header directly to disk.
-            self.file.seek(SeekFrom::Start(0))?;
-            self.header.write_to(&mut self.file)?;
-        }
+    /// Stage the in-memory header into page 0 and mark the page dirty.
+    fn stage_header_page(&mut self) -> io::Result<()> {
+        self.ensure_loaded(0)?;
+        let ts = self.next_access();
+        let frame = self
+            .pool
+            .get_mut(&0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "header page not in pool"))?;
+        self.header.serialize(&mut frame.data);
+        frame.dirty = true;
+        frame.last_access = ts;
         Ok(())
     }
 
@@ -332,6 +378,8 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use crate::wal::{checksum32, wal_path_for, WAL_HEADER_SIZE, WAL_MAGIC};
+
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("ralph_pager_tests");
         fs::create_dir_all(&dir).ok();
@@ -340,6 +388,7 @@ mod tests {
 
     fn cleanup(path: &std::path::Path) {
         fs::remove_file(path).ok();
+        fs::remove_file(wal_path_for(path)).ok();
     }
 
     #[test]
@@ -593,6 +642,117 @@ mod tests {
         let page = pager.read_page(reused).unwrap();
         assert!(page.iter().all(|b| *b == 0));
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn flush_writes_wal_page_frames_and_commit_record() {
+        let path = temp_db_path("wal_commit_record.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page_num = pager.allocate_page().unwrap();
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page[0..4].copy_from_slice(b"wal!");
+        }
+        pager.commit().unwrap();
+
+        let wal_bytes = fs::read(wal_path_for(&path)).unwrap();
+        assert!(wal_bytes.len() > WAL_HEADER_SIZE);
+        assert_eq!(&wal_bytes[0..8], WAL_MAGIC);
+
+        let mut offset = WAL_HEADER_SIZE;
+        let mut page_frames = 0usize;
+        let mut txn_id: Option<u64> = None;
+        loop {
+            let frame_type = wal_bytes[offset];
+            offset += 1;
+
+            match frame_type {
+                1 => {
+                    let frame_txn =
+                        u64::from_be_bytes(wal_bytes[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    let page_num =
+                        u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+                    offset += 4;
+                    let payload_len =
+                        u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+                    offset += 4;
+                    let checksum =
+                        u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+                    offset += 4;
+                    let payload_end = offset + payload_len as usize;
+                    let payload = &wal_bytes[offset..payload_end];
+                    offset = payload_end;
+
+                    let mut header = Vec::with_capacity(1 + 8 + 4 + 4);
+                    header.push(frame_type);
+                    header.extend_from_slice(&frame_txn.to_be_bytes());
+                    header.extend_from_slice(&page_num.to_be_bytes());
+                    header.extend_from_slice(&payload_len.to_be_bytes());
+                    assert_eq!(checksum, checksum32(&[&header, payload]));
+
+                    if let Some(existing_txn) = txn_id {
+                        assert_eq!(frame_txn, existing_txn);
+                    } else {
+                        txn_id = Some(frame_txn);
+                    }
+                    page_frames += 1;
+                }
+                2 => {
+                    let frame_txn =
+                        u64::from_be_bytes(wal_bytes[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    let frame_count =
+                        u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+                    offset += 4;
+                    let checksum =
+                        u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+                    offset += 4;
+
+                    let mut header = Vec::with_capacity(1 + 8 + 4);
+                    header.push(frame_type);
+                    header.extend_from_slice(&frame_txn.to_be_bytes());
+                    header.extend_from_slice(&frame_count.to_be_bytes());
+                    assert_eq!(checksum, checksum32(&[&header]));
+                    assert_eq!(Some(frame_txn), txn_id);
+                    assert_eq!(frame_count as usize, page_frames);
+                    assert_eq!(offset, wal_bytes.len());
+                    break;
+                }
+                other => panic!("unexpected WAL frame type {other}"),
+            }
+        }
+
+        assert!(page_frames >= 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multiple_flushes_append_multiple_wal_transactions() {
+        let path = temp_db_path("wal_append.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page_num = pager.allocate_page().unwrap();
+
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page[0] = 1;
+        }
+        pager.flush_all().unwrap();
+        let wal_len_after_first = fs::metadata(wal_path_for(&path)).unwrap().len();
+
+        {
+            let page = pager.write_page(page_num).unwrap();
+            page[0] = 2;
+        }
+        pager.flush_all().unwrap();
+        let wal_len_after_second = fs::metadata(wal_path_for(&path)).unwrap().len();
+
+        assert!(wal_len_after_second > wal_len_after_first);
         cleanup(&path);
     }
 }

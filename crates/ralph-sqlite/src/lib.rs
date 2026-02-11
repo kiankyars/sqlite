@@ -112,8 +112,8 @@ impl Database {
             },
         );
         self.pager
-            .flush_all()
-            .map_err(|e| format!("flush create table: {e}"))?;
+            .commit()
+            .map_err(|e| format!("commit create table: {e}"))?;
         Ok(ExecuteResult::CreateTable)
     }
 
@@ -231,8 +231,8 @@ impl Database {
         }
 
         self.pager
-            .flush_all()
-            .map_err(|e| format!("flush insert: {e}"))?;
+            .commit()
+            .map_err(|e| format!("commit insert: {e}"))?;
 
         Ok(ExecuteResult::Insert { rows_affected })
     }
@@ -315,8 +315,8 @@ impl Database {
         }
 
         self.pager
-            .flush_all()
-            .map_err(|e| format!("flush update: {e}"))?;
+            .commit()
+            .map_err(|e| format!("commit update: {e}"))?;
 
         Ok(ExecuteResult::Update { rows_affected })
     }
@@ -348,8 +348,8 @@ impl Database {
         }
 
         self.pager
-            .flush_all()
-            .map_err(|e| format!("flush delete: {e}"))?;
+            .commit()
+            .map_err(|e| format!("commit delete: {e}"))?;
 
         Ok(ExecuteResult::Delete { rows_affected })
     }

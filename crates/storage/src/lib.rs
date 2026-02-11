@@ -12,6 +12,7 @@
 pub mod btree;
 pub mod header;
 pub mod pager;
+mod wal;
 
 pub use btree::BTree;
 pub use header::FileHeader;

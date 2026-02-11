@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 4 (partial)** — tokenizer/parser, pager, B+tree, and end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution are implemented; schema persistence and planner/index work remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, and WAL write-ahead commit path are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -13,9 +13,11 @@ Latest completions:
 - B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
 - End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
 - Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
+- WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
+- `cargo test --workspace` (task #15 implementation): pass, 0 failed.
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
@@ -36,7 +38,7 @@ Test pass rate:
 12. ~~UPDATE and DELETE execution~~ ✓
 13. ~~Secondary indexes (CREATE INDEX)~~ ✓
 14. Query planner (index selection)
-15. WAL write path and commit
+15. ~~WAL write path and commit~~ ✓
 16. Checkpoint and crash recovery
 17. BEGIN/COMMIT/ROLLBACK SQL
 18. B+tree split/merge
@@ -92,11 +94,19 @@ Test pass rate:
   - Index build backfills existing rows; `INSERT` now maintains indexes for indexed tables
   - Added index payload encoding that handles duplicate values and hash-bucket collisions
   - 2 new integration tests and 3 parser tests; see `notes/secondary-indexes.md`
+- [x] WAL write path and commit in `crates/storage` (agent codex)
+  - Added `wal.rs` sidecar WAL implementation (`<db-path>-wal`) with header, page frames, and commit frames
+  - Added checksum validation helpers and WAL page-size/version guards
+  - Updated `Pager::flush_all()` to write dirty pages to WAL and `fsync` WAL before applying to DB file
+  - Added `Pager::commit()` and used it in SQL write statement execution paths
+  - Added storage tests for WAL frame format/checksums and multi-commit WAL append behavior
 
 ## Known Issues
 
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
 - B+tree delete currently does not rebalance/merge underflowing nodes (deferred to task #18).
+- WAL replay and checkpoint are not implemented yet (deferred to task #16).
+- Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
 - UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
