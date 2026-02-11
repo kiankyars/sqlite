@@ -1,0 +1,3 @@
+created_at_unix=1770786618
+agent_id=workspace-1
+task=SQL tokenizer, AST types, and parser for CREATE TABLE/INSERT/SELECT in ralph-parser
