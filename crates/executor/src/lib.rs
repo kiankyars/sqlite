@@ -697,15 +697,29 @@ fn ordered_numeric_key(value: f64) -> i64 {
 }
 
 fn ordered_text_key(value: &str) -> i64 {
-    // Use an 8-byte lexicographic prefix key. This preserves order for
-    // differently-prefixed strings and is non-decreasing for all strings.
-    // Longer strings sharing the same first 8 bytes intentionally collide and
-    // are disambiguated by value-level bucket filtering at read time.
-    let mut prefix = [0u8; 8];
+    // Keep the first 7 bytes exact, and encode byte 8 with a one-bit overlap
+    // channel sourced from byte 9. This preserves non-decreasing ordering and
+    // adds limited post-8th-byte discrimination for long shared prefixes.
     let bytes = value.as_bytes();
+    let mut prefix = [0u8; 7];
     let copy_len = bytes.len().min(prefix.len());
     prefix[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    let sortable_u64 = u64::from_be_bytes(prefix);
+
+    let b8 = bytes.get(7).copied().unwrap_or(0);
+    let b9 = bytes.get(8).copied().unwrap_or(0);
+    let tail_bit = u8::from(b9 >= 0x70);
+
+    let low_byte = if b8 == 0 {
+        0
+    } else {
+        b8.saturating_sub(1).saturating_add(tail_bit)
+    };
+
+    let mut sortable_bytes = [0u8; 8];
+    sortable_bytes[..7].copy_from_slice(&prefix);
+    sortable_bytes[7] = low_byte;
+    let sortable_u64 = u64::from_be_bytes(sortable_bytes);
+
     sortable_u64_to_i64(sortable_u64)
 }
 
@@ -945,9 +959,34 @@ mod tests {
     }
 
     #[test]
-    fn ordered_index_key_collides_for_text_prefixes_longer_than_eight_bytes() {
-        let k1 = ordered_index_key_for_value(&Value::Text("abcdefgh".to_string())).unwrap();
-        let k2 = ordered_index_key_for_value(&Value::Text("abcdefgh_suffix".to_string())).unwrap();
-        assert_eq!(k1, k2);
+    fn ordered_index_key_distinguishes_some_long_text_suffixes_beyond_eight_bytes() {
+        let k1 = ordered_index_key_for_value(&Value::Text("abcdefgh1".to_string())).unwrap();
+        let k2 = ordered_index_key_for_value(&Value::Text("abcdefghz".to_string())).unwrap();
+        assert!(k1 < k2);
+    }
+
+    #[test]
+    fn ordered_index_key_is_non_decreasing_for_sorted_text_series() {
+        let values = vec![
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abcdefgh",
+            "abcdefgh0",
+            "abcdefgh2",
+            "abcdefghz",
+            "abcdefgi0",
+            "b",
+        ];
+
+        let mut prev = None;
+        for text in values {
+            let key = ordered_index_key_for_value(&Value::Text(text.to_string())).unwrap();
+            if let Some(prev_key) = prev {
+                assert!(prev_key <= key, "expected non-decreasing keys");
+            }
+            prev = Some(key);
+        }
     }
 }

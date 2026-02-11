@@ -4203,6 +4203,16 @@ mod tests {
     }
 
     #[test]
+    fn ordered_range_key_bounds_split_long_text_suffixes() {
+        let bounds = ordered_range_key_bounds(
+            Some((&Value::Text("abcdefgh1".to_string()), true)),
+            Some((&Value::Text("abcdefghz".to_string()), true)),
+        )
+        .unwrap();
+        assert!(bounds.0 < bounds.1);
+    }
+
+    #[test]
     fn ordered_range_key_bounds_maps_numeric_values() {
         let bounds = ordered_range_key_bounds(
             Some((&Value::Integer(10), true)),

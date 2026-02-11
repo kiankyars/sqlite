@@ -1,3 +1,0 @@
-created_at_unix=1770826142
-agent_id=3
-task=Improve text index key encoding beyond fixed 8-byte prefixes to reduce collision-heavy scans while preserving order

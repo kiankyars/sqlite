@@ -37,13 +37,17 @@ Latest completions:
 - SELECT `GROUP BY` / `HAVING` execution semantics in `crates/ralph-sqlite` (Agent codex) — added grouped row execution for table-backed and scalar no-`FROM` queries, per-group aggregate/non-aggregate expression evaluation, HAVING filtering, and grouped ORDER BY support; HAVING without GROUP BY now behaves as aggregate-only and GROUP BY rejects aggregate expressions
 - Ordered range index seeks for numeric bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — index keying now uses order-preserving numeric keys for `INTEGER`/`REAL`, and `IndexRange` candidate reads now use `BTree::scan_range` when bounds are orderable
 - Ordered range index seeks for text bounds in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — text index keys now use an order-preserving 8-byte prefix encoding so `IndexRange` plans can seek on text bounds (with value-level filtering retained for strict bound semantics)
+- Text index overlap key encoding for long shared prefixes in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — `TEXT` ordered keys now keep the first 7 bytes exact and use an overlap-channel low byte with one suffix-threshold bit from byte 9, preserving non-decreasing ordering while reducing a subset of >8-byte collisions during range seeks
 - Single-column `UNIQUE` index execution in `crates/ralph-sqlite` (Agent codex) — `CREATE UNIQUE INDEX` now builds/enforces unique secondary indexes, `INSERT`/`UPDATE` reject duplicate non-`NULL` keys with SQLite-style errors, and index uniqueness now persists across reopen via schema SQL parsing
 - INNER JOIN / CROSS JOIN execution in `crates/parser` + `crates/ralph-sqlite` (Agent opus) — parser now supports `JOIN`, `INNER JOIN`, `CROSS JOIN`, and comma cross join syntax with ON conditions and table aliases; execution performs nested-loop cross-product joins with ON/WHERE filtering, qualified column resolution, and full ORDER BY/LIMIT support
 
 Recommended next step:
-- Improve text index key encoding beyond fixed 8-byte prefixes to reduce collision-heavy scans for long shared prefixes while preserving order.
+- Implement multi-column secondary index execution (including `UNIQUE` enforcement).
 
 Test pass rate:
+- `cargo test -p ralph-executor` (text index overlap key encoding): pass, 0 failed (15 tests).
+- `cargo test -p ralph-sqlite` (text index overlap key encoding): pass, 0 failed (59 tests).
+- `./test.sh --fast` (text index overlap key encoding, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test --workspace` (INNER JOIN / CROSS JOIN execution): pass, 0 failed (205 tests).
 - `cargo test -p ralph-parser` (INNER JOIN / CROSS JOIN parser): pass, 0 failed (65 tests).
 - `cargo test -p ralph-sqlite` (INNER JOIN / CROSS JOIN execution): pass, 0 failed (58 tests).
@@ -141,6 +145,7 @@ Test pass rate:
 27. ~~Ordered text range index seeks~~ ✓
 28. ~~Single-column UNIQUE index execution~~ ✓
 29. ~~INNER JOIN / CROSS JOIN execution~~ ✓
+30. ~~Text index overlap key encoding for long shared prefixes~~ ✓
 
 ## Completed Tasks
 
@@ -302,6 +307,10 @@ Test pass rate:
   - `ordered_index_key_for_value` now emits order-preserving keys for `TEXT` values via an 8-byte lexicographic prefix encoding
   - Existing `IndexRange` candidate reads now perform B+tree range seeks for text bounds, with value-level filtering retained for strict comparison semantics
   - Added executor and integration coverage; see `notes/ordered-text-range-index-seeks.md`
+- [x] Text index overlap key encoding for long shared prefixes (agent codex)
+  - Updated `ordered_index_key_for_value` for `TEXT` to keep first 7 bytes exact and use an overlap-channel low byte with a suffix-threshold bit from byte 9
+  - Preserved non-decreasing key ordering for `IndexRange` scans while reducing a subset of >8-byte prefix collisions
+  - Added executor + integration coverage; see `notes/text-index-key-overlap-encoding.md`
 - [x] Single-column UNIQUE index execution (agent codex)
   - `CREATE UNIQUE INDEX` now executes for single-column indexes with duplicate backfill validation
   - `INSERT`/`UPDATE` now enforce unique secondary index constraints for non-`NULL` values
@@ -318,7 +327,7 @@ Test pass rate:
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
-- Range index planning now uses ordered key-range scans for numeric and text bounds; text uses an 8-byte prefix key encoding, so long shared prefixes can still cause collision-heavy scans within matched key ranges.
+- Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support is limited to INNER JOIN and CROSS JOIN; LEFT/RIGHT/FULL OUTER JOIN not implemented. Join execution uses nested-loop cross products with no index-driven optimization. Aggregate queries (GROUP BY/HAVING) are not supported with joins yet.
 - No subquery support
 - Multi-column secondary index execution is not supported yet; UNIQUE enforcement is currently limited to single-column indexes.
