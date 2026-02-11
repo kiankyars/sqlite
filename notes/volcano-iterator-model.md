@@ -28,3 +28,11 @@
 - Predicate/projection logic is callback-based on purpose, so SQL expression semantics stay in task #11.
 - The executor pipeline is not yet integrated with `ralph-sqlite` statement execution.
 - Planner integration (task #14) can target this trait by producing pipelines equivalent to Scan/Filter/Project.
+
+## Wiring and Lifetime Management (Task Wiring)
+- Integrated `ralph-executor` into `ralph-sqlite` by moving row decoding/encoding logic to `executor` and implementing physical operators `TableScan` and `IndexEqScan`.
+- Refactored `Operator` wiring to support lifetimes:
+  - `TableScan<'a>` holds `&'a mut Pager`.
+  - `Filter<'a>` and `Project<'a>` now accept `Box<dyn Operator + 'a>`.
+  - `execute` function accepts `Box<dyn Operator + 'a>`.
+- This ensures that operators can safely hold mutable references to storage structures (Pager) during execution without 'static requirement conflicts.

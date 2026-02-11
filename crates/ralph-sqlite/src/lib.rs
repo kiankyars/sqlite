@@ -10,17 +10,13 @@ use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
     OrderByItem, SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
 };
+use ralph_executor::{
+    self, decode_index_payload, decode_row, encode_value, index_key_for_value, Filter, IndexBucket,
+    IndexEqScan, Operator, TableScan, Value,
+};
 use ralph_planner::{plan_select, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
@@ -55,12 +51,6 @@ struct IndexMeta {
     column: String,
     column_idx: usize,
     root_page: PageNum,
-}
-
-#[derive(Debug, Clone)]
-struct IndexBucket {
-    value: Value,
-    rowids: Vec<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +221,7 @@ impl Database {
             root_page,
         };
         for entry in table_entries {
-            let row = decode_row(&entry.payload)?;
+            let row = decode_row(&entry.payload).map_err(|e| e.to_string())?;
             if row.len() != table_meta.columns.len() {
                 return Err(format!(
                     "row column count {} does not match table schema {}",
@@ -324,13 +314,13 @@ impl Database {
             )
         })?;
 
-        let key = index_key_for_value(value)?;
+        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let mut buckets = match tree
             .lookup(key)
             .map_err(|e| format!("lookup index entry: {e}"))?
         {
-            Some(payload) => decode_index_payload(&payload)?,
+            Some(payload) => decode_index_payload(&payload).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
 
@@ -351,28 +341,6 @@ impl Database {
         Ok(())
     }
 
-    fn index_rowids_for_value(
-        &mut self,
-        index_meta: &IndexMeta,
-        value: &Value,
-    ) -> Result<Vec<i64>, String> {
-        let key = index_key_for_value(value)?;
-        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
-        let Some(payload) = tree
-            .lookup(key)
-            .map_err(|e| format!("lookup index entry: {e}"))?
-        else {
-            return Ok(Vec::new());
-        };
-
-        let buckets = decode_index_payload(&payload)?;
-        Ok(buckets
-            .into_iter()
-            .find(|bucket| values_equal(&bucket.value, value))
-            .map(|bucket| bucket.rowids)
-            .unwrap_or_default())
-    }
-
     fn index_delete_row(
         &mut self,
         index_meta: &IndexMeta,
@@ -386,7 +354,7 @@ impl Database {
             )
         })?;
 
-        let key = index_key_for_value(value)?;
+        let key = index_key_for_value(value).map_err(|e| e.to_string())?;
         let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
         let Some(payload) = tree
             .lookup(key)
@@ -395,7 +363,7 @@ impl Database {
             return Ok(());
         };
 
-        let mut buckets = decode_index_payload(&payload)?;
+        let mut buckets = decode_index_payload(&payload).map_err(|e| e.to_string())?;
         if let Some(bucket) = buckets
             .iter_mut()
             .find(|bucket| values_equal(&bucket.value, value))
@@ -644,66 +612,61 @@ impl Database {
         where_clause: Option<&Expr>,
         access_path: &AccessPath,
     ) -> Result<Vec<Vec<Value>>, String> {
-        match access_path {
-            AccessPath::TableScan => self.read_rows_by_table_scan(meta, where_clause),
+        let scan_op: Box<dyn Operator + '_> = match access_path {
+            AccessPath::TableScan => {
+                Box::new(TableScan::new(&mut self.pager, meta.root_page))
+            }
             AccessPath::IndexEq {
                 index_name,
                 value_expr,
                 ..
-            } => self.read_rows_by_index_eq(meta, where_clause, index_name, value_expr),
-        }
-    }
+            } => {
+                let idx_key = normalize_identifier(index_name);
+                let index_meta = self
+                    .indexes
+                    .get(&idx_key)
+                    .cloned()
+                    .ok_or_else(|| format!("index '{}' not found", index_name))?;
 
-    fn read_rows_by_table_scan(
-        &mut self,
-        meta: &TableMeta,
-        where_clause: Option<&Expr>,
-    ) -> Result<Vec<Vec<Value>>, String> {
-        let mut tree = BTree::new(&mut self.pager, meta.root_page);
-        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
-        let mut rows = Vec::new();
-        for entry in entries {
-            let decoded = decode_table_row(meta, &entry.payload)?;
-            if !where_clause_matches(meta, &decoded, where_clause)? {
-                continue;
+                let value = eval_expr(value_expr, None)?;
+
+                Box::new(IndexEqScan::new(
+                    &mut self.pager,
+                    index_meta.root_page,
+                    meta.root_page,
+                    value,
+                ))
             }
-            rows.push(decoded);
-        }
-        Ok(rows)
-    }
-
-    fn read_rows_by_index_eq(
-        &mut self,
-        meta: &TableMeta,
-        where_clause: Option<&Expr>,
-        index_name: &str,
-        value_expr: &Expr,
-    ) -> Result<Vec<Vec<Value>>, String> {
-        let index_key = normalize_identifier(index_name);
-        let Some(index_meta) = self.indexes.get(&index_key).cloned() else {
-            return self.read_rows_by_table_scan(meta, where_clause);
         };
 
-        let lookup_value = eval_expr(value_expr, None)?;
-        let mut rowids = self.index_rowids_for_value(&index_meta, &lookup_value)?;
-        rowids.sort_unstable();
-        rowids.dedup();
+        let root_op: Box<dyn Operator + '_> = if let Some(expr) = where_clause {
+            let meta = meta.clone();
+            let expr = expr.clone();
+            Box::new(Filter::new(scan_op, move |row| {
+                 let val = eval_expr(&expr, Some((&meta, row))).map_err(|e| ralph_executor::ExecutorError::new(e))?;
+                 match val {
+                    Value::Null => Ok(false),
+                    Value::Integer(i) => Ok(i != 0),
+                    Value::Real(f) => Ok(f != 0.0),
+                    Value::Text(s) => Ok(!s.is_empty()),
+                }
+            }))
+        } else {
+            scan_op
+        };
 
-        let mut tree = BTree::new(&mut self.pager, meta.root_page);
-        let mut rows = Vec::new();
-        for rowid in rowids {
-            let Some(payload) = tree
-                .lookup(rowid)
-                .map_err(|e| format!("lookup table row from index rowid: {e}"))?
-            else {
-                continue;
-            };
-            let decoded = decode_table_row(meta, &payload)?;
-            if !where_clause_matches(meta, &decoded, where_clause)? {
-                continue;
+        let rows = ralph_executor::execute(root_op).map_err(|e| e.to_string())?;
+
+        for row in &rows {
+             if row.len() != meta.columns.len() {
+                return Err(format!(
+                    "row column count {} does not match table schema {}",
+                    row.len(),
+                    meta.columns.len()
+                ));
             }
-            rows.push(decoded);
         }
+
         Ok(rows)
     }
 }
@@ -753,7 +716,7 @@ fn find_column_index(meta: &TableMeta, column: &str) -> Option<usize> {
 }
 
 fn decode_table_row(meta: &TableMeta, payload: &[u8]) -> Result<Vec<Value>, String> {
-    let row = decode_row(payload)?;
+    let row = decode_row(payload).map_err(|e| e.to_string())?;
     if row.len() != meta.columns.len() {
         return Err(format!(
             "row column count {} does not match table schema {}",
@@ -1462,11 +1425,6 @@ fn normalize_identifier(ident: &str) -> String {
     ident.to_ascii_lowercase()
 }
 
-const TAG_NULL: u8 = 0;
-const TAG_INTEGER: u8 = 1;
-const TAG_REAL: u8 = 2;
-const TAG_TEXT: u8 = 3;
-
 fn encode_row(row: &[Value]) -> Result<Vec<u8>, String> {
     let col_count: u32 = row
         .len()
@@ -1476,24 +1434,9 @@ fn encode_row(row: &[Value]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(&col_count.to_be_bytes());
     for value in row {
-        encode_value(value, &mut out)?;
+        encode_value(value, &mut out).map_err(|e| e.to_string())?;
     }
     Ok(out)
-}
-
-fn decode_row(payload: &[u8]) -> Result<Vec<Value>, String> {
-    if payload.len() < 4 {
-        return Err("row payload too small".to_string());
-    }
-    let mut offset = 0usize;
-    let col_count = read_u32(payload, &mut offset)? as usize;
-    let mut row = Vec::with_capacity(col_count);
-
-    for _ in 0..col_count {
-        row.push(decode_value(payload, &mut offset)?);
-    }
-
-    Ok(row)
 }
 
 fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
@@ -1505,7 +1448,7 @@ fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&bucket_count.to_be_bytes());
 
     for bucket in buckets {
-        encode_value(&bucket.value, &mut out)?;
+        encode_value(&bucket.value, &mut out).map_err(|e| e.to_string())?;
         let row_count: u32 = bucket
             .rowids
             .len()
@@ -1520,123 +1463,6 @@ fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn decode_index_payload(payload: &[u8]) -> Result<Vec<IndexBucket>, String> {
-    if payload.len() < 4 {
-        return Err("index payload too small".to_string());
-    }
-
-    let mut offset = 0usize;
-    let bucket_count = read_u32(payload, &mut offset)? as usize;
-    let mut buckets = Vec::with_capacity(bucket_count);
-    for _ in 0..bucket_count {
-        let value = decode_value(payload, &mut offset)?;
-        let row_count = read_u32(payload, &mut offset)? as usize;
-        let mut rowids = Vec::with_capacity(row_count);
-        for _ in 0..row_count {
-            rowids.push(read_i64(payload, &mut offset)?);
-        }
-        buckets.push(IndexBucket { value, rowids });
-    }
-
-    Ok(buckets)
-}
-
-fn index_key_for_value(value: &Value) -> Result<i64, String> {
-    let mut encoded = Vec::new();
-    encode_value(value, &mut encoded)?;
-    let hash = fnv1a64(&encoded);
-    Ok(i64::from_be_bytes(hash.to_be_bytes()))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET_BASIS;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<(), String> {
-    match value {
-        Value::Null => out.push(TAG_NULL),
-        Value::Integer(i) => {
-            out.push(TAG_INTEGER);
-            out.extend_from_slice(&i.to_be_bytes());
-        }
-        Value::Real(f) => {
-            out.push(TAG_REAL);
-            out.extend_from_slice(&f.to_bits().to_be_bytes());
-        }
-        Value::Text(s) => {
-            let len: u32 = s
-                .len()
-                .try_into()
-                .map_err(|_| "string value too large".to_string())?;
-            out.push(TAG_TEXT);
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(s.as_bytes());
-        }
-    }
-    Ok(())
-}
-
-fn decode_value(buf: &[u8], offset: &mut usize) -> Result<Value, String> {
-    let tag = *buf
-        .get(*offset)
-        .ok_or_else(|| "payload truncated while reading value tag".to_string())?;
-    *offset += 1;
-    match tag {
-        TAG_NULL => Ok(Value::Null),
-        TAG_INTEGER => Ok(Value::Integer(read_i64(buf, offset)?)),
-        TAG_REAL => Ok(Value::Real(f64::from_bits(read_u64(buf, offset)?))),
-        TAG_TEXT => {
-            let len = read_u32(buf, offset)? as usize;
-            let end = *offset + len;
-            if end > buf.len() {
-                return Err("payload text out of bounds".to_string());
-            }
-            let s = std::str::from_utf8(&buf[*offset..end])
-                .map_err(|e| format!("invalid utf-8 text in payload: {e}"))?;
-            *offset = end;
-            Ok(Value::Text(s.to_string()))
-        }
-        other => Err(format!("unknown value tag in payload: {other}")),
-    }
-}
-
-fn read_u32(buf: &[u8], offset: &mut usize) -> Result<u32, String> {
-    let end = *offset + 4;
-    if end > buf.len() {
-        return Err("payload truncated while reading u32".to_string());
-    }
-    let value = u32::from_be_bytes(buf[*offset..end].try_into().unwrap());
-    *offset = end;
-    Ok(value)
-}
-
-fn read_u64(buf: &[u8], offset: &mut usize) -> Result<u64, String> {
-    let end = *offset + 8;
-    if end > buf.len() {
-        return Err("payload truncated while reading u64".to_string());
-    }
-    let value = u64::from_be_bytes(buf[*offset..end].try_into().unwrap());
-    *offset = end;
-    Ok(value)
-}
-
-fn read_i64(buf: &[u8], offset: &mut usize) -> Result<i64, String> {
-    let end = *offset + 8;
-    if end > buf.len() {
-        return Err("payload truncated while reading i64".to_string());
-    }
-    let value = i64::from_be_bytes(buf[*offset..end].try_into().unwrap());
-    *offset = end;
-    Ok(value)
-}
 
 pub fn version() -> &'static str {
     "0.1.0-bootstrap"

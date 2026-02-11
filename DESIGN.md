@@ -131,11 +131,11 @@ ralph-sqlite (integration)
 - [ ] INSERT and simple SELECT execution end-to-end
 
 ### Stage 3: Query Execution
-- [ ] Volcano iterator model
-- [ ] Table scan operator
-- [ ] Filter (WHERE) operator
-- [ ] Projection operator
-- [ ] Expression evaluation (comparisons, arithmetic, string ops)
+- [x] Volcano iterator model
+- [x] Table scan operator
+- [x] Filter (WHERE) operator
+- [x] Projection operator
+- [x] Expression evaluation (comparisons, arithmetic, string ops)
 
 ### Stage 4: Full DML
 - [ ] UPDATE execution

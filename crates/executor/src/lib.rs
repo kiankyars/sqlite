@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use ralph_parser::ast::{BinaryOperator, Expr, UnaryOperator};
+use ralph_storage::pager::PageNum;
+use ralph_storage::{BTree, Pager};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -38,6 +40,18 @@ impl Display for ExecutorError {
 }
 
 impl Error for ExecutorError {}
+
+impl From<std::io::Error> for ExecutorError {
+    fn from(err: std::io::Error) -> Self {
+        Self::new(format!("io error: {err}"))
+    }
+}
+
+impl From<String> for ExecutorError {
+    fn from(err: String) -> Self {
+        Self::new(err)
+    }
+}
 
 pub type ExecResult<T> = Result<T, ExecutorError>;
 
@@ -92,14 +106,151 @@ impl Operator for Scan {
     }
 }
 
-pub struct Filter {
-    input: Box<dyn Operator>,
+pub struct TableScan<'a> {
+    pager: &'a mut Pager,
+    root_page: PageNum,
+    rows: Vec<Row>,
+    cursor: usize,
+    is_open: bool,
+}
+
+impl<'a> TableScan<'a> {
+    pub fn new(pager: &'a mut Pager, root_page: PageNum) -> Self {
+        Self {
+            pager,
+            root_page,
+            rows: Vec::new(),
+            cursor: 0,
+            is_open: false,
+        }
+    }
+}
+
+impl<'a> Operator for TableScan<'a> {
+    fn open(&mut self) -> ExecResult<()> {
+        let mut btree = BTree::new(self.pager, self.root_page);
+        let entries = btree.scan_all()?;
+        self.rows = entries
+            .into_iter()
+            .map(|entry| decode_row(&entry.payload))
+            .collect::<Result<_, _>>()?;
+        self.cursor = 0;
+        self.is_open = true;
+        Ok(())
+    }
+
+    fn next(&mut self) -> ExecResult<Option<Row>> {
+        if !self.is_open {
+            return Err(ExecutorError::new("operator is not open"));
+        }
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> ExecResult<()> {
+        self.is_open = false;
+        self.rows.clear();
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
+pub struct IndexEqScan<'a> {
+    pager: &'a mut Pager,
+    index_root: PageNum,
+    table_root: PageNum,
+    value: Value,
+    rows: Vec<Row>,
+    cursor: usize,
+    is_open: bool,
+}
+
+impl<'a> IndexEqScan<'a> {
+    pub fn new(
+        pager: &'a mut Pager,
+        index_root: PageNum,
+        table_root: PageNum,
+        value: Value,
+    ) -> Self {
+        Self {
+            pager,
+            index_root,
+            table_root,
+            value,
+            rows: Vec::new(),
+            cursor: 0,
+            is_open: false,
+        }
+    }
+}
+
+impl<'a> Operator for IndexEqScan<'a> {
+    fn open(&mut self) -> ExecResult<()> {
+        let key = index_key_for_value(&self.value)?;
+        
+        // 1. Scan Index
+        let rowids = {
+            let mut index_tree = BTree::new(self.pager, self.index_root);
+            match index_tree.lookup(key)? {
+                Some(payload) => {
+                    let buckets = decode_index_payload(&payload)?;
+                    buckets
+                        .into_iter()
+                        .find(|b| values_equal(&b.value, &self.value))
+                        .map(|b| b.rowids)
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            }
+        };
+
+        // 2. Fetch from Table
+        let mut table_tree = BTree::new(self.pager, self.table_root);
+        self.rows = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            if let Some(payload) = table_tree.lookup(rowid)? {
+                let row = decode_row(&payload)?;
+                self.rows.push(row);
+            }
+        }
+
+        self.cursor = 0;
+        self.is_open = true;
+        Ok(())
+    }
+
+    fn next(&mut self) -> ExecResult<Option<Row>> {
+        if !self.is_open {
+            return Err(ExecutorError::new("operator is not open"));
+        }
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> ExecResult<()> {
+        self.is_open = false;
+        self.rows.clear();
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
+pub struct Filter<'a> {
+    input: Box<dyn Operator + 'a>,
     predicate: Predicate,
     is_open: bool,
 }
 
-impl Filter {
-    pub fn new<F>(input: Box<dyn Operator>, predicate: F) -> Self
+impl<'a> Filter<'a> {
+    pub fn new<F>(input: Box<dyn Operator + 'a>, predicate: F) -> Self
     where
         F: Fn(&Row) -> ExecResult<bool> + Send + Sync + 'static,
     {
@@ -110,7 +261,7 @@ impl Filter {
         }
     }
 
-    pub fn from_expr(input: Box<dyn Operator>, predicate: Expr, columns: Vec<String>) -> Self {
+    pub fn from_expr(input: Box<dyn Operator + 'a>, predicate: Expr, columns: Vec<String>) -> Self {
         Self::new(input, move |row| {
             let value = eval_expr(&predicate, Some((row, columns.as_slice())))?;
             Ok(is_truthy(&value))
@@ -118,7 +269,7 @@ impl Filter {
     }
 }
 
-impl Operator for Filter {
+impl<'a> Operator for Filter<'a> {
     fn open(&mut self) -> ExecResult<()> {
         self.input.open()?;
         self.is_open = true;
@@ -148,14 +299,14 @@ impl Operator for Filter {
     }
 }
 
-pub struct Project {
-    input: Box<dyn Operator>,
+pub struct Project<'a> {
+    input: Box<dyn Operator + 'a>,
     projection: Projection,
     is_open: bool,
 }
 
-impl Project {
-    pub fn new<F>(input: Box<dyn Operator>, projection: F) -> Self
+impl<'a> Project<'a> {
+    pub fn new<F>(input: Box<dyn Operator + 'a>, projection: F) -> Self
     where
         F: Fn(&Row) -> ExecResult<Row> + Send + Sync + 'static,
     {
@@ -166,7 +317,11 @@ impl Project {
         }
     }
 
-    pub fn from_exprs(input: Box<dyn Operator>, expressions: Vec<Expr>, columns: Vec<String>) -> Self {
+    pub fn from_exprs(
+        input: Box<dyn Operator + 'a>,
+        expressions: Vec<Expr>,
+        columns: Vec<String>,
+    ) -> Self {
         Self::new(input, move |row| {
             expressions
                 .iter()
@@ -176,7 +331,7 @@ impl Project {
     }
 }
 
-impl Operator for Project {
+impl<'a> Operator for Project<'a> {
     fn open(&mut self) -> ExecResult<()> {
         self.input.open()?;
         self.is_open = true;
@@ -202,7 +357,7 @@ impl Operator for Project {
     }
 }
 
-pub fn execute(mut root: Box<dyn Operator>) -> ExecResult<Vec<Row>> {
+pub fn execute<'a>(mut root: Box<dyn Operator + 'a>) -> ExecResult<Vec<Row>> {
     root.open()?;
     let mut rows = Vec::new();
     while let Some(row) = root.next()? {
@@ -421,6 +576,154 @@ fn is_truthy(value: &Value) -> bool {
         Value::Real(f) => *f != 0.0,
         Value::Text(s) => !s.is_empty(),
     }
+}
+
+// ─── Encoding / Decoding Helpers ──────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct IndexBucket {
+    pub value: Value,
+    pub rowids: Vec<i64>,
+}
+
+pub const TAG_NULL: u8 = 0;
+pub const TAG_INTEGER: u8 = 1;
+pub const TAG_REAL: u8 = 2;
+pub const TAG_TEXT: u8 = 3;
+
+pub fn decode_row(payload: &[u8]) -> ExecResult<Vec<Value>> {
+    if payload.len() < 4 {
+        return Err(ExecutorError::new("row payload too small"));
+    }
+    let mut offset = 0usize;
+    let col_count = read_u32(payload, &mut offset)? as usize;
+    let mut row = Vec::with_capacity(col_count);
+
+    for _ in 0..col_count {
+        row.push(decode_value(payload, &mut offset)?);
+    }
+
+    Ok(row)
+}
+
+pub fn decode_index_payload(payload: &[u8]) -> ExecResult<Vec<IndexBucket>> {
+    if payload.len() < 4 {
+        return Err(ExecutorError::new("index payload too small"));
+    }
+
+    let mut offset = 0usize;
+    let bucket_count = read_u32(payload, &mut offset)? as usize;
+    let mut buckets = Vec::with_capacity(bucket_count);
+    for _ in 0..bucket_count {
+        let value = decode_value(payload, &mut offset)?;
+        let row_count = read_u32(payload, &mut offset)? as usize;
+        let mut rowids = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            rowids.push(read_i64(payload, &mut offset)?);
+        }
+        buckets.push(IndexBucket { value, rowids });
+    }
+
+    Ok(buckets)
+}
+
+pub fn index_key_for_value(value: &Value) -> ExecResult<i64> {
+    let mut encoded = Vec::new();
+    encode_value(value, &mut encoded)?;
+    let hash = fnv1a64(&encoded);
+    Ok(i64::from_be_bytes(hash.to_be_bytes()))
+}
+
+pub fn encode_value(value: &Value, out: &mut Vec<u8>) -> ExecResult<()> {
+    match value {
+        Value::Null => out.push(TAG_NULL),
+        Value::Integer(i) => {
+            out.push(TAG_INTEGER);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+        Value::Real(f) => {
+            out.push(TAG_REAL);
+            out.extend_from_slice(&f.to_bits().to_be_bytes());
+        }
+        Value::Text(s) => {
+            let len: u32 = s
+                .len()
+                .try_into()
+                .map_err(|_| ExecutorError::new("string value too large"))?;
+            out.push(TAG_TEXT);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+pub fn decode_value(buf: &[u8], offset: &mut usize) -> ExecResult<Value> {
+    let tag = *buf
+        .get(*offset)
+        .ok_or_else(|| ExecutorError::new("payload truncated while reading value tag"))?;
+    *offset += 1;
+    match tag {
+        TAG_NULL => Ok(Value::Null),
+        TAG_INTEGER => Ok(Value::Integer(read_i64(buf, offset)?)),
+        TAG_REAL => Ok(Value::Real(f64::from_bits(read_u64(buf, offset)?))),
+        TAG_TEXT => {
+            let len = read_u32(buf, offset)? as usize;
+            let end = *offset + len;
+            if end > buf.len() {
+                return Err(ExecutorError::new("payload text out of bounds"));
+            }
+            let s = std::str::from_utf8(&buf[*offset..end])
+                .map_err(|e| ExecutorError::new(format!("invalid utf-8 text in payload: {e}")))?;
+            *offset = end;
+            Ok(Value::Text(s.to_string()))
+        }
+        other => Err(ExecutorError::new(format!(
+            "unknown value tag in payload: {other}"
+        ))),
+    }
+}
+
+fn read_u32(buf: &[u8], offset: &mut usize) -> ExecResult<u32> {
+    let end = *offset + 4;
+    if end > buf.len() {
+        return Err(ExecutorError::new("payload truncated while reading u32"));
+    }
+    let value = u32::from_be_bytes(buf[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+fn read_u64(buf: &[u8], offset: &mut usize) -> ExecResult<u64> {
+    let end = *offset + 8;
+    if end > buf.len() {
+        return Err(ExecutorError::new("payload truncated while reading u64"));
+    }
+    let value = u64::from_be_bytes(buf[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+fn read_i64(buf: &[u8], offset: &mut usize) -> ExecResult<i64> {
+    let end = *offset + 8;
+    if end > buf.len() {
+        return Err(ExecutorError::new("payload truncated while reading i64"));
+    }
+    let value = i64::from_be_bytes(buf[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
 }
 
 #[cfg(test)]

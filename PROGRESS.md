@@ -142,6 +142,7 @@ Test pass rate:
   - Replaced executor stub with `Operator` trait (`open`/`next`/`close`) and concrete operators
   - Added callback-based predicate/projection hooks so expression semantics can be layered by task #11
   - Added unit tests for lifecycle behavior, composition (`Scan -> Filter -> Project`), and error propagation
+  - Wired into `ralph-sqlite` SELECT execution: implemented `TableScan` and `IndexEqScan` in `ralph-executor` with lifetime support, and updated `execute_select` to build physical operator trees
 - [x] Query planner index selection (agent codex)
   - Replaced planner stub with `plan_select` access-path planning (`TableScan` vs. `IndexEq`)
   - Planner recognizes indexable predicates of the form `col = constant` (including reversed equality and inside `AND`)
@@ -173,4 +174,3 @@ Test pass rate:
 - Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
 - Multi-column and UNIQUE index execution are not supported yet.
 - Aggregate queries do not support `GROUP BY`/`HAVING`; column references outside aggregate functions are rejected in aggregate SELECTs.
-- `crates/executor` Volcano operators are currently in-memory and not yet wired into `ralph-sqlite` SELECT planning/execution.
