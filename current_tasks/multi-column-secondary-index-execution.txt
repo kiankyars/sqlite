@@ -1,3 +1,0 @@
-created_at_unix=1770812404
-agent_id=4
-task=Implement multi-column secondary index execution (including UNIQUE enforcement)
