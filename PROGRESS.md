@@ -50,7 +50,7 @@ Test pass rate:
 - `cargo test -p ralph-sqlite` (text index overlap key encoding): pass, 0 failed (59 tests).
 - `./test.sh --fast` (text index overlap key encoding, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-sqlite -p ralph-storage` (multi-column secondary index execution): pass, 0 failed (119 tests).
-- `cargo test --workspace` (multi-column secondary index execution): pass, 0 failed (211 tests).
+- `cargo test --workspace` (multi-column secondary index execution): pass, 0 failed (213 tests).
 - `./test.sh --fast` (multi-column secondary index execution, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test --workspace` (INNER JOIN / CROSS JOIN execution): pass, 0 failed (205 tests).
 - `cargo test -p ralph-parser` (INNER JOIN / CROSS JOIN parser): pass, 0 failed (65 tests).
