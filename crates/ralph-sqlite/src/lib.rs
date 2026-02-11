@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
-    OrderByItem, SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
+    OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName, UnaryOperator, UpdateStmt,
 };
 use ralph_executor::{
     self, decode_index_payload, decode_row, encode_value, index_key_for_value, Filter, IndexBucket,
@@ -16,7 +16,7 @@ use ralph_executor::{
 };
 use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
-use ralph_storage::{BTree, Pager};
+use ralph_storage::{BTree, Pager, Schema};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
@@ -71,12 +71,17 @@ pub struct Database {
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let db_path = path.as_ref().to_path_buf();
-        let pager = Pager::open(&db_path).map_err(|e| format!("open database: {e}"))?;
+        let mut pager = Pager::open(&db_path).map_err(|e| format!("open database: {e}"))?;
+        if pager.header().schema_root == 0 {
+            Schema::initialize(&mut pager).map_err(|e| format!("initialize schema: {e}"))?;
+        }
+        let (tables, indexes) = load_catalogs(&mut pager)?;
+
         Ok(Self {
             db_path,
             pager,
-            tables: HashMap::new(),
-            indexes: HashMap::new(),
+            tables,
+            indexes,
             in_explicit_txn: false,
             tx_snapshot: None,
         })
@@ -88,8 +93,8 @@ impl Database {
             Stmt::Begin => self.execute_begin(),
             Stmt::Commit => self.execute_commit(),
             Stmt::Rollback => self.execute_rollback(),
-            Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt),
-            Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt),
+            Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt, sql),
+            Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt, sql),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
             Stmt::Update(update_stmt) => self.execute_update(update_stmt),
             Stmt::Delete(delete_stmt) => self.execute_delete(delete_stmt),
@@ -152,7 +157,11 @@ impl Database {
             .map_err(|e| format!("commit {context}: {e}"))
     }
 
-    fn execute_create_table(&mut self, stmt: CreateTableStmt) -> Result<ExecuteResult, String> {
+    fn execute_create_table(
+        &mut self,
+        stmt: CreateTableStmt,
+        original_sql: &str,
+    ) -> Result<ExecuteResult, String> {
         let table_key = normalize_identifier(&stmt.table);
         if self.tables.contains_key(&table_key) {
             if stmt.if_not_exists {
@@ -165,8 +174,25 @@ impl Database {
             return Err("CREATE TABLE requires at least one column".to_string());
         }
 
-        let columns: Vec<String> = stmt.columns.into_iter().map(|c| c.name).collect();
-        let root_page = BTree::create(&mut self.pager).map_err(|e| format!("create table: {e}"))?;
+        let columns: Vec<String> = stmt.columns.iter().map(|c| c.name.clone()).collect();
+        let schema_columns: Vec<(String, String)> = stmt
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    type_name_to_sql(column.type_name.as_ref()),
+                )
+            })
+            .collect();
+
+        let root_page = Schema::create_table(
+            &mut self.pager,
+            &stmt.table,
+            &schema_columns,
+            original_sql.trim(),
+        )
+        .map_err(|e| format!("create table: {e}"))?;
         self.tables.insert(
             table_key,
             TableMeta {
@@ -179,7 +205,11 @@ impl Database {
         Ok(ExecuteResult::CreateTable)
     }
 
-    fn execute_create_index(&mut self, stmt: CreateIndexStmt) -> Result<ExecuteResult, String> {
+    fn execute_create_index(
+        &mut self,
+        stmt: CreateIndexStmt,
+        original_sql: &str,
+    ) -> Result<ExecuteResult, String> {
         if stmt.unique {
             return Err("UNIQUE indexes are not supported yet".to_string());
         }
@@ -206,7 +236,15 @@ impl Database {
         let column_idx = find_column_index(&table_meta, &column)
             .ok_or_else(|| format!("unknown column '{}' in table '{}'", column, table_meta.name))?;
 
-        let root_page = BTree::create(&mut self.pager).map_err(|e| format!("create index: {e}"))?;
+        let root_page = Schema::create_index(
+            &mut self.pager,
+            &stmt.index,
+            &table_meta.name,
+            &column,
+            column_idx as u32,
+            original_sql.trim(),
+        )
+        .map_err(|e| format!("create index: {e}"))?;
         let mut table_tree = BTree::new(&mut self.pager, table_meta.root_page);
         let table_entries = table_tree
             .scan_all()
@@ -735,6 +773,86 @@ impl Database {
         }
 
         Ok(rows)
+    }
+}
+
+fn load_catalogs(
+    pager: &mut Pager,
+) -> Result<(HashMap<String, TableMeta>, HashMap<String, IndexMeta>), String> {
+    let mut tables = HashMap::new();
+    let table_entries = Schema::list_tables(pager).map_err(|e| format!("load tables: {e}"))?;
+    for mut table in table_entries {
+        table.columns.sort_by_key(|c| c.index);
+        let table_key = normalize_identifier(&table.name);
+        if tables.contains_key(&table_key) {
+            return Err(format!("duplicate table in schema: '{}'", table.name));
+        }
+
+        tables.insert(
+            table_key,
+            TableMeta {
+                name: table.name,
+                columns: table.columns.into_iter().map(|c| c.name).collect(),
+                root_page: table.root_page,
+            },
+        );
+    }
+
+    let mut indexes = HashMap::new();
+    let index_entries = Schema::list_indexes(pager).map_err(|e| format!("load indexes: {e}"))?;
+    for index in index_entries {
+        let index_key = normalize_identifier(&index.name);
+        if indexes.contains_key(&index_key) {
+            return Err(format!("duplicate index in schema: '{}'", index.name));
+        }
+        let indexed_column = index
+            .columns
+            .first()
+            .ok_or_else(|| format!("index '{}' has no indexed column metadata", index.name))?;
+
+        let table_key = normalize_identifier(&index.table_name);
+        let table_meta = tables.get(&table_key).ok_or_else(|| {
+            format!(
+                "index '{}' references missing table '{}'",
+                index.name, index.table_name
+            )
+        })?;
+        let column_idx = if (indexed_column.index as usize) < table_meta.columns.len()
+            && table_meta.columns[indexed_column.index as usize]
+                .eq_ignore_ascii_case(&indexed_column.name)
+        {
+            indexed_column.index as usize
+        } else {
+            find_column_index(table_meta, &indexed_column.name).ok_or_else(|| {
+                format!(
+                    "index '{}' references unknown column '{}' on table '{}'",
+                    index.name, indexed_column.name, table_meta.name
+                )
+            })?
+        };
+
+        indexes.insert(
+            index_key,
+            IndexMeta {
+                table_key,
+                table_name: table_meta.name.clone(),
+                column: indexed_column.name.clone(),
+                column_idx,
+                root_page: index.root_page,
+            },
+        );
+    }
+
+    Ok((tables, indexes))
+}
+
+fn type_name_to_sql(type_name: Option<&TypeName>) -> String {
+    match type_name {
+        Some(TypeName::Integer) => "INTEGER".to_string(),
+        Some(TypeName::Text) => "TEXT".to_string(),
+        Some(TypeName::Real) => "REAL".to_string(),
+        Some(TypeName::Blob) => "BLOB".to_string(),
+        None => String::new(),
     }
 }
 
@@ -1955,6 +2073,76 @@ mod tests {
         );
         assert_eq!(
             indexed_rowids(&mut db, "idx_t_score", &Value::Integer(9)),
+            vec![2]
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn table_catalog_persists_across_reopen() {
+        let path = temp_db_path("table_catalog_reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob');")
+                .unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let result = reopened
+            .execute("SELECT id, name FROM users ORDER BY id;")
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![Value::Integer(1), Value::Text("alice".to_string())],
+                        vec![Value::Integer(2), Value::Text("bob".to_string())],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn index_catalog_persists_across_reopen() {
+        let path = temp_db_path("index_catalog_reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 30), (2, 20), (3, 30);")
+                .unwrap();
+            db.execute("CREATE INDEX idx_users_age ON users(age);")
+                .unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let selected = reopened
+            .execute("SELECT id FROM users WHERE age = 30 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        assert_eq!(
+            indexed_rowids(&mut reopened, "idx_users_age", &Value::Integer(30)),
+            vec![1, 3]
+        );
+        assert_eq!(
+            indexed_rowids(&mut reopened, "idx_users_age", &Value::Integer(20)),
             vec![2]
         );
 

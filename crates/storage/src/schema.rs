@@ -85,9 +85,6 @@ impl Schema {
         // Allocate a new B+tree root for this table.
         let table_root = BTree::create(pager)?;
 
-        // Assign a new ID = max existing ID + 1.
-        let new_id = Self::next_id(pager)?;
-
         let col_infos: Vec<ColumnInfo> = columns
             .iter()
             .enumerate()
@@ -99,7 +96,7 @@ impl Schema {
             .collect();
 
         let entry = SchemaEntry {
-            id: new_id,
+            id: 0,
             object_type: ObjectType::Table,
             name: table_name.to_string(),
             table_name: table_name.to_string(),
@@ -108,10 +105,79 @@ impl Schema {
             columns: col_infos,
         };
 
+        Self::insert_entry(pager, entry)?;
+        Ok(table_root)
+    }
+
+    /// Create a new index. Returns the root page of the new index's B+tree.
+    pub fn create_index(
+        pager: &mut Pager,
+        index_name: &str,
+        table_name: &str,
+        column_name: &str,
+        column_index: u32,
+        sql: &str,
+    ) -> io::Result<PageNum> {
+        let schema_root = pager.header().schema_root;
+        if schema_root == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "schema table not initialized",
+            ));
+        }
+
+        if Self::find_index(pager, index_name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("index '{}' already exists", index_name),
+            ));
+        }
+
+        let index_root = BTree::create(pager)?;
+        let entry = SchemaEntry {
+            id: 0,
+            object_type: ObjectType::Index,
+            name: index_name.to_string(),
+            table_name: table_name.to_string(),
+            root_page: index_root,
+            sql: sql.to_string(),
+            columns: vec![ColumnInfo {
+                name: column_name.to_string(),
+                data_type: String::new(),
+                index: column_index,
+            }],
+        };
+
+        Self::insert_entry(pager, entry)?;
+        Ok(index_root)
+    }
+
+    /// Find a table's schema entry by name.
+    pub fn find_table(pager: &mut Pager, table_name: &str) -> io::Result<Option<SchemaEntry>> {
+        Self::find_by_name(pager, ObjectType::Table, table_name)
+    }
+
+    /// Find an index's schema entry by name.
+    pub fn find_index(pager: &mut Pager, index_name: &str) -> io::Result<Option<SchemaEntry>> {
+        Self::find_by_name(pager, ObjectType::Index, index_name)
+    }
+
+    /// List all tables in the schema.
+    pub fn list_tables(pager: &mut Pager) -> io::Result<Vec<SchemaEntry>> {
+        Self::list_by_type(pager, ObjectType::Table)
+    }
+
+    /// List all indexes in the schema.
+    pub fn list_indexes(pager: &mut Pager) -> io::Result<Vec<SchemaEntry>> {
+        Self::list_by_type(pager, ObjectType::Index)
+    }
+
+    fn insert_entry(pager: &mut Pager, mut entry: SchemaEntry) -> io::Result<()> {
+        let new_id = Self::next_id(pager)?;
+        entry.id = new_id;
         let payload = serialize_entry(&entry);
 
-        // Reload schema_root since create might have changed page allocations
-        // that moved the root (though our B+tree handles this internally).
+        // Reload schema_root since create may have changed page allocations.
         let schema_root = pager.header().schema_root;
         let mut tree = BTree::new(pager, schema_root);
         tree.insert(new_id, &payload)?;
@@ -119,51 +185,44 @@ impl Schema {
         // Update the schema root in case it changed (due to splits).
         let new_schema_root = tree.root_page();
         pager.header_mut().schema_root = new_schema_root;
-
-        Ok(table_root)
+        Ok(())
     }
 
-    /// Find a table's schema entry by name.
-    pub fn find_table(pager: &mut Pager, table_name: &str) -> io::Result<Option<SchemaEntry>> {
-        let schema_root = pager.header().schema_root;
-        if schema_root == 0 {
-            return Ok(None);
-        }
-
-        let mut tree = BTree::new(pager, schema_root);
-        let entries = tree.scan_all()?;
-
-        for entry in entries {
-            let schema_entry = deserialize_entry(&entry.payload)?;
-            if schema_entry.object_type == ObjectType::Table
-                && schema_entry.name == table_name
-            {
-                return Ok(Some(schema_entry));
-            }
-        }
-
-        Ok(None)
+    fn find_by_name(
+        pager: &mut Pager,
+        object_type: ObjectType,
+        name: &str,
+    ) -> io::Result<Option<SchemaEntry>> {
+        let entries = Self::list_entries(pager)?;
+        Ok(entries.into_iter().find(|entry| {
+            entry.object_type == object_type && entry.name.eq_ignore_ascii_case(name)
+        }))
     }
 
-    /// List all tables in the schema.
-    pub fn list_tables(pager: &mut Pager) -> io::Result<Vec<SchemaEntry>> {
+    fn list_by_type(pager: &mut Pager, object_type: ObjectType) -> io::Result<Vec<SchemaEntry>> {
+        let entries = Self::list_entries(pager)?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.object_type == object_type)
+            .collect())
+    }
+
+    fn list_entries(pager: &mut Pager) -> io::Result<Vec<SchemaEntry>> {
         let schema_root = pager.header().schema_root;
         if schema_root == 0 {
             return Ok(Vec::new());
         }
 
         let mut tree = BTree::new(pager, schema_root);
-        let entries = tree.scan_all()?;
+        let records = tree.scan_all()?;
 
-        let mut tables = Vec::new();
-        for entry in entries {
-            let schema_entry = deserialize_entry(&entry.payload)?;
-            if schema_entry.object_type == ObjectType::Table {
-                tables.push(schema_entry);
-            }
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            let mut schema_entry = deserialize_entry(&record.payload)?;
+            schema_entry.id = record.key;
+            entries.push(schema_entry);
         }
-
-        Ok(tables)
+        Ok(entries)
     }
 
     /// Get the next available schema entry ID.
@@ -505,6 +564,50 @@ mod tests {
         );
 
         assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_and_find_index() {
+        let path = temp_db_path("schema_index.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        Schema::initialize(&mut pager).unwrap();
+        Schema::create_table(
+            &mut pager,
+            "users",
+            &[
+                ("id".to_string(), "INTEGER".to_string()),
+                ("age".to_string(), "INTEGER".to_string()),
+            ],
+            "CREATE TABLE users (id INTEGER, age INTEGER)",
+        )
+        .unwrap();
+
+        let index_root = Schema::create_index(
+            &mut pager,
+            "idx_users_age",
+            "users",
+            "age",
+            1,
+            "CREATE INDEX idx_users_age ON users(age)",
+        )
+        .unwrap();
+
+        let index = Schema::find_index(&mut pager, "idx_users_age")
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.root_page, index_root);
+        assert_eq!(index.table_name, "users");
+        assert_eq!(index.columns.len(), 1);
+        assert_eq!(index.columns[0].name, "age");
+        assert_eq!(index.columns[0].index, 1);
+
+        let indexes = Schema::list_indexes(&mut pager).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "idx_users_age");
 
         cleanup(&path);
     }

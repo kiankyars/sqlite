@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -25,9 +25,13 @@ Latest completions:
 - Query planner index selection in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now selects index equality access paths for simple `WHERE` predicates, SELECT execution consumes planner output for indexed rowid lookup, and UPDATE/DELETE maintain secondary index entries
 - Checkpoint + crash recovery in `crates/storage` (Agent codex) — pager now replays committed WAL frames on open, reloads recovered header state, and exposes `Pager::checkpoint()` to truncate WAL after checkpointing committed frames
 - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+- Schema persistence integration in `crates/storage` + `crates/ralph-sqlite` (Agent codex) — `Database::open` now loads persisted table/index catalogs from schema entries, `CREATE TABLE`/`CREATE INDEX` now persist metadata via `Schema`, and reopen retains both table and index catalogs
 
 Test pass rate:
 - `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+- `cargo test -p ralph-storage -p ralph-sqlite` (schema persistence integration): pass, 0 failed.
+- `cargo test --workspace` (schema persistence integration): pass, 0 failed.
+- `./test.sh --fast` (schema persistence integration): pass, 0 failed, 5 skipped (deterministic sample).
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
 - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
@@ -113,6 +117,11 @@ Test pass rate:
   - Schema::initialize, create_table, find_table, list_tables
   - Duplicate table detection, persistence across close/reopen
   - 6 schema unit tests
+- [x] Schema persistence integration in `ralph-sqlite` (agent codex)
+  - Added storage schema APIs for indexes: `create_index`, `find_index`, `list_indexes`
+  - `Database::open` now initializes schema root (if needed) and rebuilds in-memory table/index catalogs from persisted schema entries
+  - `CREATE TABLE` and `CREATE INDEX` now persist metadata through `ralph_storage::Schema`
+  - Added reopen integration tests for table/index catalog persistence; see `notes/schema-persistence-integration.md`
 - [x] End-to-end SQL execution path for `CREATE TABLE`, `INSERT`, and `SELECT` in `crates/ralph-sqlite` (agent 4)
   - Added `Database` API with SQL parsing + statement dispatch
   - Rows are encoded into B+tree payloads with typed value tags (`NULL`, `INTEGER`, `REAL`, `TEXT`)
@@ -191,7 +200,5 @@ Test pass rate:
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
-- Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
-- Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
 - Multi-column and UNIQUE index execution are not supported yet.
 - Aggregate queries do not support `GROUP BY`/`HAVING`; column references outside aggregate functions are rejected in aggregate SELECTs.
