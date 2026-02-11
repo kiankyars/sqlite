@@ -1246,6 +1246,12 @@ impl Database {
 
     /// Execute a SELECT with JOIN clauses.
     fn execute_select_join(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        let aggregate_select = select_uses_aggregates(&stmt);
+        let aggregate_having = stmt
+            .having
+            .as_ref()
+            .map(expr_contains_aggregate)
+            .unwrap_or(false);
         let from = stmt.from.as_ref().unwrap();
         let (joined_meta, mut joined_rows) = self.execute_join(from)?;
 
@@ -1272,23 +1278,121 @@ impl Database {
 
         // Apply WHERE filter
         if let Some(where_expr) = &stmt.where_clause {
-            joined_rows.retain(|row| {
-                match eval_join_expr(where_expr, &joined_meta, row, &table_ranges) {
-                    Ok(v) => is_truthy(&v),
-                    Err(_) => false,
+            let mut filtered = Vec::with_capacity(joined_rows.len());
+            for row in joined_rows {
+                let predicate = eval_join_expr(where_expr, &joined_meta, &row, &table_ranges)?;
+                if is_truthy(&predicate) {
+                    filtered.push(row);
                 }
-            });
+            }
+            joined_rows = filtered;
         }
 
-        // Project columns
-        let mut rows_with_order_keys: Vec<(Vec<Value>, Vec<Value>)> =
-            Vec::with_capacity(joined_rows.len());
-        for row in &joined_rows {
-            let projected = project_join_row(&stmt.columns, &joined_meta, row, &table_ranges)?;
-            let order_keys =
-                evaluate_join_order_by_keys(&stmt.order_by, &joined_meta, row, &table_ranges)?;
-            rows_with_order_keys.push((projected, order_keys));
-        }
+        let mut rows_with_order_keys = if !stmt.group_by.is_empty() {
+            let mut groups = Vec::new();
+            for row in joined_rows {
+                let key =
+                    evaluate_join_group_by_key(&stmt.group_by, &joined_meta, &row, &table_ranges)?;
+                if let Some(existing) = groups
+                    .iter_mut()
+                    .find(|candidate: &&mut GroupState| group_keys_equal(&candidate.key, &key))
+                {
+                    existing.rows.push(row);
+                } else {
+                    groups.push(GroupState {
+                        key,
+                        rows: vec![row],
+                        scalar_row_count: 0,
+                    });
+                }
+            }
+
+            let mut rows = Vec::with_capacity(groups.len());
+            for group in &groups {
+                let representative_row = group.rows.first().map(|row| row.as_slice());
+                if let Some(having_expr) = stmt.having.as_ref() {
+                    let predicate = eval_grouped_join_expr(
+                        having_expr,
+                        &joined_meta,
+                        &group.rows,
+                        representative_row,
+                        &table_ranges,
+                    )?;
+                    if !is_truthy(&predicate) {
+                        continue;
+                    }
+                }
+
+                let projected = project_grouped_join_row(
+                    &stmt.columns,
+                    &joined_meta,
+                    &group.rows,
+                    representative_row,
+                    &table_ranges,
+                )?;
+                let order_keys = evaluate_grouped_join_order_by_keys(
+                    &stmt.order_by,
+                    &joined_meta,
+                    &group.rows,
+                    representative_row,
+                    &table_ranges,
+                )?;
+                rows.push((projected, order_keys));
+            }
+            rows
+        } else {
+            let aggregate_query = aggregate_select || aggregate_having;
+            if stmt.having.is_some() && !aggregate_query {
+                return Err("HAVING clause on a non-aggregate query".to_string());
+            }
+
+            if aggregate_query {
+                let include_row = if let Some(having_expr) = stmt.having.as_ref() {
+                    let predicate = eval_join_aggregate_expr(
+                        having_expr,
+                        &joined_meta,
+                        &joined_rows,
+                        &table_ranges,
+                    )?;
+                    is_truthy(&predicate)
+                } else {
+                    true
+                };
+
+                if include_row {
+                    vec![(
+                        project_join_aggregate_row(
+                            &stmt.columns,
+                            &joined_meta,
+                            &joined_rows,
+                            &table_ranges,
+                        )?,
+                        evaluate_join_aggregate_order_by_keys(
+                            &stmt.order_by,
+                            &joined_meta,
+                            &joined_rows,
+                            &table_ranges,
+                        )?,
+                    )]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                let mut rows = Vec::with_capacity(joined_rows.len());
+                for row in &joined_rows {
+                    let projected =
+                        project_join_row(&stmt.columns, &joined_meta, row, &table_ranges)?;
+                    let order_keys = evaluate_join_order_by_keys(
+                        &stmt.order_by,
+                        &joined_meta,
+                        row,
+                        &table_ranges,
+                    )?;
+                    rows.push((projected, order_keys));
+                }
+                rows
+            }
+        };
 
         // ORDER BY
         if !stmt.order_by.is_empty() {
@@ -2345,6 +2449,409 @@ fn evaluate_join_order_by_keys(
         keys.push(eval_join_expr(&item.expr, meta, row, table_ranges)?);
     }
     Ok(keys)
+}
+
+fn evaluate_join_group_by_key(
+    group_by: &[Expr],
+    meta: &TableMeta,
+    row: &[Value],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut key = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        key.push(eval_join_expr(expr, meta, row, table_ranges)?);
+    }
+    Ok(key)
+}
+
+fn project_grouped_join_row(
+    columns: &[SelectColumn],
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    representative_row: Option<&[Value]>,
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut projected = Vec::new();
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns => {
+                let row = representative_row
+                    .ok_or_else(|| "SELECT * without FROM is not supported".to_string())?;
+                projected.extend_from_slice(row);
+            }
+            SelectColumn::Expr { expr, .. } => projected.push(eval_grouped_join_expr(
+                expr,
+                meta,
+                rows,
+                representative_row,
+                table_ranges,
+            )?),
+        }
+    }
+    Ok(projected)
+}
+
+fn evaluate_grouped_join_order_by_keys(
+    order_by: &[OrderByItem],
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    representative_row: Option<&[Value]>,
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        out.push(eval_grouped_join_expr(
+            &item.expr,
+            meta,
+            rows,
+            representative_row,
+            table_ranges,
+        )?);
+    }
+    Ok(out)
+}
+
+fn eval_grouped_join_expr(
+    expr: &Expr,
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    representative_row: Option<&[Value]>,
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Value, String> {
+    if !expr_contains_aggregate(expr) {
+        let row = representative_row.ok_or_else(|| {
+            "grouped join query requires at least one row for non-aggregate expressions".to_string()
+        })?;
+        return eval_join_expr(expr, meta, row, table_ranges);
+    }
+
+    match expr {
+        Expr::IntegerLiteral(_)
+        | Expr::FloatLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Null
+        | Expr::ColumnRef { .. } => {
+            let row = representative_row.ok_or_else(|| {
+                "grouped join query requires at least one row for non-aggregate expressions"
+                    .to_string()
+            })?;
+            eval_join_expr(expr, meta, row, table_ranges)
+        }
+        Expr::Paren(inner) => {
+            eval_grouped_join_expr(inner, meta, rows, representative_row, table_ranges)
+        }
+        Expr::UnaryOp { op, expr } => {
+            let value = eval_grouped_join_expr(expr, meta, rows, representative_row, table_ranges)?;
+            match op {
+                UnaryOperator::Negate => match value {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err("cannot negate non-numeric value".to_string()),
+                },
+                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&value)) as i64)),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lhs = eval_grouped_join_expr(left, meta, rows, representative_row, table_ranges)?;
+            let rhs = eval_grouped_join_expr(right, meta, rows, representative_row, table_ranges)?;
+            eval_binary_op(&lhs, *op, &rhs)
+        }
+        Expr::IsNull { expr, negated } => {
+            let value = eval_grouped_join_expr(expr, meta, rows, representative_row, table_ranges)?;
+            let is_null = matches!(value, Value::Null);
+            Ok(Value::Integer(
+                (if *negated { !is_null } else { is_null }) as i64,
+            ))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval_grouped_join_expr(expr, meta, rows, representative_row, table_ranges)?;
+            let low_value =
+                eval_grouped_join_expr(low, meta, rows, representative_row, table_ranges)?;
+            let high_value =
+                eval_grouped_join_expr(high, meta, rows, representative_row, table_ranges)?;
+            let ge_low =
+                compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&value, &high_value).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let between = ge_low && le_high;
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = eval_grouped_join_expr(expr, meta, rows, representative_row, table_ranges)?;
+            let mut found = false;
+            for item in list {
+                let candidate =
+                    eval_grouped_join_expr(item, meta, rows, representative_row, table_ranges)?;
+                if values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
+        }
+        Expr::FunctionCall { name, args } => {
+            if is_aggregate_function(name) {
+                eval_join_aggregate_function(name, args, meta, rows, table_ranges)
+            } else {
+                let row = representative_row.ok_or_else(|| {
+                    "grouped join query requires at least one row for non-aggregate expressions"
+                        .to_string()
+                })?;
+                eval_join_expr(expr, meta, row, table_ranges)
+            }
+        }
+    }
+}
+
+fn project_join_aggregate_row(
+    columns: &[SelectColumn],
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut projected = Vec::new();
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns => {
+                return Err("SELECT * is not supported in aggregate queries".to_string());
+            }
+            SelectColumn::Expr { expr, .. } => {
+                projected.push(eval_join_aggregate_expr(expr, meta, rows, table_ranges)?)
+            }
+        }
+    }
+    Ok(projected)
+}
+
+fn evaluate_join_aggregate_order_by_keys(
+    order_by: &[OrderByItem],
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        out.push(eval_join_aggregate_expr(
+            &item.expr,
+            meta,
+            rows,
+            table_ranges,
+        )?);
+    }
+    Ok(out)
+}
+
+fn eval_join_aggregate_expr(
+    expr: &Expr,
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Value, String> {
+    match expr {
+        Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
+        Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
+        Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
+        Expr::Null => Ok(Value::Null),
+        Expr::Paren(inner) => eval_join_aggregate_expr(inner, meta, rows, table_ranges),
+        Expr::ColumnRef { .. } => Err(
+            "column references outside aggregate functions are not supported without GROUP BY"
+                .to_string(),
+        ),
+        Expr::UnaryOp { op, expr } => {
+            let v = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
+            match op {
+                UnaryOperator::Negate => match v {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err("cannot negate non-numeric value".to_string()),
+                },
+                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&v)) as i64)),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lhs = eval_join_aggregate_expr(left, meta, rows, table_ranges)?;
+            let rhs = eval_join_aggregate_expr(right, meta, rows, table_ranges)?;
+            eval_binary_op(&lhs, *op, &rhs)
+        }
+        Expr::IsNull { expr, negated } => {
+            let v = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
+            let is_null = matches!(v, Value::Null);
+            let result = if *negated { !is_null } else { is_null };
+            Ok(Value::Integer(result as i64))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
+            let low_v = eval_join_aggregate_expr(low, meta, rows, table_ranges)?;
+            let high_v = eval_join_aggregate_expr(high, meta, rows, table_ranges)?;
+            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let between = ge_low && le_high;
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
+            let mut found = false;
+            for item in list {
+                let candidate = eval_join_aggregate_expr(item, meta, rows, table_ranges)?;
+                if values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
+        }
+        Expr::FunctionCall { name, args } => {
+            eval_join_aggregate_function(name, args, meta, rows, table_ranges)
+        }
+    }
+}
+
+fn eval_join_aggregate_function(
+    name: &str,
+    args: &[Expr],
+    meta: &TableMeta,
+    rows: &[Vec<Value>],
+    table_ranges: &[(String, usize, usize)],
+) -> Result<Value, String> {
+    if !is_aggregate_function(name) {
+        return Err(format!("function '{name}' is not supported yet"));
+    }
+
+    if name.eq_ignore_ascii_case("COUNT") {
+        if args.len() != 1 {
+            return Err("COUNT() expects exactly one argument".to_string());
+        }
+        if is_count_star_argument(&args[0]) {
+            return Ok(Value::Integer(rows.len() as i64));
+        }
+
+        validate_aggregate_argument(name, &args[0])?;
+        let mut count = 0i64;
+        for row in rows {
+            let value = eval_join_expr(&args[0], meta, row, table_ranges)?;
+            if !matches!(value, Value::Null) {
+                count += 1;
+            }
+        }
+        return Ok(Value::Integer(count));
+    }
+
+    if args.len() != 1 {
+        return Err(format!("{name}() expects exactly one argument"));
+    }
+    validate_aggregate_argument(name, &args[0])?;
+
+    if name.eq_ignore_ascii_case("SUM") {
+        let mut sum = 0.0f64;
+        let mut saw_value = false;
+        let mut all_integers = true;
+        for row in rows {
+            let value = eval_join_expr(&args[0], meta, row, table_ranges)?;
+            match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    sum += i as f64;
+                    saw_value = true;
+                }
+                Value::Real(f) => {
+                    sum += f;
+                    saw_value = true;
+                    all_integers = false;
+                }
+                Value::Text(_) => {
+                    return Err("SUM() expects numeric values".to_string());
+                }
+            }
+        }
+        if !saw_value {
+            return Ok(Value::Null);
+        }
+        return if all_integers {
+            Ok(Value::Integer(sum as i64))
+        } else {
+            Ok(Value::Real(sum))
+        };
+    }
+
+    if name.eq_ignore_ascii_case("AVG") {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for row in rows {
+            let value = eval_join_expr(&args[0], meta, row, table_ranges)?;
+            match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    sum += i as f64;
+                    count += 1;
+                }
+                Value::Real(f) => {
+                    sum += f;
+                    count += 1;
+                }
+                Value::Text(_) => {
+                    return Err("AVG() expects numeric values".to_string());
+                }
+            }
+        }
+        if count == 0 {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Real(sum / (count as f64)));
+    }
+
+    let mut best: Option<Value> = None;
+    for row in rows {
+        let value = eval_join_expr(&args[0], meta, row, table_ranges)?;
+        if matches!(value, Value::Null) {
+            continue;
+        }
+
+        match &best {
+            None => {
+                best = Some(value);
+            }
+            Some(current) => {
+                let cmp = compare_sort_values(&value, current);
+                if name.eq_ignore_ascii_case("MIN") {
+                    if cmp == std::cmp::Ordering::Less {
+                        best = Some(value);
+                    }
+                } else if cmp == std::cmp::Ordering::Greater {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(Value::Null))
 }
 
 fn select_join_output_columns(
@@ -4890,6 +5397,99 @@ mod tests {
             }
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_group_by_and_having() {
+        let path = temp_db_path("join_group_by_having");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, total INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 15), (2, 7);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT u.name, COUNT(*), SUM(o.total) \
+                 FROM users AS u JOIN orders AS o ON u.id = o.user_id \
+                 GROUP BY u.name HAVING COUNT(*) > 1 ORDER BY u.name;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Text("alice".into()),
+                        Value::Integer(2),
+                        Value::Integer(25),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_aggregate_without_group_by() {
+        let path = temp_db_path("join_aggregate_no_group");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, total INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 15), (2, 7);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT COUNT(*), SUM(o.total) \
+                 FROM users AS u JOIN orders AS o ON u.id = o.user_id \
+                 WHERE o.total >= 10;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2), Value::Integer(25)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_join_aggregate_without_group_by_rejects_bare_column() {
+        let path = temp_db_path("join_aggregate_bare_column_error");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INTEGER, total INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10);").unwrap();
+
+        let err = db
+            .execute(
+                "SELECT u.name, COUNT(*) \
+                 FROM users AS u JOIN orders AS o ON u.id = o.user_id;",
+            )
+            .unwrap_err();
+        assert!(err.contains("without GROUP BY"));
 
         cleanup(&path);
     }

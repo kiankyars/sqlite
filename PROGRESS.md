@@ -41,11 +41,14 @@ Latest completions:
 - Single-column `UNIQUE` index execution in `crates/ralph-sqlite` (Agent codex) — `CREATE UNIQUE INDEX` now builds/enforces unique secondary indexes, `INSERT`/`UPDATE` reject duplicate non-`NULL` keys with SQLite-style errors, and index uniqueness now persists across reopen via schema SQL parsing
 - INNER JOIN / CROSS JOIN execution in `crates/parser` + `crates/ralph-sqlite` (Agent opus) — parser now supports `JOIN`, `INNER JOIN`, `CROSS JOIN`, and comma cross join syntax with ON conditions and table aliases; execution performs nested-loop cross-product joins with ON/WHERE filtering, qualified column resolution, and full ORDER BY/LIMIT support
 - Multi-column secondary index execution in `crates/ralph-sqlite` + `crates/storage` (Agent codex) — `CREATE INDEX`/`CREATE UNIQUE INDEX` now execute for multi-column definitions with tuple-based backfill + INSERT/UPDATE/DELETE maintenance and tuple UNIQUE enforcement (`NULL`-tolerant), with schema reload preserving behavior across reopen
+- JOIN `GROUP BY` / `HAVING` aggregate execution in `crates/ralph-sqlite` (Agent codex) — join SELECT path now supports grouped and aggregate evaluation with HAVING/ORDER BY/LIMIT/OFFSET semantics, including aggregate HAVING without GROUP BY and SQLite-style bare-column aggregate errors; see `notes/join-group-by-having-execution.md`
 
 Recommended next step:
 - Add planner/execution support to use multi-column indexes for matching multi-column predicates.
 
 Test pass rate:
+- `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' cargo test -p ralph-sqlite` (JOIN `GROUP BY` / `HAVING` execution): pass, 0 failed (62 tests).
+- `CARGO_INCREMENTAL=0 RUSTFLAGS='-Ccodegen-units=1 -Cdebuginfo=0' ./test.sh --fast` (JOIN `GROUP BY` / `HAVING` execution, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (text index overlap key encoding): pass, 0 failed (15 tests).
 - `cargo test -p ralph-sqlite` (text index overlap key encoding): pass, 0 failed (59 tests).
 - `./test.sh --fast` (text index overlap key encoding, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
@@ -150,6 +153,7 @@ Test pass rate:
 28. ~~Single-column UNIQUE index execution~~ ✓
 29. ~~INNER JOIN / CROSS JOIN execution~~ ✓
 30. ~~Text index overlap key encoding for long shared prefixes~~ ✓
+31. ~~JOIN `GROUP BY` / `HAVING` aggregate execution~~ ✓
 
 ## Completed Tasks
 
@@ -331,6 +335,10 @@ Test pass rate:
   - UNIQUE enforcement now validates multi-column tuples (`NULL` in any indexed column bypasses uniqueness checks, matching SQLite behavior)
   - Planner access-path selection remains single-column only for now; multi-column planner support is follow-up
   - Added integration coverage plus reopen validation; see `notes/multi-column-secondary-index-execution.md`
+- [x] JOIN `GROUP BY` / `HAVING` aggregate execution (agent codex)
+  - Extended join SELECT execution to support grouped and aggregate query paths instead of non-aggregate-only projection
+  - Added join-aware grouped and aggregate expression evaluation for HAVING and ORDER BY with table-qualified column resolution
+  - Added integration coverage for join `GROUP BY` + `HAVING`, aggregate join queries without `GROUP BY`, and bare-column aggregate error behavior; see `notes/join-group-by-having-execution.md`
 
 ## Known Issues
 
@@ -338,7 +346,7 @@ Test pass rate:
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
 - Query planning currently supports single-table equality and simple range predicates on single-column secondary indexes; OR, multi-index, and cost-based planning are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
-- JOIN support is limited to INNER JOIN and CROSS JOIN; LEFT/RIGHT/FULL OUTER JOIN not implemented. Join execution uses nested-loop cross products with no index-driven optimization. Aggregate queries (GROUP BY/HAVING) are not supported with joins yet.
+- JOIN support is limited to INNER JOIN and CROSS JOIN; LEFT/RIGHT/FULL OUTER JOIN not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support
 - Multi-column indexes are maintained/enforced, but planner access-path selection still targets single-column indexes only.
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.
