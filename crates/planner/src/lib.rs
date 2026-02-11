@@ -130,6 +130,13 @@ fn estimated_access_path_cost(path: &AccessPath) -> usize {
                 14
             }
         }
+        AccessPath::IndexPrefixRange { lower, upper, .. } => {
+            match (lower.is_some(), upper.is_some()) {
+                (true, true) => 52,
+                (true, false) | (false, true) => 58,
+                (false, false) => 64,
+            }
+        }
         AccessPath::IndexRange { lower, upper, .. } => match (lower.is_some(), upper.is_some()) {
             (true, true) => 24,
             (true, false) | (false, true) => 40,
