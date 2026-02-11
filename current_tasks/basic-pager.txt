@@ -1,3 +1,0 @@
-created_at_unix=1770786594
-agent_id=2
-task=Basic pager: read/write 4KB pages, file header, page allocation

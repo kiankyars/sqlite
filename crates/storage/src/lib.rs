@@ -1,21 +1,16 @@
-/// Storage engine: pager, B+tree, and on-disk format.
-///
-/// This crate will contain:
-/// - Page cache / buffer pool (pager)
-/// - B+tree implementation for tables and indexes
-/// - On-disk file format (header, pages, freelists)
-/// - WAL and transaction support
+//! Storage engine: pager, B+tree, and on-disk format.
+//!
+//! This crate provides:
+//! - File header management (magic, page size, page count, etc.)
+//! - Page cache / buffer pool with LRU eviction (pager)
+//! - Page allocation (extend file; freelist reuse planned)
+//!
+//! Future additions:
+//! - B+tree implementation for tables and indexes
+//! - WAL and transaction support
 
-pub fn open(_path: &str) -> Result<(), String> {
-    Err("storage not yet implemented".into())
-}
+pub mod header;
+pub mod pager;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stub_returns_error() {
-        assert!(open("test.db").is_err());
-    }
-}
+pub use header::FileHeader;
+pub use pager::Pager;
