@@ -1,7 +1,14 @@
 /// SQL parser and AST definitions.
 ///
-/// This crate currently implements tokenization (lexing) and keeps a
-/// placeholder parser API for upcoming work.
+/// This crate currently implements:
+/// - SQL tokenization (lexing)
+/// - AST node types
+/// - A parser for CREATE TABLE, INSERT, and SELECT
+
+pub mod ast;
+mod parser;
+
+pub use parser::{parse, ParseError};
 
 use std::fmt;
 
@@ -85,12 +92,6 @@ impl std::error::Error for LexError {}
 
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(input).tokenize()
-}
-
-/// Parser entry point is still a placeholder while parser development
-/// happens in a dedicated task.
-pub fn parse(_input: &str) -> Result<(), String> {
-    Err("parser not yet implemented".into())
 }
 
 struct Lexer<'a> {
@@ -497,6 +498,10 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{
+        BinaryOperator, ColumnDef, CreateTableStatement, Expr, InsertStatement, SelectItem,
+        SelectStatement, Statement,
+    };
 
     fn kinds(sql: &str) -> Vec<TokenKind> {
         tokenize(sql)
@@ -620,7 +625,73 @@ mod tests {
     }
 
     #[test]
-    fn stub_parser_returns_error() {
-        assert!(parse("SELECT 1").is_err());
+    fn parse_create_table() {
+        let statement = parse("CREATE TABLE users (id INTEGER, name TEXT);").unwrap();
+        assert_eq!(
+            statement,
+            Statement::CreateTable(CreateTableStatement {
+                table_name: "users".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        data_type: "INTEGER".to_string(),
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        data_type: "TEXT".to_string(),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_insert_with_explicit_columns() {
+        let statement = parse("INSERT INTO users (id, name) VALUES (1, 'Alice');").unwrap();
+        assert_eq!(
+            statement,
+            Statement::Insert(InsertStatement {
+                table_name: "users".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                values: vec![Expr::Integer(1), Expr::String("Alice".to_string())],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_select_with_arithmetic_and_from() {
+        let statement = parse("SELECT 1 + 2, name FROM users;").unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select(SelectStatement {
+                projection: vec![
+                    SelectItem::Expr(Expr::Binary {
+                        left: Box::new(Expr::Integer(1)),
+                        op: BinaryOperator::Add,
+                        right: Box::new(Expr::Integer(2)),
+                    }),
+                    SelectItem::Expr(Expr::Identifier("name".to_string())),
+                ],
+                from: Some("users".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_select_star() {
+        let statement = parse("SELECT * FROM users").unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select(SelectStatement {
+                projection: vec![SelectItem::Wildcard],
+                from: Some("users".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_statement() {
+        let err = parse("DROP TABLE users;").unwrap_err();
+        assert!(err.message().contains("unexpected token"));
     }
 }

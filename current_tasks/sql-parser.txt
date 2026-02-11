@@ -1,3 +1,0 @@
-created_at_unix=1770786609
-agent_id=4
-task=SQL parser for CREATE TABLE, INSERT, SELECT
