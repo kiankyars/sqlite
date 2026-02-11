@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/parser",
+    "crates/planner",
+    "crates/executor",
+    "crates/storage",
+    "crates/ralph-sqlite",
+]
+resolver = "2"
