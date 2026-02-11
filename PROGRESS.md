@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus simple cost heuristics for table-scan vs index-path selection for SELECT/UPDATE/DELETE are implemented.
+**Phase: Stage 6 (partial)** — Tokenizer/parser, pager, B+tree, schema table + catalog persistence integration, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE/`DROP TABLE`/`DROP INDEX` execution, single-column and multi-column secondary index execution (including `UNIQUE` enforcement), SELECT `ORDER BY`/`LIMIT`/aggregates/`GROUP BY`/`HAVING`, INNER JOIN / CROSS JOIN / LEFT JOIN execution, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection (single-column equality/`IN`/range + OR unions + AND intersections + multi-column equality/prefix-range) plus statistics-aware cost selection for table-scan vs index paths for SELECT/UPDATE/DELETE are implemented.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
@@ -50,6 +50,7 @@ Latest completions:
 - Planner cost heuristics for table-scan vs index-path selection in `crates/planner` (Agent 3) — planner now estimates static access-path costs and falls back to `TableScan` for high-fanout `IndexOr`/`IndexAnd` shapes while keeping small fanout index probes; see `notes/planner-cost-heuristics-selection.md`
 - Multi-column prefix/range planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now emits `IndexPrefixRange` for left-prefix equality predicates (with optional range bounds on the next index column), and SELECT/UPDATE/DELETE now evaluate those candidates against decoded tuple buckets from multi-column indexes; see `notes/multi-column-prefix-range-planner-execution.md`
 - Multi-column prefix/range scan-reduction heuristics in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now penalizes weak `IndexPrefixRange` probes that imply full composite-index scans, falls back to `TableScan` for low-selectivity prefix-only forms, and retains bounded prefix/range usage; see `notes/multi-column-prefix-range-scan-reduction.md`
+- Planner statistics-driven cost model for table-scan vs index-path selection in `crates/planner` + `crates/ralph-sqlite` (Agent 3) — added `plan_where_with_stats`/`plan_select_with_stats` plus runtime table/index cardinality hints from `ralph-sqlite`, with legacy static heuristics preserved when stats are absent; see `notes/planner-statistics-cost-model.md`
 
 Recommended next step:
 - Improve cost-based planning with data/statistics-driven estimates (cardinality/selectivity aware index-vs-table decisions).
@@ -59,6 +60,9 @@ Test pass rate:
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner/execution compatibility for prefix/range scan-reduction): pass, 0 failed (86 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test --workspace` (full regression after prefix/range scan-reduction): pass, 0 failed (256 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (prefix/range scan-reduction, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner statistics-driven cost model): pass, 0 failed (31 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner statistics integration): pass, 0 failed (82 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner statistics integration, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner cost heuristics): pass, 0 failed (29 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner cost heuristics compatibility): pass, 0 failed (82 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner cost heuristics, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
@@ -189,6 +193,7 @@ Test pass rate:
 35. ~~Planner/execution support for multi-index AND-intersection predicates~~ ✓
 36. ~~Simple planner cost heuristics for table scan vs index path selection~~ ✓
 37. ~~Planner/execution support for multi-column index left-prefix/range predicates~~ ✓
+38. ~~Planner statistics-driven cost model for table scan vs index path selection~~ ✓
 
 ## Completed Tasks
 
@@ -399,12 +404,17 @@ Test pass rate:
   - Added planner `AccessPath::IndexPrefixRange` for multi-column indexes when left-prefix equality predicates are present, with optional range predicates on the next index column
   - Added `ralph-sqlite` execution support to scan/decode multi-column tuple buckets and apply prefix/range filtering for candidate rowid collection in SELECT/UPDATE/DELETE
   - Added planner + integration coverage; see `notes/multi-column-prefix-range-planner-execution.md`
+- [x] Planner statistics-driven cost model for table scan vs index path selection (agent 3)
+  - Added `PlannerStats`/`IndexStats` and stats-aware APIs (`plan_where_with_stats`, `plan_select_with_stats`) in `crates/planner`
+  - Kept legacy `plan_where`/`plan_select` behavior unchanged for call sites that do not provide stats
+  - Wired `ralph-sqlite` to collect runtime table/index cardinality estimates and pass them to planner for SELECT/UPDATE/DELETE
+  - Added planner coverage for stats-driven high-cardinality and low-cardinality path choices; see `notes/planner-statistics-cost-model.md`
 
 ## Known Issues
 
 - Dirty-page eviction now preserves rollback correctness by spilling uncommitted page bytes in memory; long-running write transactions can still increase memory usage if many dirty pages are evicted before commit.
 - UPDATE/DELETE use index-driven row selection when a suitable equality or simple range index predicate exists; they fall back to full table scan otherwise.
-- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and simple static cost heuristics for table-scan vs index-path selection; statistics-driven cost-based planning is not implemented.
+- Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection; persisted histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support includes INNER JOIN, CROSS JOIN, and LEFT JOIN; RIGHT/FULL OUTER JOIN are not implemented. Join execution uses nested-loop cross products with no index-driven optimization.
 - No subquery support

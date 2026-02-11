@@ -15,7 +15,10 @@ use ralph_parser::ast::{
     DropTableStmt, Expr, InsertStmt, JoinType, OrderByItem, SelectColumn, SelectStmt, Stmt,
     TypeName, UnaryOperator, UpdateStmt,
 };
-use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
+use ralph_planner::{
+    plan_select_with_stats, plan_where_with_stats, AccessPath, IndexInfo,
+    IndexStats as PlannerIndexStats, PlannerStats,
+};
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager, Schema};
 
@@ -553,7 +556,13 @@ impl Database {
         let table_indexes = self.indexes_for_table(&table_key);
 
         let planner_indexes = self.planner_indexes_for_table(&table_key);
-        let access_path = plan_where(stmt.where_clause.as_ref(), &meta.name, &planner_indexes);
+        let planner_stats = self.planner_stats_for_table(&meta, &planner_indexes);
+        let access_path = plan_where_with_stats(
+            stmt.where_clause.as_ref(),
+            &meta.name,
+            &planner_indexes,
+            Some(&planner_stats),
+        );
         let entries = self.read_candidate_entries(&meta, &access_path)?;
         let mut planned_updates = Vec::new();
 
@@ -613,7 +622,13 @@ impl Database {
         let table_indexes = self.indexes_for_table(&table_key);
 
         let planner_indexes = self.planner_indexes_for_table(&table_key);
-        let access_path = plan_where(stmt.where_clause.as_ref(), &meta.name, &planner_indexes);
+        let planner_stats = self.planner_stats_for_table(&meta, &planner_indexes);
+        let access_path = plan_where_with_stats(
+            stmt.where_clause.as_ref(),
+            &meta.name,
+            &planner_indexes,
+            Some(&planner_stats),
+        );
         let entries = self.read_candidate_entries(&meta, &access_path)?;
         let mut rows_affected = 0usize;
 
@@ -680,7 +695,9 @@ impl Database {
         let table_meta = table_ctx.as_ref().map(|(_, meta)| meta);
         let access_path = if let Some((table_key, meta)) = table_ctx.as_ref() {
             let planner_indexes = self.planner_indexes_for_table(table_key);
-            plan_select(&stmt, &meta.name, &planner_indexes).access_path
+            let planner_stats = self.planner_stats_for_table(meta, &planner_indexes);
+            plan_select_with_stats(&stmt, &meta.name, &planner_indexes, Some(&planner_stats))
+                .access_path
         } else {
             AccessPath::TableScan
         };
@@ -1241,6 +1258,62 @@ impl Database {
             .collect();
         planner_indexes.sort_by(|left, right| left.name.cmp(&right.name));
         planner_indexes
+    }
+
+    fn planner_stats_for_table(
+        &mut self,
+        table_meta: &TableMeta,
+        planner_indexes: &[IndexInfo],
+    ) -> PlannerStats {
+        let estimated_table_rows = self.estimate_tree_entry_count(table_meta.root_page).ok();
+        let mut index_stats = Vec::new();
+
+        for planner_index in planner_indexes {
+            let idx_key = normalize_identifier(&planner_index.name);
+            let Some(root_page) = self.indexes.get(&idx_key).map(|meta| meta.root_page) else {
+                continue;
+            };
+            if let Ok((estimated_rows, estimated_distinct_keys)) =
+                self.estimate_index_cardinality(root_page)
+            {
+                index_stats.push(PlannerIndexStats {
+                    index_name: planner_index.name.clone(),
+                    estimated_rows,
+                    estimated_distinct_keys,
+                });
+            }
+        }
+
+        PlannerStats {
+            estimated_table_rows,
+            index_stats,
+        }
+    }
+
+    fn estimate_tree_entry_count(&mut self, root_page: PageNum) -> Result<usize, String> {
+        let mut tree = BTree::new(&mut self.pager, root_page);
+        tree.scan_all()
+            .map(|entries| entries.len())
+            .map_err(|e| format!("scan tree rows: {e}"))
+    }
+
+    fn estimate_index_cardinality(&mut self, root_page: PageNum) -> Result<(usize, usize), String> {
+        let mut tree = BTree::new(&mut self.pager, root_page);
+        let entries = tree
+            .scan_all()
+            .map_err(|e| format!("scan index rows: {e}"))?;
+
+        let mut estimated_rows = 0usize;
+        let mut estimated_distinct_keys = 0usize;
+        for entry in entries {
+            let buckets = decode_index_payload(&entry.payload).map_err(|e| e.to_string())?;
+            estimated_distinct_keys = estimated_distinct_keys.saturating_add(buckets.len());
+            for bucket in buckets {
+                estimated_rows = estimated_rows.saturating_add(bucket.rowids.len());
+            }
+        }
+
+        Ok((estimated_rows, estimated_distinct_keys))
     }
 
     fn read_rows_for_select(
@@ -3633,6 +3706,7 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ralph_planner::{plan_select, plan_where};
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};

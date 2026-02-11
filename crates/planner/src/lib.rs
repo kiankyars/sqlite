@@ -15,8 +15,18 @@ pub fn plan_where(
     table_name: &str,
     indexes: &[IndexInfo],
 ) -> AccessPath {
+    plan_where_with_stats(where_clause, table_name, indexes, None)
+}
+
+/// Plan an access path from an arbitrary WHERE clause with optional table/index stats.
+pub fn plan_where_with_stats(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
+) -> AccessPath {
     where_clause
-        .and_then(|expr| choose_index_access(expr, table_name, indexes))
+        .and_then(|expr| choose_index_access(expr, table_name, indexes, stats))
         .unwrap_or(AccessPath::TableScan)
 }
 
@@ -25,6 +35,20 @@ pub struct IndexInfo {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
+}
+
+/// Lightweight optional planner statistics used for cost estimation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlannerStats {
+    pub estimated_table_rows: Option<usize>,
+    pub index_stats: Vec<IndexStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStats {
+    pub index_name: String,
+    pub estimated_rows: usize,
+    pub estimated_distinct_keys: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,17 +92,31 @@ pub struct SelectPlan {
 }
 
 pub fn plan_select(stmt: &SelectStmt, table_name: &str, indexes: &[IndexInfo]) -> SelectPlan {
+    plan_select_with_stats(stmt, table_name, indexes, None)
+}
+
+pub fn plan_select_with_stats(
+    stmt: &SelectStmt,
+    table_name: &str,
+    indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
+) -> SelectPlan {
     let access_path = stmt
         .where_clause
         .as_ref()
-        .and_then(|expr| choose_index_access(expr, table_name, indexes))
+        .and_then(|expr| choose_index_access(expr, table_name, indexes, stats))
         .unwrap_or(AccessPath::TableScan);
     SelectPlan { access_path }
 }
 
-fn choose_index_access(expr: &Expr, table_name: &str, indexes: &[IndexInfo]) -> Option<AccessPath> {
-    let index_path = choose_index_access_raw(expr, table_name, indexes)?;
-    if estimated_access_path_cost(&index_path) >= estimated_table_scan_cost() {
+fn choose_index_access(
+    expr: &Expr,
+    table_name: &str,
+    indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
+) -> Option<AccessPath> {
+    let index_path = choose_index_access_raw(expr, table_name, indexes, stats)?;
+    if estimated_access_path_cost(&index_path, stats) >= estimated_table_scan_cost(stats) {
         None
     } else {
         Some(index_path)
@@ -89,9 +127,10 @@ fn choose_index_access_raw(
     expr: &Expr,
     table_name: &str,
     indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
 ) -> Option<AccessPath> {
     match expr {
-        Expr::Paren(inner) => choose_index_access_raw(inner, table_name, indexes),
+        Expr::Paren(inner) => choose_index_access_raw(inner, table_name, indexes, stats),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
@@ -99,16 +138,16 @@ fn choose_index_access_raw(
         } => {
             let eq_path = choose_index_eq_access(expr, table_name, indexes)
                 .or_else(|| choose_index_prefix_range_access(expr, table_name, indexes));
-            let and_path = choose_index_and_access(expr, table_name, indexes);
+            let and_path = choose_index_and_access(expr, table_name, indexes, stats);
             choose_preferred_and_path(eq_path, and_path).or_else(|| {
-                choose_index_access_raw(left, table_name, indexes)
-                    .or_else(|| choose_index_access_raw(right, table_name, indexes))
+                choose_index_access_raw(left, table_name, indexes, stats)
+                    .or_else(|| choose_index_access_raw(right, table_name, indexes, stats))
             })
         }
         Expr::BinaryOp {
             op: BinaryOperator::Or,
             ..
-        } => choose_index_or_access(expr, table_name, indexes),
+        } => choose_index_or_access(expr, table_name, indexes, stats),
         _ => choose_index_eq_access(expr, table_name, indexes)
             .or_else(|| choose_index_in_access(expr, table_name, indexes))
             .or_else(|| choose_index_prefix_range_access(expr, table_name, indexes))
@@ -116,18 +155,31 @@ fn choose_index_access_raw(
     }
 }
 
-fn estimated_table_scan_cost() -> usize {
-    100
+const LEGACY_TABLE_SCAN_COST: f64 = 100.0;
+const DEFAULT_ESTIMATED_TABLE_ROWS: f64 = 1000.0;
+
+fn estimated_table_scan_cost(stats: Option<&PlannerStats>) -> f64 {
+    stats
+        .and_then(|s| s.estimated_table_rows)
+        .map(|rows| rows.max(1) as f64)
+        .unwrap_or(LEGACY_TABLE_SCAN_COST)
 }
 
-fn estimated_access_path_cost(path: &AccessPath) -> usize {
+fn estimated_access_path_cost(path: &AccessPath, stats: Option<&PlannerStats>) -> f64 {
+    match stats {
+        Some(stats) => estimate_access_path_with_stats(path, stats).cost,
+        None => estimated_access_path_cost_legacy(path),
+    }
+}
+
+fn estimated_access_path_cost_legacy(path: &AccessPath) -> f64 {
     match path {
-        AccessPath::TableScan => estimated_table_scan_cost(),
+        AccessPath::TableScan => LEGACY_TABLE_SCAN_COST,
         AccessPath::IndexEq { columns, .. } => {
             if columns.len() > 1 {
-                10
+                10.0
             } else {
-                14
+                14.0
             }
         }
         AccessPath::IndexPrefixRange {
@@ -148,23 +200,163 @@ fn estimated_access_path_cost(path: &AccessPath) -> usize {
             cost
         }
         AccessPath::IndexRange { lower, upper, .. } => match (lower.is_some(), upper.is_some()) {
-            (true, true) => 24,
-            (true, false) | (false, true) => 40,
-            (false, false) => 95,
+            (true, true) => 24.0,
+            (true, false) | (false, true) => 40.0,
+            (false, false) => 95.0,
         },
         AccessPath::IndexOr { branches } => {
-            6 + branches
+            6.0 + branches
                 .iter()
-                .map(|branch| estimated_access_path_cost(branch) + 3)
-                .sum::<usize>()
+                .map(|branch| estimated_access_path_cost_legacy(branch) + 3.0)
+                .sum::<f64>()
         }
         AccessPath::IndexAnd { branches } => {
-            8 + branches
+            8.0 + branches
                 .iter()
-                .map(|branch| estimated_access_path_cost(branch) + 3)
-                .sum::<usize>()
+                .map(|branch| estimated_access_path_cost_legacy(branch) + 3.0)
+                .sum::<f64>()
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CostEstimate {
+    cost: f64,
+    output_rows: f64,
+}
+
+fn estimate_access_path_with_stats(path: &AccessPath, stats: &PlannerStats) -> CostEstimate {
+    let table_rows = stats
+        .estimated_table_rows
+        .map(|rows| rows.max(1) as f64)
+        .unwrap_or(DEFAULT_ESTIMATED_TABLE_ROWS);
+
+    match path {
+        AccessPath::TableScan => CostEstimate {
+            cost: table_rows,
+            output_rows: table_rows,
+        },
+        AccessPath::IndexEq {
+            index_name,
+            columns,
+            ..
+        } => {
+            let fallback_selectivity = if columns.len() > 1 { 0.04 } else { 0.12 };
+            let output_rows = estimate_index_eq_rows(stats, index_name, table_rows, fallback_selectivity);
+            CostEstimate {
+                cost: 8.0 + output_rows,
+                output_rows,
+            }
+        }
+        AccessPath::IndexPrefixRange {
+            index_name,
+            lower,
+            upper,
+            ..
+        } => {
+            let fallback_selectivity = match (lower.is_some(), upper.is_some()) {
+                (true, true) => 0.10,
+                (true, false) | (false, true) => 0.20,
+                (false, false) => 0.35,
+            };
+            let output_rows =
+                estimate_index_range_rows(stats, index_name, table_rows, fallback_selectivity);
+            CostEstimate {
+                cost: 9.0 + output_rows * 0.75,
+                output_rows,
+            }
+        }
+        AccessPath::IndexRange {
+            index_name,
+            lower,
+            upper,
+            ..
+        } => {
+            let fallback_selectivity = match (lower.is_some(), upper.is_some()) {
+                (true, true) => 0.20,
+                (true, false) | (false, true) => 0.45,
+                (false, false) => 0.95,
+            };
+            let output_rows =
+                estimate_index_range_rows(stats, index_name, table_rows, fallback_selectivity);
+            CostEstimate {
+                cost: 10.0 + output_rows * 0.9,
+                output_rows,
+            }
+        }
+        AccessPath::IndexOr { branches } => {
+            let mut branch_cost = 0.0;
+            let mut branch_rows_sum = 0.0;
+            for branch in branches {
+                let est = estimate_access_path_with_stats(branch, stats);
+                branch_cost += est.cost;
+                branch_rows_sum += est.output_rows;
+            }
+            let output_rows = branch_rows_sum.min(table_rows).max(1.0);
+            CostEstimate {
+                cost: 5.0 + branch_cost + output_rows * 0.15,
+                output_rows,
+            }
+        }
+        AccessPath::IndexAnd { branches } => {
+            let mut branch_cost = 0.0;
+            let mut min_rows: Option<f64> = None;
+            for branch in branches {
+                let est = estimate_access_path_with_stats(branch, stats);
+                branch_cost += est.cost;
+                min_rows = Some(min_rows.map_or(est.output_rows, |cur| cur.min(est.output_rows)));
+            }
+            let mut output_rows = min_rows.unwrap_or(table_rows);
+            if branches.len() > 1 {
+                output_rows = (output_rows / 2f64.powi((branches.len() - 1) as i32)).max(1.0);
+            }
+            CostEstimate {
+                cost: 7.0 + branch_cost + output_rows * 0.3,
+                output_rows,
+            }
+        }
+    }
+}
+
+fn estimate_index_eq_rows(
+    stats: &PlannerStats,
+    index_name: &str,
+    table_rows: f64,
+    fallback_selectivity: f64,
+) -> f64 {
+    let fallback = (table_rows * fallback_selectivity).max(1.0);
+    let Some(index_stats) = find_index_stats(stats, index_name) else {
+        return fallback.min(table_rows);
+    };
+    if index_stats.estimated_rows == 0 || index_stats.estimated_distinct_keys == 0 {
+        return fallback.min(table_rows);
+    }
+    let rows = (index_stats.estimated_rows as f64 / index_stats.estimated_distinct_keys as f64)
+        .max(1.0);
+    rows.min(table_rows)
+}
+
+fn estimate_index_range_rows(
+    stats: &PlannerStats,
+    index_name: &str,
+    table_rows: f64,
+    fallback_selectivity: f64,
+) -> f64 {
+    let fallback = (table_rows * fallback_selectivity).max(1.0);
+    let Some(index_stats) = find_index_stats(stats, index_name) else {
+        return fallback.min(table_rows);
+    };
+    if index_stats.estimated_rows == 0 {
+        return 1.0;
+    }
+    fallback.min(index_stats.estimated_rows as f64).max(1.0).min(table_rows)
+}
+
+fn find_index_stats<'a>(stats: &'a PlannerStats, index_name: &str) -> Option<&'a IndexStats> {
+    stats
+        .index_stats
+        .iter()
+        .find(|candidate| candidate.index_name.eq_ignore_ascii_case(index_name))
 }
 
 fn choose_preferred_and_path(
@@ -324,6 +516,7 @@ fn choose_index_or_access(
     expr: &Expr,
     table_name: &str,
     indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
 ) -> Option<AccessPath> {
     let mut terms = Vec::new();
     collect_or_terms(expr, &mut terms);
@@ -333,7 +526,7 @@ fn choose_index_or_access(
 
     let mut branches = Vec::with_capacity(terms.len());
     for term in terms {
-        let branch = choose_index_access(term, table_name, indexes)?;
+        let branch = choose_index_access(term, table_name, indexes, stats)?;
         match branch {
             AccessPath::IndexOr { branches: nested } => branches.extend(nested),
             other => branches.push(other),
@@ -351,6 +544,7 @@ fn choose_index_and_access(
     expr: &Expr,
     table_name: &str,
     indexes: &[IndexInfo],
+    stats: Option<&PlannerStats>,
 ) -> Option<AccessPath> {
     let mut terms = Vec::new();
     collect_and_terms(expr, &mut terms);
@@ -360,7 +554,7 @@ fn choose_index_and_access(
 
     let mut branches = Vec::with_capacity(terms.len());
     for term in terms {
-        let branch = choose_index_access(term, table_name, indexes);
+        let branch = choose_index_access(term, table_name, indexes, stats);
         match branch {
             Some(AccessPath::IndexAnd { branches: nested }) => {
                 for nested_branch in nested {
@@ -1461,6 +1655,39 @@ mod tests {
             "SELECT * FROM t WHERE c1 = 1 AND c2 = 2 AND c3 = 3 AND c4 = 4 AND c5 = 5 AND c6 = 6;",
         );
         let path = plan_where(where_expr.as_ref(), "t", &indexes);
+        assert_eq!(path, AccessPath::TableScan);
+    }
+
+    #[test]
+    fn plan_where_with_stats_keeps_large_in_probe_for_selective_index() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score IN (1, 2, 3, 4, 5, 6);");
+        let stats = PlannerStats {
+            estimated_table_rows: Some(10_000),
+            index_stats: vec![IndexStats {
+                index_name: "idx_t_score".to_string(),
+                estimated_rows: 10_000,
+                estimated_distinct_keys: 10_000,
+            }],
+        };
+        let path = plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
+        assert!(matches!(
+            path,
+            AccessPath::IndexOr { branches } if branches.len() == 6
+        ));
+    }
+
+    #[test]
+    fn plan_where_with_stats_falls_back_for_low_cardinality_index_eq() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 42;");
+        let stats = PlannerStats {
+            estimated_table_rows: Some(1_000),
+            index_stats: vec![IndexStats {
+                index_name: "idx_t_score".to_string(),
+                estimated_rows: 1_000,
+                estimated_distinct_keys: 1,
+            }],
+        };
+        let path = plan_where_with_stats(where_expr.as_ref(), "t", &default_indexes(), Some(&stats));
         assert_eq!(path, AccessPath::TableScan);
     }
 }
