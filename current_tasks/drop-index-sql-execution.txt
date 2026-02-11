@@ -1,3 +1,0 @@
-created_at_unix=1739246400
-agent_id=opus
-task=Implement DROP INDEX SQL parsing and execution with page reclamation
