@@ -8,11 +8,13 @@ Latest completions (2026-02-11):
 - SQL tokenizer (lexer) implemented in `crates/parser`.
 - Parser + AST implemented for `CREATE TABLE`, `INSERT`, and `SELECT` in `crates/parser`.
 - Basic pager with buffer pool implemented in `crates/storage`.
+- Added dedicated AST structural tests in `crates/parser/src/ast.rs`.
 
 Current test pass rate:
 - `cargo test --workspace`: passing.
 - `./test.sh` (full): 5/5 passed (latest full-harness run from pager task).
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, deterministic sampling skipped all checks.
+- `./test.sh --fast` (AGENT_ID=3): 1 passed, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
