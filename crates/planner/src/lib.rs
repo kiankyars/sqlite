@@ -130,12 +130,22 @@ fn estimated_access_path_cost(path: &AccessPath) -> usize {
                 14
             }
         }
-        AccessPath::IndexPrefixRange { lower, upper, .. } => {
-            match (lower.is_some(), upper.is_some()) {
-                (true, true) => 52,
-                (true, false) | (false, true) => 58,
-                (false, false) => 64,
+        AccessPath::IndexPrefixRange {
+            eq_prefix_value_exprs,
+            lower,
+            upper,
+            ..
+        } => {
+            // Prefix/range probes currently require scanning composite-index entries.
+            // Penalize weak prefixes so planner can fall back to cheaper paths.
+            let mut cost = 126usize.saturating_sub(eq_prefix_value_exprs.len() * 18);
+            if lower.is_some() {
+                cost = cost.saturating_sub(14);
             }
+            if upper.is_some() {
+                cost = cost.saturating_sub(14);
+            }
+            cost
         }
         AccessPath::IndexRange { lower, upper, .. } => match (lower.is_some(), upper.is_some()) {
             (true, true) => 24,
@@ -166,12 +176,19 @@ fn choose_preferred_and_path(
             let prefers_eq = matches!(
                 &eq_path,
                 AccessPath::IndexEq { columns, .. } if columns.len() > 1
-            ) || matches!(&eq_path, AccessPath::IndexPrefixRange { .. });
+            );
             if prefers_eq {
-                Some(eq_path)
-            } else {
-                Some(and_path)
+                return Some(eq_path);
             }
+
+            if matches!(&eq_path, AccessPath::IndexPrefixRange { .. }) {
+                if estimated_access_path_cost(&eq_path) <= estimated_access_path_cost(&and_path) {
+                    return Some(eq_path);
+                }
+                return Some(and_path);
+            }
+
+            Some(and_path)
         }
         (_, Some(and_path)) => Some(and_path),
         (eq_path, None) => eq_path,
@@ -1019,19 +1036,10 @@ mod tests {
     }
 
     #[test]
-    fn chooses_multi_column_index_prefix_for_leading_equality() {
+    fn falls_back_for_weak_multi_column_index_prefix_without_range() {
         let stmt = parse_select("SELECT * FROM t WHERE score = 9;");
         let plan = plan_select(&stmt, "t", &composite_only_indexes());
-        assert_eq!(
-            plan.access_path,
-            AccessPath::IndexPrefixRange {
-                index_name: "idx_t_score_age".to_string(),
-                columns: vec!["score".to_string(), "age".to_string()],
-                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(9)],
-                lower: None,
-                upper: None,
-            }
-        );
+        assert_eq!(plan.access_path, AccessPath::TableScan);
     }
 
     #[test]
@@ -1291,6 +1299,13 @@ mod tests {
                 upper: None,
             }
         );
+    }
+
+    #[test]
+    fn plan_where_falls_back_for_weak_multi_column_prefix_without_range() {
+        let where_expr = parse_where("SELECT * FROM t WHERE score = 100;");
+        let path = plan_where(where_expr.as_ref(), "t", &composite_only_indexes());
+        assert_eq!(path, AccessPath::TableScan);
     }
 
     #[test]

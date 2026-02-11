@@ -5133,7 +5133,7 @@ mod tests {
     }
 
     #[test]
-    fn select_plans_multi_column_index_prefix_for_leading_equality() {
+    fn select_falls_back_for_weak_multi_column_index_prefix_without_range() {
         let path = temp_db_path("select_multi_column_prefix_plan");
         let mut db = Database::open(&path).unwrap();
 
@@ -5152,16 +5152,7 @@ mod tests {
         };
         let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
         let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
-        assert_eq!(
-            access_path,
-            AccessPath::IndexPrefixRange {
-                index_name: "idx_users_score_age".to_string(),
-                columns: vec!["score".to_string(), "age".to_string()],
-                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(10)],
-                lower: None,
-                upper: None,
-            }
-        );
+        assert_eq!(access_path, AccessPath::TableScan);
 
         let selected = db
             .execute("SELECT id FROM users WHERE score = 10 ORDER BY id;")
@@ -5192,6 +5183,33 @@ mod tests {
             "INSERT INTO users VALUES (1, 10, 20), (2, 10, 21), (3, 10, 25), (4, 10, 30), (5, 11, 24);",
         )
         .unwrap();
+
+        let stmt = match ralph_parser::parse(
+            "SELECT id FROM users WHERE score = 10 AND age >= 21 AND age < 30 ORDER BY id;",
+        )
+        .unwrap()
+        {
+            Stmt::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
+        let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
+        assert_eq!(
+            access_path,
+            AccessPath::IndexPrefixRange {
+                index_name: "idx_users_score_age".to_string(),
+                columns: vec!["score".to_string(), "age".to_string()],
+                eq_prefix_value_exprs: vec![Expr::IntegerLiteral(10)],
+                lower: Some(ralph_planner::RangeBound {
+                    value_expr: Expr::IntegerLiteral(21),
+                    inclusive: true,
+                }),
+                upper: Some(ralph_planner::RangeBound {
+                    value_expr: Expr::IntegerLiteral(30),
+                    inclusive: false,
+                }),
+            }
+        );
 
         let selected = db
             .execute(
@@ -5392,13 +5410,14 @@ mod tests {
         )
         .unwrap();
 
-        let stmt =
-            match ralph_parser::parse("SELECT id FROM users WHERE score IN (10, 30, 10) ORDER BY id;")
-                .unwrap()
-            {
-                Stmt::Select(stmt) => stmt,
-                other => panic!("expected SELECT statement, got {other:?}"),
-            };
+        let stmt = match ralph_parser::parse(
+            "SELECT id FROM users WHERE score IN (10, 30, 10) ORDER BY id;",
+        )
+        .unwrap()
+        {
+            Stmt::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
         let planner_indexes = db.planner_indexes_for_table(&normalize_identifier("users"));
         let access_path = plan_select(&stmt, "users", &planner_indexes).access_path;
         assert_eq!(

@@ -49,11 +49,16 @@ Latest completions:
 - Multi-index `AND`-intersection planning/execution in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now emits `IndexAnd` for multi-term indexable conjunctions, execution now intersects branch-selected rowids before table lookup for SELECT/UPDATE/DELETE candidate reads, and composite equality indexes remain preferred when available; see `notes/multi-index-and-intersection-selection.md`
 - Planner cost heuristics for table-scan vs index-path selection in `crates/planner` (Agent 3) — planner now estimates static access-path costs and falls back to `TableScan` for high-fanout `IndexOr`/`IndexAnd` shapes while keeping small fanout index probes; see `notes/planner-cost-heuristics-selection.md`
 - Multi-column prefix/range planner/execution support in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now emits `IndexPrefixRange` for left-prefix equality predicates (with optional range bounds on the next index column), and SELECT/UPDATE/DELETE now evaluate those candidates against decoded tuple buckets from multi-column indexes; see `notes/multi-column-prefix-range-planner-execution.md`
+- Multi-column prefix/range scan-reduction heuristics in `crates/planner` + `crates/ralph-sqlite` (Agent 4) — planner now penalizes weak `IndexPrefixRange` probes that imply full composite-index scans, falls back to `TableScan` for low-selectivity prefix-only forms, and retains bounded prefix/range usage; see `notes/multi-column-prefix-range-scan-reduction.md`
 
 Recommended next step:
-- Improve cost-based planning with data/statistics-driven estimates and reduce multi-column prefix/range full-index scans.
+- Improve cost-based planning with data/statistics-driven estimates (cardinality/selectivity aware index-vs-table decisions).
 
 Test pass rate:
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (multi-column prefix/range scan-reduction heuristics): pass, 0 failed (33 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner/execution compatibility for prefix/range scan-reduction): pass, 0 failed (86 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test --workspace` (full regression after prefix/range scan-reduction): pass, 0 failed (256 tests).
+- `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (prefix/range scan-reduction, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner` (planner cost heuristics): pass, 0 failed (29 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-sqlite` (planner cost heuristics compatibility): pass, 0 failed (82 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner cost heuristics, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
