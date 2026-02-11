@@ -10,6 +10,7 @@ use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, Expr, InsertStmt,
     OrderByItem, SelectColumn, SelectStmt, Stmt, UnaryOperator, UpdateStmt,
 };
+use ralph_planner::{plan_select, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
 
@@ -350,6 +351,70 @@ impl Database {
         Ok(())
     }
 
+    fn index_rowids_for_value(
+        &mut self,
+        index_meta: &IndexMeta,
+        value: &Value,
+    ) -> Result<Vec<i64>, String> {
+        let key = index_key_for_value(value)?;
+        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
+        let Some(payload) = tree
+            .lookup(key)
+            .map_err(|e| format!("lookup index entry: {e}"))?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let buckets = decode_index_payload(&payload)?;
+        Ok(buckets
+            .into_iter()
+            .find(|bucket| values_equal(&bucket.value, value))
+            .map(|bucket| bucket.rowids)
+            .unwrap_or_default())
+    }
+
+    fn index_delete_row(
+        &mut self,
+        index_meta: &IndexMeta,
+        rowid: i64,
+        row: &[Value],
+    ) -> Result<(), String> {
+        let value = row.get(index_meta.column_idx).ok_or_else(|| {
+            format!(
+                "row missing indexed column '{}' for index on '{}'",
+                index_meta.column, index_meta.table_name
+            )
+        })?;
+
+        let key = index_key_for_value(value)?;
+        let mut tree = BTree::new(&mut self.pager, index_meta.root_page);
+        let Some(payload) = tree
+            .lookup(key)
+            .map_err(|e| format!("lookup index entry: {e}"))?
+        else {
+            return Ok(());
+        };
+
+        let mut buckets = decode_index_payload(&payload)?;
+        if let Some(bucket) = buckets
+            .iter_mut()
+            .find(|bucket| values_equal(&bucket.value, value))
+        {
+            bucket.rowids.retain(|candidate| *candidate != rowid);
+        }
+        buckets.retain(|bucket| !bucket.rowids.is_empty());
+
+        if buckets.is_empty() {
+            tree.delete(key)
+                .map_err(|e| format!("delete index entry: {e}"))?;
+        } else {
+            let encoded = encode_index_payload(&buckets)?;
+            tree.insert(key, &encoded)
+                .map_err(|e| format!("update index entry: {e}"))?;
+        }
+        Ok(())
+    }
+
     fn execute_update(&mut self, stmt: UpdateStmt) -> Result<ExecuteResult, String> {
         let table_key = normalize_identifier(&stmt.table);
         let meta = self
@@ -358,9 +423,12 @@ impl Database {
             .cloned()
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
         let assignments = resolve_update_assignments(&meta, &stmt.assignments)?;
+        let table_indexes = self.indexes_for_table(&table_key);
 
-        let mut tree = BTree::new(&mut self.pager, meta.root_page);
-        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let entries = {
+            let mut tree = BTree::new(&mut self.pager, meta.root_page);
+            tree.scan_all().map_err(|e| format!("scan table: {e}"))?
+        };
         let mut rows_affected = 0usize;
 
         for entry in entries {
@@ -376,14 +444,26 @@ impl Database {
                 evaluated_assignments.push((*col_idx, value));
             }
 
-            let mut updated_row = original_row;
+            let mut updated_row = original_row.clone();
             for (col_idx, value) in evaluated_assignments {
                 updated_row[col_idx] = value;
             }
 
+            for index_meta in &table_indexes {
+                self.index_delete_row(index_meta, entry.key, &original_row)?;
+            }
+
             let encoded = encode_row(&updated_row)?;
-            tree.insert(entry.key, &encoded)
-                .map_err(|e| format!("update row: {e}"))?;
+            {
+                let mut tree = BTree::new(&mut self.pager, meta.root_page);
+                tree.insert(entry.key, &encoded)
+                    .map_err(|e| format!("update row: {e}"))?;
+            }
+
+            for index_meta in &table_indexes {
+                self.index_insert_row(index_meta, entry.key, &updated_row)?;
+            }
+
             rows_affected += 1;
         }
 
@@ -399,9 +479,12 @@ impl Database {
             .get(&table_key)
             .cloned()
             .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
+        let table_indexes = self.indexes_for_table(&table_key);
 
-        let mut tree = BTree::new(&mut self.pager, meta.root_page);
-        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let entries = {
+            let mut tree = BTree::new(&mut self.pager, meta.root_page);
+            tree.scan_all().map_err(|e| format!("scan table: {e}"))?
+        };
         let mut rows_affected = 0usize;
 
         for entry in entries {
@@ -410,9 +493,15 @@ impl Database {
                 continue;
             }
 
-            let deleted = tree
-                .delete(entry.key)
-                .map_err(|e| format!("delete row: {e}"))?;
+            for index_meta in &table_indexes {
+                self.index_delete_row(index_meta, entry.key, &row)?;
+            }
+
+            let deleted = {
+                let mut tree = BTree::new(&mut self.pager, meta.root_page);
+                tree.delete(entry.key)
+                    .map_err(|e| format!("delete row: {e}"))?
+            };
             if deleted {
                 rows_affected += 1;
             }
@@ -431,36 +520,35 @@ impl Database {
             }
         }
 
-        let table_meta = if let Some(from) = &stmt.from {
+        let table_ctx = if let Some(from) = &stmt.from {
             let table_key = normalize_identifier(&from.table);
-            Some(
-                self.tables
-                    .get(&table_key)
-                    .cloned()
-                    .ok_or_else(|| format!("no such table '{}'", from.table))?,
-            )
+            let table_meta = self
+                .tables
+                .get(&table_key)
+                .cloned()
+                .ok_or_else(|| format!("no such table '{}'", from.table))?;
+            Some((table_key, table_meta))
         } else {
             None
         };
+        let table_meta = table_ctx.as_ref().map(|(_, meta)| meta);
+        let access_path = if let Some((table_key, meta)) = table_ctx.as_ref() {
+            let planner_indexes = self.planner_indexes_for_table(table_key);
+            plan_select(&stmt, &meta.name, &planner_indexes).access_path
+        } else {
+            AccessPath::TableScan
+        };
 
-        let mut rows_with_order_keys = if let Some(meta) = table_meta.as_ref() {
-            let mut tree = BTree::new(&mut self.pager, meta.root_page);
-            let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
-            let mut filtered_rows = Vec::new();
-            for entry in entries {
-                let decoded = decode_table_row(meta, &entry.payload)?;
-                if !where_clause_matches(meta, &decoded, stmt.where_clause.as_ref())? {
-                    continue;
-                }
-                filtered_rows.push(decoded);
-            }
+        let mut rows_with_order_keys = if let Some(meta) = table_meta {
+            let filtered_rows =
+                self.read_rows_for_select(meta, stmt.where_clause.as_ref(), &access_path)?;
 
             if aggregate_select {
                 vec![(
-                    project_aggregate_row(&stmt.columns, Some(meta), &filtered_rows, 0)?,
+                    project_aggregate_row(&stmt.columns, table_meta, &filtered_rows, 0)?,
                     evaluate_aggregate_order_by_keys(
                         &stmt.order_by,
-                        Some(meta),
+                        table_meta,
                         &filtered_rows,
                         0,
                     )?,
@@ -533,9 +621,90 @@ impl Database {
             rows.truncate(limit);
         }
 
-        let columns = select_output_columns(&stmt.columns, table_meta.as_ref())?;
+        let columns = select_output_columns(&stmt.columns, table_meta)?;
 
         Ok(ExecuteResult::Select(QueryResult { columns, rows }))
+    }
+
+    fn planner_indexes_for_table(&self, table_key: &str) -> Vec<IndexInfo> {
+        self.indexes
+            .iter()
+            .filter(|(_, idx)| idx.table_key == table_key)
+            .map(|(name, idx)| IndexInfo {
+                name: name.clone(),
+                table: idx.table_name.clone(),
+                column: idx.column.clone(),
+            })
+            .collect()
+    }
+
+    fn read_rows_for_select(
+        &mut self,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        access_path: &AccessPath,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        match access_path {
+            AccessPath::TableScan => self.read_rows_by_table_scan(meta, where_clause),
+            AccessPath::IndexEq {
+                index_name,
+                value_expr,
+                ..
+            } => self.read_rows_by_index_eq(meta, where_clause, index_name, value_expr),
+        }
+    }
+
+    fn read_rows_by_table_scan(
+        &mut self,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let mut tree = BTree::new(&mut self.pager, meta.root_page);
+        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let mut rows = Vec::new();
+        for entry in entries {
+            let decoded = decode_table_row(meta, &entry.payload)?;
+            if !where_clause_matches(meta, &decoded, where_clause)? {
+                continue;
+            }
+            rows.push(decoded);
+        }
+        Ok(rows)
+    }
+
+    fn read_rows_by_index_eq(
+        &mut self,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        index_name: &str,
+        value_expr: &Expr,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let index_key = normalize_identifier(index_name);
+        let Some(index_meta) = self.indexes.get(&index_key).cloned() else {
+            return self.read_rows_by_table_scan(meta, where_clause);
+        };
+
+        let lookup_value = eval_expr(value_expr, None)?;
+        let mut rowids = self.index_rowids_for_value(&index_meta, &lookup_value)?;
+        rowids.sort_unstable();
+        rowids.dedup();
+
+        let mut tree = BTree::new(&mut self.pager, meta.root_page);
+        let mut rows = Vec::new();
+        for rowid in rowids {
+            let Some(payload) = tree
+                .lookup(rowid)
+                .map_err(|e| format!("lookup table row from index rowid: {e}"))?
+            else {
+                continue;
+            };
+            let decoded = decode_table_row(meta, &payload)?;
+            if !where_clause_matches(meta, &decoded, where_clause)? {
+                continue;
+            }
+            rows.push(decoded);
+        }
+        Ok(rows)
     }
 }
 
@@ -1945,6 +2114,82 @@ mod tests {
             indexed_rowids(&mut db, "idx_users_age", &Value::Integer(42)),
             vec![3]
         );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_maintains_secondary_index_entries() {
+        let path = temp_db_path("index_update_maintenance");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 30), (2, 30), (3, 42);")
+            .unwrap();
+
+        let updated = db
+            .execute("UPDATE users SET age = 31 WHERE id = 2;")
+            .unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 1 });
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(30)),
+            vec![1]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(31)),
+            vec![2]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(42)),
+            vec![3]
+        );
+
+        let selected = db.execute("SELECT id FROM users WHERE age = 31;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_maintains_secondary_index_entries() {
+        let path = temp_db_path("index_delete_maintenance");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 30), (2, 30), (3, 42);")
+            .unwrap();
+
+        let deleted = db.execute("DELETE FROM users WHERE id = 1;").unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 1 });
+
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(30)),
+            vec![2]
+        );
+        assert_eq!(
+            indexed_rowids(&mut db, "idx_users_age", &Value::Integer(42)),
+            vec![3]
+        );
+
+        let selected = db.execute("SELECT id FROM users WHERE age = 30;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(q.rows, vec![vec![Value::Integer(2)]]);
+            }
+            _ => panic!("expected SELECT result"),
+        }
 
         cleanup(&path);
     }

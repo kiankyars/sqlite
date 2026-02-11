@@ -1,3 +1,0 @@
-created_at_unix=1770792030
-agent_id=codex
-task=Query planner (index selection)

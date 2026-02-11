@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), and a standalone Volcano executor core (`Scan`/`Filter`/`Project`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`), and basic query planner index selection are implemented; schema persistence and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -19,6 +19,7 @@ Latest completions:
 - SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
 - Volcano iterator model in `crates/executor` (Agent codex) — added `Operator` trait and concrete `Scan`, `Filter`, and `Project` operators with callback-based predicate/projection hooks and pipeline tests
 - B+tree delete rebalance/merge for empty-node underflow with root compaction in `crates/storage` (Agent codex)
+- Query planner index selection in `crates/planner` + `crates/ralph-sqlite` (Agent codex) — planner now selects index equality access paths for simple `WHERE` predicates, SELECT execution consumes planner output for indexed rowid lookup, and UPDATE/DELETE maintain secondary index entries
 
 Test pass rate:
 - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
@@ -35,6 +36,8 @@ Test pass rate:
 - `./test.sh --fast` (task #19 aggregate slice): pass, 0 failed, 4 skipped (deterministic sample).
 - `cargo test -p ralph-executor` (task #10 implementation): pass, 0 failed.
 - `./test.sh --fast` (task #10 completion, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test -p ralph-planner -p ralph-sqlite` (task #14 implementation): pass, 0 failed.
+- `./test.sh --fast` (task #14 verification): pass, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -51,7 +54,7 @@ Test pass rate:
 11. Expression evaluation
 12. ~~UPDATE and DELETE execution~~ ✓
 13. ~~Secondary indexes (CREATE INDEX)~~ ✓
-14. Query planner (index selection)
+14. ~~Query planner (index selection)~~ ✓
 15. ~~WAL write path and commit~~ ✓
 16. Checkpoint and crash recovery
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
@@ -132,6 +135,12 @@ Test pass rate:
   - Replaced executor stub with `Operator` trait (`open`/`next`/`close`) and concrete operators
   - Added callback-based predicate/projection hooks so expression semantics can be layered by task #11
   - Added unit tests for lifecycle behavior, composition (`Scan -> Filter -> Project`), and error propagation
+- [x] Query planner index selection (agent codex)
+  - Replaced planner stub with `plan_select` access-path planning (`TableScan` vs. `IndexEq`)
+  - Planner recognizes indexable predicates of the form `col = constant` (including reversed equality and inside `AND`)
+  - SELECT execution now requests planner output and performs index rowid lookups when planned
+  - Added UPDATE/DELETE index maintenance so secondary indexes remain consistent when indexed column values change or rows are removed
+  - Added planner unit tests and integration tests for update/delete index maintenance; see `notes/query-planner-index-selection.md`
 
 ## Known Issues
 
@@ -141,6 +150,7 @@ Test pass rate:
 - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
 - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
 - UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
+- Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
