@@ -1,5 +1,4 @@
 /// Recursive-descent SQL parser — converts tokens into AST nodes.
-
 use crate::ast::*;
 use crate::token::{Keyword, Token};
 
@@ -257,8 +256,13 @@ impl Parser {
                 }
                 Ok(Stmt::CreateTable(self.parse_create_table()?))
             }
-            Token::Keyword(Keyword::Index) => Ok(Stmt::CreateIndex(self.parse_create_index(unique)?)),
-            other => Err(format!("expected TABLE or INDEX after CREATE, found {:?}", other)),
+            Token::Keyword(Keyword::Index) => {
+                Ok(Stmt::CreateIndex(self.parse_create_index(unique)?))
+            }
+            other => Err(format!(
+                "expected TABLE or INDEX after CREATE, found {:?}",
+                other
+            )),
         }
     }
 
@@ -444,15 +448,17 @@ impl Parser {
         })
     }
 
-    // ── DROP TABLE ──────────────────────────────────────────────────────
+    // ── DROP TABLE / DROP INDEX ────────────────────────────────────────
 
     fn parse_drop(&mut self) -> Result<Stmt, String> {
         self.expect_keyword(Keyword::Drop)?;
         match self.peek() {
-            Token::Keyword(Keyword::Table) => {
-                Ok(Stmt::DropTable(self.parse_drop_table()?))
-            }
-            other => Err(format!("expected TABLE after DROP, found {:?}", other)),
+            Token::Keyword(Keyword::Table) => Ok(Stmt::DropTable(self.parse_drop_table()?)),
+            Token::Keyword(Keyword::Index) => Ok(Stmt::DropIndex(self.parse_drop_index()?)),
+            other => Err(format!(
+                "expected TABLE or INDEX after DROP, found {:?}",
+                other
+            )),
         }
     }
 
@@ -467,6 +473,19 @@ impl Parser {
         };
         let table = self.expect_ident()?;
         Ok(DropTableStmt { if_exists, table })
+    }
+
+    fn parse_drop_index(&mut self) -> Result<DropIndexStmt, String> {
+        self.expect_keyword(Keyword::Index)?;
+        let if_exists = if self.at_keyword(Keyword::If) {
+            self.advance();
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let index = self.expect_ident()?;
+        Ok(DropIndexStmt { if_exists, index })
     }
 
     // ── Transaction control ─────────────────────────────────────────────
@@ -792,7 +811,9 @@ impl Parser {
                 }
             }
             // Handle aggregate keywords as function names (COUNT, SUM, etc.)
-            Token::Keyword(kw @ (Keyword::Count | Keyword::Sum | Keyword::Avg | Keyword::Min | Keyword::Max)) => {
+            Token::Keyword(
+                kw @ (Keyword::Count | Keyword::Sum | Keyword::Avg | Keyword::Min | Keyword::Max),
+            ) => {
                 self.advance();
                 let name = format!("{:?}", kw).to_uppercase();
                 self.expect_token(&Token::LeftParen)?;
@@ -828,8 +849,8 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use crate::tokenizer::Tokenizer;
     use super::*;
+    use crate::tokenizer::Tokenizer;
 
     fn parse(input: &str) -> Stmt {
         let tokens = Tokenizer::new(input).tokenize().unwrap();
@@ -883,14 +904,12 @@ mod tests {
     fn test_select_string() {
         let stmt = parse("SELECT 'hello';");
         match stmt {
-            Stmt::Select(s) => {
-                match &s.columns[0] {
-                    SelectColumn::Expr { expr, .. } => {
-                        assert_eq!(*expr, Expr::StringLiteral("hello".into()));
-                    }
-                    _ => panic!("expected Expr column"),
+            Stmt::Select(s) => match &s.columns[0] {
+                SelectColumn::Expr { expr, .. } => {
+                    assert_eq!(*expr, Expr::StringLiteral("hello".into()));
                 }
-            }
+                _ => panic!("expected Expr column"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -955,15 +974,9 @@ mod tests {
                 );
                 assert_eq!(ct.columns[1].name, "name");
                 assert_eq!(ct.columns[1].type_name, Some(TypeName::Text));
-                assert_eq!(
-                    ct.columns[1].constraints,
-                    vec![ColumnConstraint::NotNull]
-                );
+                assert_eq!(ct.columns[1].constraints, vec![ColumnConstraint::NotNull]);
                 assert_eq!(ct.columns[2].name, "email");
-                assert_eq!(
-                    ct.columns[2].constraints,
-                    vec![ColumnConstraint::Unique]
-                );
+                assert_eq!(ct.columns[2].constraints, vec![ColumnConstraint::Unique]);
             }
             _ => panic!("expected CreateTable"),
         }
@@ -1115,6 +1128,30 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_index() {
+        let stmt = parse("DROP INDEX idx_users_name;");
+        match stmt {
+            Stmt::DropIndex(di) => {
+                assert_eq!(di.index, "idx_users_name");
+                assert!(!di.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
+        }
+    }
+
+    #[test]
+    fn test_drop_index_if_exists() {
+        let stmt = parse("DROP INDEX IF EXISTS idx_users_name;");
+        match stmt {
+            Stmt::DropIndex(di) => {
+                assert_eq!(di.index, "idx_users_name");
+                assert!(di.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
+        }
+    }
+
+    #[test]
     fn test_begin_transaction() {
         let stmt = parse("BEGIN TRANSACTION;");
         assert_eq!(stmt, Stmt::Begin);
@@ -1136,14 +1173,12 @@ mod tests {
     fn test_select_with_alias() {
         let stmt = parse("SELECT id AS user_id FROM users;");
         match stmt {
-            Stmt::Select(s) => {
-                match &s.columns[0] {
-                    SelectColumn::Expr { alias, .. } => {
-                        assert_eq!(alias.as_deref(), Some("user_id"));
-                    }
-                    _ => panic!("expected Expr"),
+            Stmt::Select(s) => match &s.columns[0] {
+                SelectColumn::Expr { alias, .. } => {
+                    assert_eq!(alias.as_deref(), Some("user_id"));
                 }
-            }
+                _ => panic!("expected Expr"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1166,25 +1201,23 @@ mod tests {
         // 1 + 2 * 3 should parse as 1 + (2 * 3)
         let stmt = parse("SELECT 1 + 2 * 3;");
         match stmt {
-            Stmt::Select(s) => {
-                match &s.columns[0] {
-                    SelectColumn::Expr { expr, .. } => {
-                        assert_eq!(
-                            *expr,
-                            Expr::BinaryOp {
-                                left: Box::new(Expr::IntegerLiteral(1)),
-                                op: BinaryOperator::Add,
-                                right: Box::new(Expr::BinaryOp {
-                                    left: Box::new(Expr::IntegerLiteral(2)),
-                                    op: BinaryOperator::Multiply,
-                                    right: Box::new(Expr::IntegerLiteral(3)),
-                                }),
-                            }
-                        );
-                    }
-                    _ => panic!("expected Expr"),
+            Stmt::Select(s) => match &s.columns[0] {
+                SelectColumn::Expr { expr, .. } => {
+                    assert_eq!(
+                        *expr,
+                        Expr::BinaryOp {
+                            left: Box::new(Expr::IntegerLiteral(1)),
+                            op: BinaryOperator::Add,
+                            right: Box::new(Expr::BinaryOp {
+                                left: Box::new(Expr::IntegerLiteral(2)),
+                                op: BinaryOperator::Multiply,
+                                right: Box::new(Expr::IntegerLiteral(3)),
+                            }),
+                        }
+                    );
                 }
-            }
+                _ => panic!("expected Expr"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1246,9 +1279,7 @@ mod tests {
         let stmt = parse("SELECT * FROM t WHERE x IN (1, 2, 3);");
         match stmt {
             Stmt::Select(s) => match &s.where_clause.unwrap() {
-                Expr::InList {
-                    list, negated, ..
-                } => {
+                Expr::InList { list, negated, .. } => {
                     assert!(!negated);
                     assert_eq!(list.len(), 3);
                 }

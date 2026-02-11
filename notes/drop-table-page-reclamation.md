@@ -39,5 +39,4 @@ Implemented executable `DROP TABLE` in `crates/ralph-sqlite` with dependent-inde
 
 ## Remaining limitations
 
-- `DROP INDEX` SQL statement execution is still not implemented.
 - UNIQUE/multi-column index execution remains unsupported.

@@ -10,6 +10,7 @@ pub enum Stmt {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     DropTable(DropTableStmt),
+    DropIndex(DropIndexStmt),
     Begin,
     Commit,
     Rollback,
@@ -116,6 +117,12 @@ pub struct DropTableStmt {
     pub table: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub index: String,
+}
+
 /// SQL expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -139,20 +146,11 @@ pub enum Expr {
         right: Box<Expr>,
     },
     /// Unary operation: op expr
-    UnaryOp {
-        op: UnaryOperator,
-        expr: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOperator, expr: Box<Expr> },
     /// `expr IS NULL` or `expr IS NOT NULL`
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Expr>, negated: bool },
     /// Function call: name(args...)
-    FunctionCall {
-        name: String,
-        args: Vec<Expr>,
-    },
+    FunctionCall { name: String, args: Vec<Expr> },
     /// `expr BETWEEN low AND high`
     Between {
         expr: Box<Expr>,

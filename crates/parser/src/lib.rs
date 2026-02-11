@@ -5,7 +5,6 @@
 /// - `ast`: AST node types for SQL statements and expressions
 /// - `tokenizer`: SQL lexer producing a token stream
 /// - `parser`: Recursive-descent parser producing AST from tokens
-
 pub mod ast;
 pub mod parser;
 pub mod token;
@@ -97,6 +96,18 @@ mod tests {
                 assert!(dt.if_exists);
             }
             _ => panic!("expected DropTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_index() {
+        let stmt = parse("DROP INDEX IF EXISTS idx_t_x;").unwrap();
+        match stmt {
+            Stmt::DropIndex(di) => {
+                assert_eq!(di.index, "idx_t_x");
+                assert!(di.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
         }
     }
 

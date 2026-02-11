@@ -11,8 +11,9 @@ use ralph_executor::{
     IndexEqScan, Operator, TableScan, Value,
 };
 use ralph_parser::ast::{
-    Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropTableStmt, Expr,
-    InsertStmt, OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName, UnaryOperator, UpdateStmt,
+    Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
+    DropTableStmt, Expr, InsertStmt, OrderByItem, SelectColumn, SelectStmt, Stmt, TypeName,
+    UnaryOperator, UpdateStmt,
 };
 use ralph_planner::{plan_select, plan_where, AccessPath, IndexInfo};
 use ralph_storage::pager::PageNum;
@@ -32,6 +33,7 @@ pub enum ExecuteResult {
     CreateTable,
     CreateIndex,
     DropTable,
+    DropIndex,
     Insert { rows_affected: usize },
     Update { rows_affected: usize },
     Delete { rows_affected: usize },
@@ -97,6 +99,7 @@ impl Database {
             Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt, sql),
             Stmt::CreateIndex(create_stmt) => self.execute_create_index(create_stmt, sql),
             Stmt::DropTable(drop_stmt) => self.execute_drop_table(drop_stmt),
+            Stmt::DropIndex(drop_stmt) => self.execute_drop_index(drop_stmt),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
             Stmt::Update(update_stmt) => self.execute_update(update_stmt),
             Stmt::Delete(delete_stmt) => self.execute_delete(delete_stmt),
@@ -323,6 +326,35 @@ impl Database {
         self.tables.remove(&table_key);
         self.commit_if_autocommit("drop table")?;
         Ok(ExecuteResult::DropTable)
+    }
+
+    fn execute_drop_index(&mut self, stmt: DropIndexStmt) -> Result<ExecuteResult, String> {
+        let index_key = normalize_identifier(&stmt.index);
+        let index_meta = match self.indexes.get(&index_key).cloned() {
+            Some(meta) => meta,
+            None => {
+                if stmt.if_exists {
+                    return Ok(ExecuteResult::DropIndex);
+                }
+                return Err(format!("no such index '{}'", stmt.index));
+            }
+        };
+
+        let dropped_index = Schema::drop_index(&mut self.pager, &stmt.index)
+            .map_err(|e| format!("drop index schema entry '{}': {e}", stmt.index))?;
+        let dropped_index = dropped_index
+            .ok_or_else(|| format!("drop index '{}': index schema entry not found", stmt.index))?;
+        BTree::reclaim_tree(&mut self.pager, dropped_index.root_page)
+            .map_err(|e| format!("drop index '{}': reclaim pages: {e}", dropped_index.name))?;
+
+        self.indexes.remove(&index_key);
+        debug_assert_eq!(
+            index_meta.root_page, dropped_index.root_page,
+            "in-memory and schema root pages diverged for dropped index '{}'",
+            stmt.index
+        );
+        self.commit_if_autocommit("drop index")?;
+        Ok(ExecuteResult::DropIndex)
     }
 
     fn execute_insert(&mut self, stmt: InsertStmt) -> Result<ExecuteResult, String> {
@@ -2175,6 +2207,62 @@ mod tests {
 
         let err = db.execute("DROP TABLE missing;").unwrap_err();
         assert!(err.contains("no such table"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_removes_index_and_reclaims_pages() {
+        let path = temp_db_path("drop_index_reclaim");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, age INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 30), (2, 20), (3, 30);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+
+        let freelist_before = db.pager.header().freelist_count;
+        let dropped = db.execute("DROP INDEX idx_users_age;").unwrap();
+        assert_eq!(dropped, ExecuteResult::DropIndex);
+        assert!(!db.indexes.contains_key("idx_users_age"));
+        assert!(db.pager.header().freelist_count > freelist_before);
+
+        let selected = db
+            .execute("SELECT id FROM users WHERE age = 30 ORDER BY id;")
+            .unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        assert_eq!(
+            db.execute("CREATE INDEX idx_users_age ON users(age);")
+                .unwrap(),
+            ExecuteResult::CreateIndex
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_if_exists_is_noop_for_missing_index() {
+        let path = temp_db_path("drop_index_if_exists");
+        let mut db = Database::open(&path).unwrap();
+
+        assert_eq!(
+            db.execute("DROP INDEX IF EXISTS missing_idx;").unwrap(),
+            ExecuteResult::DropIndex
+        );
+
+        let err = db.execute("DROP INDEX missing_idx;").unwrap_err();
+        assert!(err.contains("no such index"));
 
         cleanup(&path);
     }
