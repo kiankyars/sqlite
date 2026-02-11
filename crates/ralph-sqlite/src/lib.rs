@@ -424,6 +424,13 @@ impl Database {
     }
 
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
+        let aggregate_select = select_uses_aggregates(&stmt);
+        if let Some(where_expr) = stmt.where_clause.as_ref() {
+            if expr_contains_aggregate(where_expr) {
+                return Err("aggregate functions are not allowed in WHERE".to_string());
+            }
+        }
+
         let table_meta = if let Some(from) = &stmt.from {
             let table_key = normalize_identifier(&from.table);
             Some(
@@ -439,17 +446,34 @@ impl Database {
         let mut rows_with_order_keys = if let Some(meta) = table_meta.as_ref() {
             let mut tree = BTree::new(&mut self.pager, meta.root_page);
             let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
-            let mut rows = Vec::new();
+            let mut filtered_rows = Vec::new();
             for entry in entries {
                 let decoded = decode_table_row(meta, &entry.payload)?;
                 if !where_clause_matches(meta, &decoded, stmt.where_clause.as_ref())? {
                     continue;
                 }
-                let projected = project_row(&stmt.columns, meta, &decoded)?;
-                let order_keys = evaluate_order_by_keys(&stmt.order_by, Some((meta, &decoded)))?;
-                rows.push((projected, order_keys));
+                filtered_rows.push(decoded);
             }
-            rows
+
+            if aggregate_select {
+                vec![(
+                    project_aggregate_row(&stmt.columns, Some(meta), &filtered_rows, 0)?,
+                    evaluate_aggregate_order_by_keys(
+                        &stmt.order_by,
+                        Some(meta),
+                        &filtered_rows,
+                        0,
+                    )?,
+                )]
+            } else {
+                let mut rows = Vec::with_capacity(filtered_rows.len());
+                for decoded in &filtered_rows {
+                    let projected = project_row(&stmt.columns, meta, decoded)?;
+                    let order_keys = evaluate_order_by_keys(&stmt.order_by, Some((meta, decoded)))?;
+                    rows.push((projected, order_keys));
+                }
+                rows
+            }
         } else {
             if stmt
                 .columns
@@ -459,16 +483,24 @@ impl Database {
                 return Err("SELECT * without FROM is not supported".to_string());
             }
 
-            if let Some(where_expr) = &stmt.where_clause {
+            let scalar_row_count = if let Some(where_expr) = &stmt.where_clause {
                 let predicate = eval_expr(where_expr, None)?;
                 if !is_truthy(&predicate) {
-                    Vec::new()
+                    0
                 } else {
-                    vec![(
-                        project_row_no_from(&stmt.columns)?,
-                        evaluate_order_by_keys(&stmt.order_by, None)?,
-                    )]
+                    1
                 }
+            } else {
+                1
+            };
+
+            if aggregate_select {
+                vec![(
+                    project_aggregate_row(&stmt.columns, None, &[], scalar_row_count)?,
+                    evaluate_aggregate_order_by_keys(&stmt.order_by, None, &[], scalar_row_count)?,
+                )]
+            } else if scalar_row_count == 0 {
+                Vec::new()
             } else {
                 vec![(
                     project_row_no_from(&stmt.columns)?,
@@ -602,6 +634,340 @@ fn project_row_no_from(columns: &[SelectColumn]) -> Result<Vec<Value>, String> {
         }
     }
     Ok(projected)
+}
+
+fn select_uses_aggregates(stmt: &SelectStmt) -> bool {
+    stmt.columns.iter().any(|column| match column {
+        SelectColumn::AllColumns => false,
+        SelectColumn::Expr { expr, .. } => expr_contains_aggregate(expr),
+    })
+}
+
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            is_aggregate_function(name) || args.iter().any(expr_contains_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        Expr::IsNull { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_aggregate(expr)
+                || expr_contains_aggregate(low)
+                || expr_contains_aggregate(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
+        }
+        Expr::Paren(inner) => expr_contains_aggregate(inner),
+        _ => false,
+    }
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("COUNT")
+        || name.eq_ignore_ascii_case("SUM")
+        || name.eq_ignore_ascii_case("AVG")
+        || name.eq_ignore_ascii_case("MIN")
+        || name.eq_ignore_ascii_case("MAX")
+}
+
+fn project_aggregate_row(
+    columns: &[SelectColumn],
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+) -> Result<Vec<Value>, String> {
+    let mut projected = Vec::new();
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns => {
+                return Err("SELECT * is not supported in aggregate queries".to_string());
+            }
+            SelectColumn::Expr { expr, .. } => {
+                projected.push(eval_aggregate_expr(expr, meta, rows, scalar_row_count)?)
+            }
+        }
+    }
+    Ok(projected)
+}
+
+fn evaluate_aggregate_order_by_keys(
+    order_by: &[OrderByItem],
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        out.push(eval_aggregate_expr(
+            &item.expr,
+            meta,
+            rows,
+            scalar_row_count,
+        )?);
+    }
+    Ok(out)
+}
+
+fn eval_aggregate_expr(
+    expr: &Expr,
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+) -> Result<Value, String> {
+    match expr {
+        Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
+        Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
+        Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
+        Expr::Null => Ok(Value::Null),
+        Expr::Paren(inner) => eval_aggregate_expr(inner, meta, rows, scalar_row_count),
+        Expr::ColumnRef { .. } => Err(
+            "column references outside aggregate functions are not supported without GROUP BY"
+                .to_string(),
+        ),
+        Expr::UnaryOp { op, expr } => {
+            let v = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
+            match op {
+                UnaryOperator::Negate => match v {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Real(f) => Ok(Value::Real(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err("cannot negate non-numeric value".to_string()),
+                },
+                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&v)) as i64)),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lhs = eval_aggregate_expr(left, meta, rows, scalar_row_count)?;
+            let rhs = eval_aggregate_expr(right, meta, rows, scalar_row_count)?;
+            eval_binary_op(&lhs, *op, &rhs)
+        }
+        Expr::IsNull { expr, negated } => {
+            let v = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
+            let is_null = matches!(v, Value::Null);
+            let result = if *negated { !is_null } else { is_null };
+            Ok(Value::Integer(result as i64))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let v = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
+            let low_v = eval_aggregate_expr(low, meta, rows, scalar_row_count)?;
+            let high_v = eval_aggregate_expr(high, meta, rows, scalar_row_count)?;
+            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let between = ge_low && le_high;
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
+            let mut found = false;
+            for item in list {
+                let candidate = eval_aggregate_expr(item, meta, rows, scalar_row_count)?;
+                if values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
+        }
+        Expr::FunctionCall { name, args } => {
+            eval_aggregate_function(name, args, meta, rows, scalar_row_count)
+        }
+    }
+}
+
+fn eval_aggregate_function(
+    name: &str,
+    args: &[Expr],
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+) -> Result<Value, String> {
+    if !is_aggregate_function(name) {
+        return Err(format!("function '{name}' is not supported yet"));
+    }
+
+    if name.eq_ignore_ascii_case("COUNT") {
+        if args.len() != 1 {
+            return Err("COUNT() expects exactly one argument".to_string());
+        }
+        if is_count_star_argument(&args[0]) {
+            let count = aggregate_input_row_count(meta, rows, scalar_row_count);
+            return Ok(Value::Integer(count as i64));
+        }
+
+        validate_aggregate_argument(name, &args[0])?;
+        let mut count = 0i64;
+        for_each_aggregate_input_row(meta, rows, scalar_row_count, |row_ctx| {
+            let value = eval_expr(&args[0], row_ctx)?;
+            if !matches!(value, Value::Null) {
+                count += 1;
+            }
+            Ok(())
+        })?;
+        return Ok(Value::Integer(count));
+    }
+
+    if args.len() != 1 {
+        return Err(format!("{name}() expects exactly one argument"));
+    }
+    validate_aggregate_argument(name, &args[0])?;
+
+    if name.eq_ignore_ascii_case("SUM") {
+        let mut sum = 0.0f64;
+        let mut saw_value = false;
+        let mut all_integers = true;
+        for_each_aggregate_input_row(meta, rows, scalar_row_count, |row_ctx| {
+            let value = eval_expr(&args[0], row_ctx)?;
+            match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    sum += i as f64;
+                    saw_value = true;
+                }
+                Value::Real(f) => {
+                    sum += f;
+                    saw_value = true;
+                    all_integers = false;
+                }
+                Value::Text(_) => {
+                    return Err("SUM() expects numeric values".to_string());
+                }
+            }
+            Ok(())
+        })?;
+        if !saw_value {
+            return Ok(Value::Null);
+        }
+        return if all_integers {
+            Ok(Value::Integer(sum as i64))
+        } else {
+            Ok(Value::Real(sum))
+        };
+    }
+
+    if name.eq_ignore_ascii_case("AVG") {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for_each_aggregate_input_row(meta, rows, scalar_row_count, |row_ctx| {
+            let value = eval_expr(&args[0], row_ctx)?;
+            match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    sum += i as f64;
+                    count += 1;
+                }
+                Value::Real(f) => {
+                    sum += f;
+                    count += 1;
+                }
+                Value::Text(_) => {
+                    return Err("AVG() expects numeric values".to_string());
+                }
+            }
+            Ok(())
+        })?;
+        if count == 0 {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Real(sum / (count as f64)));
+    }
+
+    let mut best: Option<Value> = None;
+    for_each_aggregate_input_row(meta, rows, scalar_row_count, |row_ctx| {
+        let value = eval_expr(&args[0], row_ctx)?;
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+
+        match &best {
+            None => {
+                best = Some(value);
+            }
+            Some(current) => {
+                let cmp = compare_sort_values(&value, current);
+                if name.eq_ignore_ascii_case("MIN") {
+                    if cmp == std::cmp::Ordering::Less {
+                        best = Some(value);
+                    }
+                } else if cmp == std::cmp::Ordering::Greater {
+                    best = Some(value);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(best.unwrap_or(Value::Null))
+}
+
+fn validate_aggregate_argument(name: &str, arg: &Expr) -> Result<(), String> {
+    if expr_contains_aggregate(arg) {
+        return Err(format!(
+            "nested aggregate functions are not supported in {name}()"
+        ));
+    }
+    Ok(())
+}
+
+fn for_each_aggregate_input_row<F>(
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+    mut f: F,
+) -> Result<(), String>
+where
+    F: FnMut(Option<(&TableMeta, &[Value])>) -> Result<(), String>,
+{
+    if let Some(meta) = meta {
+        for row in rows {
+            f(Some((meta, row)))?;
+        }
+    } else {
+        for _ in 0..scalar_row_count {
+            f(None)?;
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_input_row_count(
+    meta: Option<&TableMeta>,
+    rows: &[Vec<Value>],
+    scalar_row_count: usize,
+) -> usize {
+    if meta.is_some() {
+        rows.len()
+    } else {
+        scalar_row_count
+    }
+}
+
+fn is_count_star_argument(arg: &Expr) -> bool {
+    matches!(
+        arg,
+        Expr::ColumnRef {
+            table: None,
+            column,
+        } if column == "*"
+    )
 }
 
 fn evaluate_order_by_keys(
@@ -1335,6 +1701,130 @@ mod tests {
             }
             _ => panic!("expected SELECT result"),
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_aggregate_functions_with_where_and_nulls() {
+        let path = temp_db_path("aggregate_where_nulls");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT COUNT(*), COUNT(score), SUM(score), AVG(score), MIN(score), MAX(score) \
+                 FROM t WHERE id >= 2;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(2),
+                        Value::Integer(1),
+                        Value::Integer(30),
+                        Value::Real(30.0),
+                        Value::Integer(30),
+                        Value::Integer(30),
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_aggregate_functions_over_empty_input() {
+        let path = temp_db_path("aggregate_empty_input");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30);")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT COUNT(*), COUNT(score), SUM(score), AVG(score), MIN(score), MAX(score) \
+                 FROM t WHERE id > 10;",
+            )
+            .unwrap();
+        match result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(0),
+                        Value::Integer(0),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_aggregate_without_from_respects_where() {
+        let path = temp_db_path("aggregate_no_from");
+        let mut db = Database::open(&path).unwrap();
+
+        let true_result = db
+            .execute("SELECT COUNT(*), SUM(2 + 3), MAX(7) WHERE 1;")
+            .unwrap();
+        match true_result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![
+                        Value::Integer(1),
+                        Value::Integer(5),
+                        Value::Integer(7)
+                    ]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        let false_result = db
+            .execute("SELECT COUNT(*), SUM(2 + 3), MAX(7) WHERE 0;")
+            .unwrap();
+        match false_result {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(0), Value::Null, Value::Null]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn select_mixed_aggregate_and_column_without_group_by_errors() {
+        let path = temp_db_path("aggregate_mixed_column_error");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3);").unwrap();
+
+        let err = db.execute("SELECT COUNT(*) + 1, id FROM t;").unwrap_err();
+        assert!(err.contains("without GROUP BY"));
 
         cleanup(&path);
     }

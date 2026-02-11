@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, WAL replay/checkpoint, and aggregate execution remain.
+**Phase: Stage 5 (partial)** — tokenizer/parser, pager, B+tree, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, and SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) are implemented; schema persistence, planner/index work, and WAL replay/checkpoint remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -16,6 +16,7 @@ Latest completions:
 - WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
 - SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
 - SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
+- SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
 
 Test pass rate:
 - `cargo test --workspace` (task #12 implementation): pass, 0 failed.
@@ -27,6 +28,8 @@ Test pass rate:
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
 - `cargo test --workspace` (task #19 ORDER BY slice): pass, 0 failed.
 - `./test.sh --fast` (task #19 ORDER BY slice, AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
+- `cargo test --workspace` (task #19 aggregate slice): pass, 0 failed.
+- `./test.sh --fast` (task #19 aggregate slice): pass, 0 failed, 4 skipped (deterministic sample).
 
 ## Prioritized Task Backlog
 
@@ -48,7 +51,7 @@ Test pass rate:
 16. Checkpoint and crash recovery
 17. ~~BEGIN/COMMIT/ROLLBACK SQL~~ ✓
 18. B+tree split/merge
-19. ORDER BY, LIMIT, aggregates (partial: ORDER BY + LIMIT/OFFSET done; aggregates pending)
+19. ~~ORDER BY, LIMIT, aggregates~~ ✓
 
 ## Completed Tasks
 
@@ -111,6 +114,10 @@ Test pass rate:
   - Added `Database` execution support with explicit transaction state tracking and autocommit gating for write statements
   - `ROLLBACK` restores connection-local table/index catalogs from a BEGIN snapshot and reopens the pager to drop uncommitted in-memory page changes
   - Added parser tests and integration tests for deferred WAL writes, rollback behavior, and transaction state errors
+- [x] SELECT aggregate execution (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) in `crates/ralph-sqlite` (agent codex)
+  - Added aggregate-aware SELECT execution path for non-`GROUP BY` queries, including aggregate expressions such as `COUNT(*) + 1`
+  - Added NULL-aware aggregate semantics over empty inputs (`COUNT` -> `0`, others -> `NULL`)
+  - Added integration tests for table-backed aggregates, no-`FROM` aggregates, and mixed aggregate/non-aggregate rejection without `GROUP BY`
 
 ## Known Issues
 
@@ -126,4 +133,4 @@ Test pass rate:
 - Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
 - Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
 - Multi-column and UNIQUE index execution are not supported yet.
-- SELECT aggregate function execution (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) is not implemented yet.
+- Aggregate queries do not support `GROUP BY`/`HAVING`; column references outside aggregate functions are rejected in aggregate SELECTs.
