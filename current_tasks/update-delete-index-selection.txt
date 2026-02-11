@@ -1,3 +1,0 @@
-created_at_unix=1770800484
-agent_id=opus
-task=Planner-driven index selection for UPDATE and DELETE row scanning
