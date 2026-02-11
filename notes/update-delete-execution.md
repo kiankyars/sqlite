@@ -2,27 +2,33 @@
 
 ## Scope completed
 
-Implemented a storage-layer delete primitive in `crates/storage/src/btree.rs` as groundwork for task #12:
+Task #12 is now implemented end-to-end in `crates/ralph-sqlite/src/lib.rs`:
 
-- Added `BTree::delete(key) -> io::Result<bool>`.
-- Delete traverses the tree to the target leaf and removes the key if present.
-- Return value semantics:
-  - `Ok(true)` when a row is deleted.
-  - `Ok(false)` when the key is not present.
+- `Database::execute` now dispatches parsed `UPDATE` and `DELETE` statements.
+- Added execution handlers:
+  - `execute_update(UpdateStmt)` returns `ExecuteResult::Update { rows_affected }`
+  - `execute_delete(DeleteStmt)` returns `ExecuteResult::Delete { rows_affected }`
+- `WHERE` filtering for UPDATE/DELETE reuses existing expression evaluation.
+- UPDATE assignments are evaluated against the original row image, then applied.
+- DELETE uses `BTree::delete(key)` for each qualifying row key.
 
 ## Tests added
 
-- `delete_existing_and_missing_keys`
-- `delete_after_leaf_splits`
+Added integration-focused tests in `crates/ralph-sqlite/src/lib.rs`:
 
-Both are in `crates/storage/src/btree.rs` tests and pass under `cargo test --workspace`.
+- `update_with_where_updates_matching_rows`
+- `delete_with_where_removes_matching_rows`
+- `update_and_delete_without_where_affect_all_rows`
 
-## Important behavior note
+These pass under `cargo test --workspace`.
 
-Delete is currently **non-rebalancing**. It does not merge/redistribute underflowing nodes and does not shrink roots. This matches current staged roadmap expectations (task #18 handles merge/rebalance).
+## Behavior notes
 
-## Suggested next steps for task #12
+- UPDATE/DELETE currently execute as full table scans in key order.
+- B+tree delete remains **non-rebalancing** at storage level (no merge/redistribute; task #18).
+- Schema/table metadata remains connection-local pending task #8.
 
-1. Build a table-level row codec + scan/filter path in executor/storage integration.
-2. Wire parsed `UPDATE` and `DELETE` AST nodes to row selection + write/delete operations.
-3. Reuse expression evaluation implementation (task #11) for `WHERE` predicate matching.
+## Suggested next steps
+
+1. Persist table metadata via schema-table storage (task #8) so UPDATE/DELETE work across reopen.
+2. Integrate planner/index selection to avoid full scans once indexes exist (tasks #13-14).

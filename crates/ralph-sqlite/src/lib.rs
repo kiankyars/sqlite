@@ -3,12 +3,12 @@
 /// This crate provides a minimal embedded database API that parses SQL
 /// statements and executes a small supported subset against pager + B+tree
 /// storage.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ralph_parser::ast::{
-    BinaryOperator, CreateTableStmt, Expr, InsertStmt, SelectColumn, SelectStmt, Stmt, UnaryOperator,
+    Assignment, BinaryOperator, CreateTableStmt, DeleteStmt, Expr, InsertStmt, SelectColumn,
+    SelectStmt, Stmt, UnaryOperator, UpdateStmt,
 };
 use ralph_storage::pager::PageNum;
 use ralph_storage::{BTree, Pager};
@@ -31,6 +31,8 @@ pub struct QueryResult {
 pub enum ExecuteResult {
     CreateTable,
     Insert { rows_affected: usize },
+    Update { rows_affected: usize },
+    Delete { rows_affected: usize },
     Select(QueryResult),
 }
 
@@ -60,6 +62,8 @@ impl Database {
         match stmt {
             Stmt::CreateTable(create_stmt) => self.execute_create_table(create_stmt),
             Stmt::Insert(insert_stmt) => self.execute_insert(insert_stmt),
+            Stmt::Update(update_stmt) => self.execute_update(update_stmt),
+            Stmt::Delete(delete_stmt) => self.execute_delete(delete_stmt),
             Stmt::Select(select_stmt) => self.execute_select(select_stmt),
             other => Err(format!("statement not supported yet: {other:?}")),
         }
@@ -138,6 +142,83 @@ impl Database {
         Ok(ExecuteResult::Insert { rows_affected })
     }
 
+    fn execute_update(&mut self, stmt: UpdateStmt) -> Result<ExecuteResult, String> {
+        let table_key = normalize_identifier(&stmt.table);
+        let meta = self
+            .tables
+            .get(&table_key)
+            .cloned()
+            .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
+        let assignments = resolve_update_assignments(&meta, &stmt.assignments)?;
+
+        let mut tree = BTree::new(&mut self.pager, meta.root_page);
+        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let mut rows_affected = 0usize;
+
+        for entry in entries {
+            let original_row = decode_table_row(&meta, &entry.payload)?;
+            if !where_clause_matches(&meta, &original_row, stmt.where_clause.as_ref())? {
+                continue;
+            }
+
+            // UPDATE assignments are evaluated against the original row.
+            let mut evaluated_assignments = Vec::with_capacity(assignments.len());
+            for (col_idx, expr) in &assignments {
+                let value = eval_expr(expr, Some((&meta, &original_row)))?;
+                evaluated_assignments.push((*col_idx, value));
+            }
+
+            let mut updated_row = original_row;
+            for (col_idx, value) in evaluated_assignments {
+                updated_row[col_idx] = value;
+            }
+
+            let encoded = encode_row(&updated_row)?;
+            tree.insert(entry.key, &encoded)
+                .map_err(|e| format!("update row: {e}"))?;
+            rows_affected += 1;
+        }
+
+        self.pager
+            .flush_all()
+            .map_err(|e| format!("flush update: {e}"))?;
+
+        Ok(ExecuteResult::Update { rows_affected })
+    }
+
+    fn execute_delete(&mut self, stmt: DeleteStmt) -> Result<ExecuteResult, String> {
+        let table_key = normalize_identifier(&stmt.table);
+        let meta = self
+            .tables
+            .get(&table_key)
+            .cloned()
+            .ok_or_else(|| format!("no such table '{}'", stmt.table))?;
+
+        let mut tree = BTree::new(&mut self.pager, meta.root_page);
+        let entries = tree.scan_all().map_err(|e| format!("scan table: {e}"))?;
+        let mut rows_affected = 0usize;
+
+        for entry in entries {
+            let row = decode_table_row(&meta, &entry.payload)?;
+            if !where_clause_matches(&meta, &row, stmt.where_clause.as_ref())? {
+                continue;
+            }
+
+            let deleted = tree
+                .delete(entry.key)
+                .map_err(|e| format!("delete row: {e}"))?;
+            if deleted {
+                rows_affected += 1;
+            }
+        }
+
+        self.pager
+            .flush_all()
+            .map_err(|e| format!("flush delete: {e}"))?;
+
+        Ok(ExecuteResult::Delete { rows_affected })
+    }
+
     fn execute_select(&mut self, stmt: SelectStmt) -> Result<ExecuteResult, String> {
         if !stmt.order_by.is_empty() {
             return Err("ORDER BY is not supported yet".to_string());
@@ -155,20 +236,9 @@ impl Database {
 
             let mut projected_rows = Vec::new();
             for entry in entries {
-                let decoded = decode_row(&entry.payload)?;
-                if decoded.len() != meta.columns.len() {
-                    return Err(format!(
-                        "row column count {} does not match table schema {}",
-                        decoded.len(),
-                        meta.columns.len()
-                    ));
-                }
-
-                if let Some(where_expr) = &stmt.where_clause {
-                    let predicate = eval_expr(where_expr, Some((&meta, &decoded)))?;
-                    if !is_truthy(&predicate) {
-                        continue;
-                    }
+                let decoded = decode_table_row(&meta, &entry.payload)?;
+                if !where_clause_matches(&meta, &decoded, stmt.where_clause.as_ref())? {
+                    continue;
                 }
 
                 projected_rows.push(project_row(&stmt.columns, &meta, &decoded)?);
@@ -223,7 +293,10 @@ impl Database {
     }
 }
 
-fn resolve_insert_columns(meta: &TableMeta, columns: Option<&Vec<String>>) -> Result<Vec<usize>, String> {
+fn resolve_insert_columns(
+    meta: &TableMeta,
+    columns: Option<&Vec<String>>,
+) -> Result<Vec<usize>, String> {
     let mut result = Vec::new();
     if let Some(cols) = columns {
         let mut seen = HashSet::new();
@@ -241,13 +314,59 @@ fn resolve_insert_columns(meta: &TableMeta, columns: Option<&Vec<String>>) -> Re
     Ok(result)
 }
 
+fn resolve_update_assignments(
+    meta: &TableMeta,
+    assignments: &[Assignment],
+) -> Result<Vec<(usize, Expr)>, String> {
+    let mut resolved = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let col_idx = find_column_index(meta, &assignment.column).ok_or_else(|| {
+            format!(
+                "unknown column '{}' in table '{}'",
+                assignment.column, meta.name
+            )
+        })?;
+        resolved.push((col_idx, assignment.value.clone()));
+    }
+    Ok(resolved)
+}
+
 fn find_column_index(meta: &TableMeta, column: &str) -> Option<usize> {
     meta.columns
         .iter()
         .position(|c| c.eq_ignore_ascii_case(column))
 }
 
-fn project_row(columns: &[SelectColumn], meta: &TableMeta, row: &[Value]) -> Result<Vec<Value>, String> {
+fn decode_table_row(meta: &TableMeta, payload: &[u8]) -> Result<Vec<Value>, String> {
+    let row = decode_row(payload)?;
+    if row.len() != meta.columns.len() {
+        return Err(format!(
+            "row column count {} does not match table schema {}",
+            row.len(),
+            meta.columns.len()
+        ));
+    }
+    Ok(row)
+}
+
+fn where_clause_matches(
+    meta: &TableMeta,
+    row: &[Value],
+    where_clause: Option<&Expr>,
+) -> Result<bool, String> {
+    if let Some(where_expr) = where_clause {
+        let predicate = eval_expr(where_expr, Some((meta, row)))?;
+        Ok(is_truthy(&predicate))
+    } else {
+        Ok(true)
+    }
+}
+
+fn project_row(
+    columns: &[SelectColumn],
+    meta: &TableMeta,
+    row: &[Value],
+) -> Result<Vec<Value>, String> {
     let mut projected = Vec::new();
     for column in columns {
         match column {
@@ -271,7 +390,10 @@ fn project_row_no_from(columns: &[SelectColumn]) -> Result<Vec<Value>, String> {
     Ok(projected)
 }
 
-fn select_output_columns(columns: &[SelectColumn], meta: Option<&TableMeta>) -> Result<Vec<String>, String> {
+fn select_output_columns(
+    columns: &[SelectColumn],
+    meta: Option<&TableMeta>,
+) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for (idx, col) in columns.iter().enumerate() {
         match col {
@@ -326,7 +448,8 @@ fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Val
         Expr::Null => Ok(Value::Null),
         Expr::Paren(inner) => eval_expr(inner, row_ctx),
         Expr::ColumnRef { table, column } => {
-            let (meta, row) = row_ctx.ok_or_else(|| "column reference requires a table row".to_string())?;
+            let (meta, row) =
+                row_ctx.ok_or_else(|| "column reference requires a table row".to_string())?;
             if let Some(table_name) = table {
                 if !meta.name.eq_ignore_ascii_case(table_name) {
                     return Err(format!(
@@ -375,11 +498,18 @@ fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Val
             let low_v = eval_expr(low, row_ctx)?;
             let high_v = eval_expr(high, row_ctx)?;
             let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
-            let le_high = compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+            let le_high =
+                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
-            Ok(Value::Integer((if *negated { !between } else { between }) as i64))
+            Ok(Value::Integer(
+                (if *negated { !between } else { between }) as i64,
+            ))
         }
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let value = eval_expr(expr, row_ctx)?;
             let mut found = false;
             for item in list {
@@ -389,7 +519,9 @@ fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Val
                     break;
                 }
             }
-            Ok(Value::Integer((if *negated { !found } else { found }) as i64))
+            Ok(Value::Integer(
+                (if *negated { !found } else { found }) as i64,
+            ))
         }
         Expr::FunctionCall { name, .. } => Err(format!("function '{name}' is not supported yet")),
     }
@@ -402,13 +534,18 @@ fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value,
         Add | Subtract | Multiply | Divide | Modulo => eval_numeric_binary(lhs, op, rhs),
         Eq => Ok(Value::Integer(values_equal(lhs, rhs) as i64)),
         NotEq => Ok(Value::Integer((!values_equal(lhs, rhs)) as i64)),
-        Lt => compare_values(lhs, rhs).map(|o| Value::Integer((o == std::cmp::Ordering::Less) as i64)),
+        Lt => {
+            compare_values(lhs, rhs).map(|o| Value::Integer((o == std::cmp::Ordering::Less) as i64))
+        }
         LtEq => compare_values(lhs, rhs).map(|o| {
             Value::Integer((o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal) as i64)
         }),
-        Gt => compare_values(lhs, rhs).map(|o| Value::Integer((o == std::cmp::Ordering::Greater) as i64)),
+        Gt => compare_values(lhs, rhs)
+            .map(|o| Value::Integer((o == std::cmp::Ordering::Greater) as i64)),
         GtEq => compare_values(lhs, rhs).map(|o| {
-            Value::Integer((o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal) as i64)
+            Value::Integer(
+                (o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal) as i64,
+            )
         }),
         And => Ok(Value::Integer((is_truthy(lhs) && is_truthy(rhs)) as i64)),
         Or => Ok(Value::Integer((is_truthy(lhs) || is_truthy(rhs)) as i64)),
@@ -417,7 +554,11 @@ fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value,
             let needle = value_to_string(rhs).replace('%', "");
             Ok(Value::Integer(haystack.contains(&needle) as i64))
         }
-        Concat => Ok(Value::Text(format!("{}{}", value_to_string(lhs), value_to_string(rhs)))),
+        Concat => Ok(Value::Text(format!(
+            "{}{}",
+            value_to_string(lhs),
+            value_to_string(rhs)
+        ))),
     }
 }
 
@@ -696,7 +837,8 @@ mod tests {
 
         db.execute("CREATE TABLE t (a INTEGER, b TEXT, c INTEGER);")
             .unwrap();
-        db.execute("INSERT INTO t (b, a) VALUES ('x', 10);").unwrap();
+        db.execute("INSERT INTO t (b, a) VALUES ('x', 10);")
+            .unwrap();
 
         let result = db.execute("SELECT * FROM t;").unwrap();
         match result {
@@ -724,8 +866,105 @@ mod tests {
         let result = db.execute("SELECT 1 + 2, 'ok';").unwrap();
         match result {
             ExecuteResult::Select(q) => {
-                assert_eq!(q.rows, vec![vec![Value::Integer(3), Value::Text("ok".to_string())]]);
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(3), Value::Text("ok".to_string())]]
+                );
             }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_with_where_updates_matching_rows() {
+        let path = temp_db_path("update_with_where");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER, name TEXT, score INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'cara', 30);")
+            .unwrap();
+
+        let result = db
+            .execute("UPDATE users SET score = score + 5, name = 'updated' WHERE id >= 2;")
+            .unwrap();
+        assert_eq!(result, ExecuteResult::Update { rows_affected: 2 });
+
+        let selected = db.execute("SELECT id, name, score FROM users;").unwrap();
+        match selected {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![
+                        vec![
+                            Value::Integer(1),
+                            Value::Text("alice".to_string()),
+                            Value::Integer(10)
+                        ],
+                        vec![
+                            Value::Integer(2),
+                            Value::Text("updated".to_string()),
+                            Value::Integer(25)
+                        ],
+                        vec![
+                            Value::Integer(3),
+                            Value::Text("updated".to_string()),
+                            Value::Integer(35)
+                        ],
+                    ]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn delete_with_where_removes_matching_rows() {
+        let path = temp_db_path("delete_with_where");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4);")
+            .unwrap();
+
+        let deleted = db.execute("DELETE FROM t WHERE id >= 3;").unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 2 });
+
+        let remaining = db.execute("SELECT id FROM t;").unwrap();
+        match remaining {
+            ExecuteResult::Select(q) => {
+                assert_eq!(
+                    q.rows,
+                    vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+                );
+            }
+            _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_and_delete_without_where_affect_all_rows() {
+        let path = temp_db_path("update_delete_all_rows");
+        let mut db = Database::open(&path).unwrap();
+
+        db.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3);").unwrap();
+
+        let updated = db.execute("UPDATE t SET v = v * 2;").unwrap();
+        assert_eq!(updated, ExecuteResult::Update { rows_affected: 3 });
+
+        let deleted = db.execute("DELETE FROM t;").unwrap();
+        assert_eq!(deleted, ExecuteResult::Delete { rows_affected: 3 });
+
+        let remaining = db.execute("SELECT * FROM t;").unwrap();
+        match remaining {
+            ExecuteResult::Select(q) => assert!(q.rows.is_empty()),
             _ => panic!("expected SELECT result"),
         }
 

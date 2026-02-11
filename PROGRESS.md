@@ -2,7 +2,7 @@
 
 ## Current Status
 
-**Phase: Stage 2 (Storage + basic SQL execution)** — tokenizer/parser, pager, B+tree, and basic end-to-end CREATE/INSERT/SELECT execution are implemented.
+**Phase: Stage 4 (partial)** — tokenizer/parser, pager, B+tree, and end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution are implemented; schema persistence and planner/index work remain.
 
 Latest completions:
 - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1) — replaces prior implementations with comprehensive coverage of 6 statement types, full expression parsing with operator precedence, WHERE/ORDER BY/LIMIT/OFFSET
@@ -11,9 +11,10 @@ Latest completions:
 - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
 - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
 - B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
+- End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
 
 Test pass rate:
-- `cargo test --workspace`: passing.
+- `cargo test --workspace` (task #12 implementation): pass, 0 failed.
 - `./test.sh --fast` (AGENT_ID=4): pass, 0 failed, 5 skipped (deterministic sample).
 - `./test.sh --fast` (AGENT_ID=3): pass, 0 failed, 4 skipped (deterministic sample).
 - `./test.sh` (full): 5/5 passed (latest known full-harness run).
@@ -31,7 +32,7 @@ Test pass rate:
 9. ~~End-to-end: CREATE TABLE + INSERT + SELECT~~ ✓
 10. Volcano iterator model (Scan, Filter, Project)
 11. Expression evaluation
-12. UPDATE and DELETE execution
+12. ~~UPDATE and DELETE execution~~ ✓
 13. Secondary indexes (CREATE INDEX)
 14. Query planner (index selection)
 15. WAL write path and commit
@@ -79,11 +80,17 @@ Test pass rate:
   - Added `BTree::delete(key) -> io::Result<bool>` to remove keys from the target leaf
   - Traverses interior nodes to locate the leaf; returns `false` when key is absent
   - Added tests for deleting existing/missing keys and deleting after leaf splits
+- [x] End-to-end UPDATE/DELETE execution in `crates/ralph-sqlite` (agent codex)
+  - Added statement dispatch for `Stmt::Update` / `Stmt::Delete`
+  - Added `ExecuteResult::Update { rows_affected }` and `ExecuteResult::Delete { rows_affected }`
+  - Reused expression evaluation for `WHERE` predicates and UPDATE assignment values
+  - Added integration tests: update with WHERE, delete with WHERE, and full-table update/delete
 
 ## Known Issues
 
 - Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
 - B+tree delete currently does not rebalance/merge underflowing nodes (deferred to task #18).
+- UPDATE/DELETE currently run as full table scans (no index-based row selection yet).
 - No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
 - No JOIN support (single-table FROM only)
 - No subquery support
