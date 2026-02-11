@@ -1,3 +1,0 @@
-created_at_unix=1770801200
-agent_id=opus
-task=Implement DROP TABLE and DROP INDEX execution (parser + ralph-sqlite)
