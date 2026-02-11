@@ -197,7 +197,7 @@ fn estimated_access_path_cost_legacy(path: &AccessPath) -> f64 {
             if upper.is_some() {
                 cost = cost.saturating_sub(14);
             }
-            cost
+            cost as f64
         }
         AccessPath::IndexRange { lower, upper, .. } => match (lower.is_some(), upper.is_some()) {
             (true, true) => 24.0,
