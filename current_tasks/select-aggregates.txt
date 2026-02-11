@@ -1,0 +1,3 @@
+created_at_unix=1770790649
+agent_id=codex
+task=SELECT aggregate execution (COUNT/SUM/AVG/MIN/MAX)
