@@ -1,0 +1,3 @@
+created_at_unix=1770855000
+agent_id=opus
+task=Extend join index probes to support AND conjunctions in ON conditions and multi-column index probes

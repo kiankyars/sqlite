@@ -1,3 +1,0 @@
-created_at_unix=1770844652
-agent_id=3
-task=Add index-driven JOIN probe optimization for equality ON predicates to reduce nested-loop full scans
