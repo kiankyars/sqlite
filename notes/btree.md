@@ -28,24 +28,30 @@ Starts at byte 9. Each entry is a u16 offset into the page. Entries are sorted b
 BTree::create(pager) -> PageNum       // Allocate and init empty leaf
 BTree::new(pager, root_page)          // Open existing tree
 tree.insert(key, payload)             // Insert or update
+tree.delete(key)                      // Remove cell and rebalance if needed
 tree.lookup(key) -> Option<Vec<u8>>   // Point lookup
 tree.scan_all() -> Vec<Entry>         // Full ordered scan
 tree.scan_range(min, max) -> Vec<Entry>  // Range scan
-tree.root_page() -> PageNum           // Current root (may change after split)
+tree.root_page() -> PageNum           // Current root (may change after split/merge)
 ```
 
 ## Design Decisions
 
 - Keys are i64 stored big-endian so byte ordering matches numeric ordering.
-- Leaf splitting: collect all entries + new one, sort, split at midpoint. Left leaf points to right sibling via next_leaf.
-- Interior splitting: similar collect-and-split approach. Median key is promoted to parent.
-- When root splits, a new root is created with one key and two children.
-- Update = delete old cell + insert new cell (simple, avoids in-place resize).
-- No overflow pages yet — payload must fit within a single page cell.
+- **Leaf splitting**: collect all entries + new one, sort, split at midpoint. Left leaf points to right sibling via next_leaf.
+- **Interior splitting**: similar collect-and-split approach. Median key is promoted to parent.
+- **Root splits**: a new root is created with one key and two children.
+- **Update**: delete old cell + insert new cell (simple, avoids in-place resize).
+- **Overflow pages**: payloads exceeding a fraction of page size use overflow pages (see task notes).
 
-## What's Next
+### Delete and Rebalance
 
-- **Schema table** (task #8): Use a B+tree to store table/index metadata.
-- **Overflow pages**: For large payloads exceeding ~page_size/4.
-- **Delete operation**: Remove cells from leaves; merge underflowing nodes (task #18).
-- **B+tree merge** (task #18): Rebalance on delete.
+- **Recursive Delete**: `BTree::delete` performs recursive delete with underflow propagation.
+- **Underflow Threshold**: Nodes are considered underfull below 35% logical utilization.
+  - Logical utilization for leaves includes live cells (`key + payload_size + payload`) and pointer array.
+  - Logical utilization for interior nodes includes `PAGE_HEADER_SIZE + key_count * (INTERIOR_CELL_SIZE + CELL_PTR_SIZE)`.
+- **Sibling Rebalance**:
+  - **Merge**: If two adjacent siblings fit in one page, they are merged. The removed child page is reclaimed via `Pager::free_page`.
+  - **Redistribute**: If merge would overflow, entries are redistributed across siblings, and the parent separator key is updated.
+- **Root Compaction**: When a root interior node's separator count drops to zero, its only child is copied into the root page. This keeps the root page number stable.
+- **Page Reclamation**: `free_page` is called on removed pages during root compaction and empty-child rebalancing.

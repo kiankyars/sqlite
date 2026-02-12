@@ -1,39 +1,55 @@
-# Schema Table Notes
+# Schema and Secondary Indexes
 
-## Overview
+This document describes how ralph-sqlite manages database metadata and secondary indexes.
 
-The schema table is a B+tree rooted at `header.schema_root`. It stores one entry per database object (table or index), keyed by a sequential i64 ID.
+## Schema Table (Catalog)
 
-## API
+The schema table (equivalent to `sqlite_master`) is the root of the database's metadata. It is stored in a B+tree rooted at **Page 1** (as indicated in `header.schema_root`).
 
-```rust
-Schema::initialize(pager) -> PageNum       // Create schema B+tree, set header.schema_root
-Schema::create_table(pager, name, cols, sql) -> PageNum  // Returns new table's root page
-Schema::find_table(pager, name) -> Option<SchemaEntry>
-Schema::list_tables(pager) -> Vec<SchemaEntry>
-```
+### Storage and Persistence
+- **Structure**: A B+tree keyed by object name (string).
+- **Entries**: Each entry persists metadata for one object:
+  - `type`: `table`, `index`, or `stats`.
+  - `name`: Object name (e.g., `users`).
+  - `table_name`: For indexes and stats, the name of the associated table.
+  - `root_page`: The PageNum of the object's B+tree root.
+  - `sql`: The original `CREATE` statement.
+- **Lifecycle**:
+  - `Database::open` loads the schema tree into in-memory catalogs.
+  - `CREATE` and `DROP` statements update both the in-memory maps and the on-disk schema B+tree.
+  - Schema initialization happens on the first open if `header.schema_root` is 0.
 
-## SchemaEntry Fields
+## Secondary Indexes
 
-- `id`: i64 — B+tree key (sequential)
-- `object_type`: Table | Index
-- `name`: object name
-- `table_name`: for indexes, the associated table
-- `root_page`: PageNum of the object's B+tree root
-- `sql`: original CREATE statement
-- `columns`: Vec<ColumnInfo> with name, data_type, index
+Secondary indexes provide efficient access paths by mapping indexed column values to rowids.
 
-## Serialization Format
+### Index Types
+- **Single-Column**: Indexed on a single table column.
+- **Multi-Column (Composite)**: Indexed on a sequence of columns. Uses tuple-based key encoding.
+- **Unique**: Enforces that no two rows share the same non-NULL indexed values.
 
-Binary, big-endian:
-```
-[u8 object_type] [u32 root_page] [str name] [str table_name] [str sql]
-[u16 col_count] { [str col_name] [str col_type] [u32 col_index] }*
-```
-Where `str` = `[u16 len] [utf-8 bytes]`.
+### Index Key Encoding
+Index keys are 64-bit integers (`i64`) used as B+tree keys.
+- **Numeric**: `INTEGER` and finite `REAL` values use an order-preserving encoding, mapping them to a monotonic `i64` space. This enables true B+tree range seeks.
+- **Text**: Strings use a lexicographic prefix encoding (approx. 8 bytes) to enable range seeks, with residual value-level filtering to resolve collisions.
+- **Hash Fallback**: Values that cannot be ordered (e.g., `NULL`, `NaN`, or multi-column hashes for point lookups) use a hash-based key (`FNV-1a`).
+- **Multi-Column Encoding**: Composite values are encoded as tuples and either hashed (for equality) or prefix-encoded (for range scans).
 
-## Integration Points
+### Maintenance
+- **Backfill**: `CREATE INDEX` scans the table to populate the new index B+tree.
+- **DML Integration**: `INSERT`, `UPDATE`, and `DELETE` automatically maintain all indexes on the affected table.
+- **Uniqueness**: `UNIQUE` constraints are validated before writes. `NULL` values are excluded from uniqueness checks (multiple NULLs are allowed).
 
-- **CREATE TABLE**: Parser produces `CreateTableStatement` → `Schema::create_table` stores metadata and allocates a data B+tree.
-- **INSERT/SELECT**: Look up table via `Schema::find_table` to get the data B+tree root_page.
-- **End-to-end** (task #9): Wire parser → schema → btree for full SQL execution.
+## Page Reclamation
+
+When objects are removed, ralph-sqlite performs physical page reclamation to keep the database file compact:
+- **Schema Removal**: The metadata entry is deleted from the schema B+tree.
+- **Tree Reclamation**: `BTree::reclaim_tree` traverses the object's B+tree and returns all pages to the `Pager`'s freelist.
+- **Cascading Drop**: Dropping a table automatically reclaims all associated secondary indexes.
+
+## Planner Statistics
+
+The schema table also stores `stats` entries used for cost-based optimization.
+- **Table Stats**: Row counts.
+- **Index Stats**: Row counts, distinct key counts, and **prefix fanout** (distinct counts for each leading prefix level in composite indexes).
+- **Maintenance**: Stats are refreshed after DML operations and persisted alongside other schema metadata.

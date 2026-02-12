@@ -263,7 +263,11 @@ impl<'a> Filter<'a> {
 
     pub fn from_expr(input: Box<dyn Operator + 'a>, predicate: Expr, columns: Vec<String>) -> Self {
         Self::new(input, move |row| {
-            let value = eval_expr(&predicate, Some((row, columns.as_slice())))?;
+            let ctx = SimpleRowContext {
+                row,
+                columns: columns.as_slice(),
+            };
+            let value = eval_expr_simple(&predicate, Some(&ctx))?;
             Ok(is_truthy(&value))
         })
     }
@@ -323,9 +327,13 @@ impl<'a> Project<'a> {
         columns: Vec<String>,
     ) -> Self {
         Self::new(input, move |row| {
+            let ctx = SimpleRowContext {
+                row,
+                columns: columns.as_slice(),
+            };
             expressions
                 .iter()
-                .map(|expr| eval_expr(expr, Some((row, columns.as_slice()))))
+                .map(|expr| eval_expr_simple(expr, Some(&ctx)))
                 .collect()
         })
     }
@@ -367,36 +375,61 @@ pub fn execute<'a>(mut root: Box<dyn Operator + 'a>) -> ExecResult<Vec<Row>> {
     Ok(rows)
 }
 
-pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<Value> {
+pub trait RowContext {
+    fn resolve(&self, table: Option<&str>, column: &str) -> ExecResult<Value>;
+}
+
+/// A simple row context that resolves columns by name from a single table (unqualified).
+pub struct SimpleRowContext<'a> {
+    pub row: &'a [Value],
+    pub columns: &'a [String],
+}
+
+impl<'a> RowContext for SimpleRowContext<'a> {
+    fn resolve(&self, table: Option<&str>, column: &str) -> ExecResult<Value> {
+        if table.is_some() {
+            return Err(ExecutorError::new(
+                "table-qualified column references are not supported in SimpleRowContext",
+            ));
+        }
+        let idx = self
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(column))
+            .ok_or_else(|| ExecutorError::new(format!("unknown column '{column}'")))?;
+        self.row
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| ExecutorError::new(format!("row is missing column '{column}'")))
+    }
+}
+
+pub fn eval_expr<F>(
+    expr: &Expr,
+    ctx: Option<&dyn RowContext>,
+    custom_fn: Option<&F>,
+) -> ExecResult<Value>
+where
+    F: Fn(&str, &[Value]) -> ExecResult<Value>,
+{
     match expr {
         Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
         Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
         Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
         Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, row_ctx),
+        Expr::Paren(inner) => eval_expr(inner, ctx, custom_fn),
         Expr::ColumnRef { table, column } => {
-            if table.is_some() {
-                return Err(ExecutorError::new(
-                    "table-qualified column references are not supported yet",
-                ));
-            }
-            let (row, columns) = row_ctx
+            let ctx = ctx
                 .ok_or_else(|| ExecutorError::new("column reference requires row context"))?;
-            if column == "*" {
+            if *column == "*" {
                 return Err(ExecutorError::new(
                     "'*' cannot be used as a scalar expression",
                 ));
             }
-            let idx = columns
-                .iter()
-                .position(|name| name.eq_ignore_ascii_case(column))
-                .ok_or_else(|| ExecutorError::new(format!("unknown column '{column}'")))?;
-            row.get(idx)
-                .cloned()
-                .ok_or_else(|| ExecutorError::new(format!("row is missing column '{column}'")))
+            ctx.resolve(table.as_deref(), column)
         }
         Expr::UnaryOp { op, expr } => {
-            let value = eval_expr(expr, row_ctx)?;
+            let value = eval_expr(expr, ctx, custom_fn)?;
             match op {
                 UnaryOperator::Negate => match value {
                     Value::Integer(i) => Ok(Value::Integer(-i)),
@@ -408,12 +441,12 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            let lhs = eval_expr(left, row_ctx)?;
-            let rhs = eval_expr(right, row_ctx)?;
+            let lhs = eval_expr(left, ctx, custom_fn)?;
+            let rhs = eval_expr(right, ctx, custom_fn)?;
             eval_binary_op(&lhs, *op, &rhs)
         }
         Expr::IsNull { expr, negated } => {
-            let value = eval_expr(expr, row_ctx)?;
+            let value = eval_expr(expr, ctx, custom_fn)?;
             let is_null = matches!(value, Value::Null);
             Ok(Value::Integer(
                 (if *negated { !is_null } else { is_null }) as i64,
@@ -425,9 +458,9 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
             high,
             negated,
         } => {
-            let value = eval_expr(expr, row_ctx)?;
-            let low_value = eval_expr(low, row_ctx)?;
-            let high_value = eval_expr(high, row_ctx)?;
+            let value = eval_expr(expr, ctx, custom_fn)?;
+            let low_value = eval_expr(low, ctx, custom_fn)?;
+            let high_value = eval_expr(high, ctx, custom_fn)?;
             let ge_low =
                 compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
             let le_high =
@@ -442,10 +475,10 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
             list,
             negated,
         } => {
-            let value = eval_expr(expr, row_ctx)?;
+            let value = eval_expr(expr, ctx, custom_fn)?;
             let mut found = false;
             for item in list {
-                let candidate = eval_expr(item, row_ctx)?;
+                let candidate = eval_expr(item, ctx, custom_fn)?;
                 if values_equal(&value, &candidate) {
                     found = true;
                     break;
@@ -458,13 +491,24 @@ pub fn eval_expr(expr: &Expr, row_ctx: Option<(&Row, &[String])>) -> ExecResult<
         Expr::FunctionCall { name, args } => {
             let mut values = Vec::with_capacity(args.len());
             for arg in args {
-                values.push(eval_expr(arg, row_ctx)?);
+                values.push(eval_expr(arg, ctx, custom_fn)?);
+            }
+            if let Some(custom) = custom_fn {
+                match custom(name, &values) {
+                    Ok(v) => return Ok(v),
+                    Err(_) => {
+                        // Fallback to standard scalar functions if custom fails
+                    }
+                }
             }
             eval_scalar_function(name, &values)
         }
     }
 }
 
+pub fn eval_expr_simple(expr: &Expr, ctx: Option<&dyn RowContext>) -> ExecResult<Value> {
+    eval_expr::<fn(&str, &[Value]) -> ExecResult<Value>>(expr, ctx, None)
+}
 pub fn eval_scalar_function(name: &str, args: &[Value]) -> ExecResult<Value> {
     if name.eq_ignore_ascii_case("LENGTH") {
         expect_arg_count(name, args, 1)?;
@@ -711,7 +755,7 @@ fn sql_substr(source: &str, start: i64, length: Option<i64>) -> String {
     chars[begin as usize..end as usize].iter().collect()
 }
 
-fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> ExecResult<Value> {
+pub fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> ExecResult<Value> {
     use BinaryOperator::*;
 
     match op {
@@ -784,7 +828,7 @@ fn numeric_operands(lhs: &Value, rhs: &Value) -> ExecResult<(f64, f64, bool)> {
     Ok((left, right, both_int))
 }
 
-fn value_to_f64(value: &Value) -> ExecResult<f64> {
+pub fn value_to_f64(value: &Value) -> ExecResult<f64> {
     match value {
         Value::Integer(i) => Ok(*i as f64),
         Value::Real(f) => Ok(*f),
@@ -793,7 +837,7 @@ fn value_to_f64(value: &Value) -> ExecResult<f64> {
     }
 }
 
-fn value_to_string(value: &Value) -> String {
+pub fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Integer(i) => i.to_string(),
@@ -842,7 +886,7 @@ fn like_dp(h: &[char], p: &[char]) -> bool {
     dp[pn]
 }
 
-fn values_equal(lhs: &Value, rhs: &Value) -> bool {
+pub fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Null, Value::Null) => true,
         (Value::Integer(a), Value::Integer(b)) => a == b,
@@ -854,7 +898,7 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     }
 }
 
-fn compare_values(lhs: &Value, rhs: &Value) -> ExecResult<std::cmp::Ordering> {
+pub fn compare_values(lhs: &Value, rhs: &Value) -> ExecResult<std::cmp::Ordering> {
     match (lhs, rhs) {
         (Value::Integer(a), Value::Integer(b)) => Ok(a.cmp(b)),
         (Value::Real(a), Value::Real(b)) => a
@@ -874,7 +918,7 @@ fn compare_values(lhs: &Value, rhs: &Value) -> ExecResult<std::cmp::Ordering> {
     }
 }
 
-fn is_truthy(value: &Value) -> bool {
+pub fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Integer(i) => *i != 0,
@@ -979,17 +1023,103 @@ pub fn encode_value(value: &Value, out: &mut Vec<u8>) -> ExecResult<()> {
     Ok(())
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub fn encode_row(row: &[Value]) -> ExecResult<Vec<u8>> {
+
+    let col_count: u32 = row
+
+        .len()
+
+        .try_into()
+
+        .map_err(|_| ExecutorError::new("row has too many columns"))?;
+
+
+
+    let mut out = Vec::new();
+
+    out.extend_from_slice(&col_count.to_be_bytes());
+
+    for value in row {
+
+        encode_value(value, &mut out)?;
+
+    }
+
+    Ok(out)
+
+}
+
+
+
+pub fn encode_index_payload(buckets: &[IndexBucket]) -> ExecResult<Vec<u8>> {
+
+    let bucket_count: u32 = buckets
+
+        .len()
+
+        .try_into()
+
+        .map_err(|_| ExecutorError::new("too many index buckets"))?;
+
+    let mut out = Vec::new();
+
+    out.extend_from_slice(&bucket_count.to_be_bytes());
+
+
+
+    for bucket in buckets {
+
+        encode_value(&bucket.value, &mut out)?;
+
+        let row_count: u32 = bucket
+
+            .rowids
+
+            .len()
+
+            .try_into()
+
+            .map_err(|_| ExecutorError::new("too many rowids in index bucket"))?;
+
+        out.extend_from_slice(&row_count.to_be_bytes());
+
+        for rowid in &bucket.rowids {
+
+            out.extend_from_slice(&rowid.to_be_bytes());
+
+        }
+
+    }
+
+
+
+    Ok(out)
+
+}
+
+
+
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+
     const PRIME: u64 = 0x100000001b3;
 
     let mut hash = OFFSET_BASIS;
+
     for b in bytes {
+
         hash ^= *b as u64;
+
         hash = hash.wrapping_mul(PRIME);
+
     }
+
     hash
+
 }
+
+
 
 fn ordered_numeric_key(value: f64) -> i64 {
     let bits = value.to_bits();
@@ -1202,19 +1332,20 @@ mod tests {
             Expr::IntegerLiteral(5),
         );
 
-        assert_eq!(eval_expr(&expr, None).unwrap(), int(1));
+        assert_eq!(eval_expr_simple(&expr, None).unwrap(), int(1));
     }
 
     #[test]
     fn eval_expr_resolves_columns_from_row_context() {
         let row = vec![int(3), int(4)];
         let columns = vec!["a".to_string(), "b".to_string()];
+        let ctx = SimpleRowContext {
+            row: &row,
+            columns: columns.as_slice(),
+        };
         let expr = bin(col("a"), BinaryOperator::Multiply, col("b"));
 
-        assert_eq!(
-            eval_expr(&expr, Some((&row, columns.as_slice()))).unwrap(),
-            int(12)
-        );
+        assert_eq!(eval_expr_simple(&expr, Some(&ctx)).unwrap(), int(12));
     }
 
     #[test]
@@ -1252,14 +1383,18 @@ mod tests {
     fn eval_expr_errors_on_unknown_column() {
         let row = vec![int(1)];
         let columns = vec!["known".to_string()];
-        let err = eval_expr(&col("missing"), Some((&row, columns.as_slice()))).unwrap_err();
+        let ctx = SimpleRowContext {
+            row: &row,
+            columns: columns.as_slice(),
+        };
+        let err = eval_expr_simple(&col("missing"), Some(&ctx)).unwrap_err();
         assert_eq!(err.to_string(), "unknown column 'missing'");
     }
 
     #[test]
     fn eval_expr_supports_scalar_functions() {
         assert_eq!(
-            eval_expr(
+            eval_expr_simple(
                 &call("LENGTH", vec![Expr::StringLiteral("hello".to_string())]),
                 None
             )
@@ -1267,7 +1402,7 @@ mod tests {
             int(5)
         );
         assert_eq!(
-            eval_expr(
+            eval_expr_simple(
                 &call("UPPER", vec![Expr::StringLiteral("MiXeD".to_string())]),
                 None
             )
@@ -1275,7 +1410,7 @@ mod tests {
             Value::Text("MIXED".to_string())
         );
         assert_eq!(
-            eval_expr(
+            eval_expr_simple(
                 &call(
                     "COALESCE",
                     vec![Expr::Null, Expr::IntegerLiteral(7), Expr::IntegerLiteral(8)]
@@ -1286,7 +1421,7 @@ mod tests {
             int(7)
         );
         assert_eq!(
-            eval_expr(
+            eval_expr_simple(
                 &call(
                     "SUBSTR",
                     vec![
@@ -1301,7 +1436,7 @@ mod tests {
             Value::Text("pha".to_string())
         );
         assert_eq!(
-            eval_expr(
+            eval_expr_simple(
                 &call(
                     "TRIM",
                     vec![
@@ -1318,7 +1453,7 @@ mod tests {
 
     #[test]
     fn eval_expr_scalar_function_errors_for_unsupported_name() {
-        let err = eval_expr(&call("DOES_NOT_EXIST", vec![]), None).unwrap_err();
+        let err = eval_expr_simple(&call("DOES_NOT_EXIST", vec![]), None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "function 'DOES_NOT_EXIST' is not supported yet"

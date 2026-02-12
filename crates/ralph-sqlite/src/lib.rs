@@ -7,9 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ralph_executor::{
-    self, decode_index_payload, decode_row, encode_value, eval_scalar_function,
-    index_key_for_value, ordered_index_key_for_value, sql_like_match, Filter, IndexBucket,
-    IndexEqScan, Operator, TableScan, Value,
+    self, compare_values, decode_index_payload, decode_row, encode_index_payload, encode_row,
+    encode_value, eval_binary_op, eval_expr as executor_eval_expr, eval_expr_simple,
+    eval_scalar_function, fnv1a64, index_key_for_value, is_truthy, ordered_index_key_for_value,
+    sql_like_match, value_to_f64, value_to_string, values_equal, Filter, IndexBucket, IndexEqScan,
+    Operator, RowContext, TableScan, Value,
 };
 use ralph_parser::ast::{
     Assignment, BinaryOperator, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt,
@@ -49,6 +51,85 @@ struct TableMeta {
     name: String,
     columns: Vec<String>,
     root_page: PageNum,
+}
+
+struct SingleTableContext<'a> {
+    meta: &'a TableMeta,
+    row: &'a [Value],
+}
+
+impl<'a> RowContext for SingleTableContext<'a> {
+    fn resolve(&self, table: Option<&str>, column: &str) -> Result<Value, ralph_executor::ExecutorError> {
+        if let Some(table_name) = table {
+            if !self.meta.name.eq_ignore_ascii_case(table_name) {
+                return Err(ralph_executor::ExecutorError::new(format!(
+                    "unknown table qualifier '{}' for table '{}'",
+                    table_name, self.meta.name
+                )));
+            }
+        }
+        let col_idx = find_column_index(self.meta, column).ok_or_else(|| {
+            ralph_executor::ExecutorError::new(format!(
+                "unknown column '{}' in table '{}'",
+                column, self.meta.name
+            ))
+        })?;
+        Ok(self.row[col_idx].clone())
+    }
+}
+
+struct JoinedRowContext<'a> {
+    meta: &'a TableMeta,
+    row: &'a [Value],
+    table_ranges: &'a [(String, usize, usize)],
+}
+
+impl<'a> RowContext for JoinedRowContext<'a> {
+    fn resolve(&self, table: Option<&str>, column: &str) -> Result<Value, ralph_executor::ExecutorError> {
+        if let Some(table_qualifier) = table {
+            // Qualified: find the table range and resolve within it
+            let (_, start, end) = self.table_ranges
+                .iter()
+                .find(|(alias, _, _)| alias.eq_ignore_ascii_case(table_qualifier))
+                .ok_or_else(|| {
+                    ralph_executor::ExecutorError::new(format!(
+                        "unknown table or alias '{}'",
+                        table_qualifier
+                    ))
+                })?;
+            let range_cols = &self.meta.columns[*start..*end];
+            let local_idx = range_cols
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(column))
+                .ok_or_else(|| {
+                    ralph_executor::ExecutorError::new(format!(
+                        "unknown column '{}' in table '{}'",
+                        column, table_qualifier
+                    ))
+                })?;
+            Ok(self.row[start + local_idx].clone())
+        } else {
+            // Unqualified: search all table ranges, error if ambiguous
+            let mut found: Option<usize> = None;
+            for (_, start, end) in self.table_ranges {
+                for (i, col) in self.meta.columns[*start..*end].iter().enumerate() {
+                    if col.eq_ignore_ascii_case(column) {
+                        if found.is_some() {
+                            return Err(ralph_executor::ExecutorError::new(format!(
+                                "ambiguous column name '{}'",
+                                column
+                            )));
+                        }
+                        found = Some(start + i);
+                    }
+                }
+            }
+            let idx = found.ok_or_else(|| {
+                ralph_executor::ExecutorError::new(format!("unknown column '{}'", column))
+            })?;
+            Ok(self.row[idx].clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -483,7 +564,7 @@ impl Database {
         let mut inserted_rows = Vec::with_capacity(evaluated_rows.len());
 
         for row in evaluated_rows {
-            let encoded = encode_row(&row)?;
+            let encoded = encode_row(&row).map_err(|e| e.to_string())?;
             table_tree
                 .insert(next_rowid, &encoded)
                 .map_err(|e| format!("insert row: {e}"))?;
@@ -555,7 +636,7 @@ impl Database {
             });
         }
 
-        let encoded = encode_index_payload(&buckets)?;
+        let encoded = encode_index_payload(&buckets).map_err(|e| e.to_string())?;
         tree.insert(key, &encoded)
             .map_err(|e| format!("insert index entry: {e}"))?;
         Ok(())
@@ -590,7 +671,7 @@ impl Database {
             tree.delete(key)
                 .map_err(|e| format!("delete index entry: {e}"))?;
         } else {
-            let encoded = encode_index_payload(&buckets)?;
+            let encoded = encode_index_payload(&buckets).map_err(|e| e.to_string())?;
             tree.insert(key, &encoded)
                 .map_err(|e| format!("update index entry: {e}"))?;
         }
@@ -647,7 +728,7 @@ impl Database {
                 self.index_delete_row(index_meta, rowid, &original_row)?;
             }
 
-            let encoded = encode_row(&updated_row)?;
+            let encoded = encode_row(&updated_row).map_err(|e| e.to_string())?;
             {
                 let mut tree = BTree::new(&mut self.pager, meta.root_page);
                 tree.insert(rowid, &encoded)
@@ -1171,7 +1252,7 @@ impl Database {
             let buckets = decode_index_payload(&entry.payload).map_err(|e| e.to_string())?;
             for bucket in buckets {
                 let lower_ok = if let Some((bound, inclusive)) = lower {
-                    let ordering = compare_values(&bucket.value, bound)?;
+                    let ordering = compare_values(&bucket.value, bound).map_err(|e| e.to_string())?;
                     ordering == std::cmp::Ordering::Greater
                         || (inclusive && ordering == std::cmp::Ordering::Equal)
                 } else {
@@ -1182,7 +1263,7 @@ impl Database {
                 }
 
                 let upper_ok = if let Some((bound, inclusive)) = upper {
-                    let ordering = compare_values(&bucket.value, bound)?;
+                    let ordering = compare_values(&bucket.value, bound).map_err(|e| e.to_string())?;
                     ordering == std::cmp::Ordering::Less
                         || (inclusive && ordering == std::cmp::Ordering::Equal)
                 } else {
@@ -1248,7 +1329,7 @@ impl Database {
 
                 let range_value = &indexed_values[range_column_idx];
                 let lower_ok = if let Some((bound, inclusive)) = lower {
-                    let ordering = compare_values(range_value, bound)?;
+                    let ordering = compare_values(range_value, bound).map_err(|e| e.to_string())?;
                     ordering == std::cmp::Ordering::Greater
                         || (inclusive && ordering == std::cmp::Ordering::Equal)
                 } else {
@@ -1259,7 +1340,7 @@ impl Database {
                 }
 
                 let upper_ok = if let Some((bound, inclusive)) = upper {
-                    let ordering = compare_values(range_value, bound)?;
+                    let ordering = compare_values(range_value, bound).map_err(|e| e.to_string())?;
                     ordering == std::cmp::Ordering::Less
                         || (inclusive && ordering == std::cmp::Ordering::Equal)
                 } else {
@@ -2648,7 +2729,7 @@ fn eval_grouped_expr(
         Expr::BinaryOp { left, op, right } => {
             let lhs = eval_grouped_expr(left, meta, rows, scalar_row_count, representative_row)?;
             let rhs = eval_grouped_expr(right, meta, rows, scalar_row_count, representative_row)?;
-            eval_binary_op(&lhs, *op, &rhs)
+            eval_binary_op(&lhs, *op, &rhs).map_err(|e| e.to_string())
         }
         Expr::IsNull { expr, negated } => {
             let value = eval_grouped_expr(expr, meta, rows, scalar_row_count, representative_row)?;
@@ -2669,9 +2750,9 @@ fn eval_grouped_expr(
             let high_value =
                 eval_grouped_expr(high, meta, rows, scalar_row_count, representative_row)?;
             let ge_low =
-                compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+                compare_values(&value, &low_value).map_err(|e| e.to_string()).map(|ord| ord >= std::cmp::Ordering::Equal)?;
             let le_high =
-                compare_values(&value, &high_value).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+                compare_values(&value, &high_value).map_err(|e| e.to_string()).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
             Ok(Value::Integer(
                 (if *negated { !between } else { between }) as i64,
@@ -2817,7 +2898,7 @@ fn eval_aggregate_expr(
         Expr::BinaryOp { left, op, right } => {
             let lhs = eval_aggregate_expr(left, meta, rows, scalar_row_count)?;
             let rhs = eval_aggregate_expr(right, meta, rows, scalar_row_count)?;
-            eval_binary_op(&lhs, *op, &rhs)
+            eval_binary_op(&lhs, *op, &rhs).map_err(|e| e.to_string())
         }
         Expr::IsNull { expr, negated } => {
             let v = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
@@ -2834,9 +2915,9 @@ fn eval_aggregate_expr(
             let v = eval_aggregate_expr(expr, meta, rows, scalar_row_count)?;
             let low_v = eval_aggregate_expr(low, meta, rows, scalar_row_count)?;
             let high_v = eval_aggregate_expr(high, meta, rows, scalar_row_count)?;
-            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let ge_low = compare_values(&v, &low_v).map_err(|e| e.to_string()).map(|ord| ord >= std::cmp::Ordering::Equal)?;
             let le_high =
-                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+                compare_values(&v, &high_v).map_err(|e| e.to_string()).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
             Ok(Value::Integer(
                 (if *negated { !between } else { between }) as i64,
@@ -3082,9 +3163,9 @@ fn compare_order_keys(
 fn compare_sort_values(left: &Value, right: &Value) -> std::cmp::Ordering {
     match (left, right) {
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
-        _ if is_numeric(left) && is_numeric(right) => value_to_f64(left)
+        _ if is_numeric(left) && is_numeric(right) => value_to_f64(left).map_err(|e| e.to_string())
             .and_then(|lv| {
-                value_to_f64(right)
+                value_to_f64(right).map_err(|e| e.to_string())
                     .map(|rv| lv.partial_cmp(&rv).unwrap_or(std::cmp::Ordering::Equal))
             })
             .unwrap_or(std::cmp::Ordering::Equal),
@@ -3269,7 +3350,7 @@ fn eval_grouped_join_expr(
         Expr::BinaryOp { left, op, right } => {
             let lhs = eval_grouped_join_expr(left, meta, rows, representative_row, table_ranges)?;
             let rhs = eval_grouped_join_expr(right, meta, rows, representative_row, table_ranges)?;
-            eval_binary_op(&lhs, *op, &rhs)
+            eval_binary_op(&lhs, *op, &rhs).map_err(|e| e.to_string())
         }
         Expr::IsNull { expr, negated } => {
             let value = eval_grouped_join_expr(expr, meta, rows, representative_row, table_ranges)?;
@@ -3290,9 +3371,9 @@ fn eval_grouped_join_expr(
             let high_value =
                 eval_grouped_join_expr(high, meta, rows, representative_row, table_ranges)?;
             let ge_low =
-                compare_values(&value, &low_value).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+                compare_values(&value, &low_value).map_err(|e| e.to_string()).map(|ord| ord >= std::cmp::Ordering::Equal)?;
             let le_high =
-                compare_values(&value, &high_value).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+                compare_values(&value, &high_value).map_err(|e| e.to_string()).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
             Ok(Value::Integer(
                 (if *negated { !between } else { between }) as i64,
@@ -3398,7 +3479,7 @@ fn eval_join_aggregate_expr(
         Expr::BinaryOp { left, op, right } => {
             let lhs = eval_join_aggregate_expr(left, meta, rows, table_ranges)?;
             let rhs = eval_join_aggregate_expr(right, meta, rows, table_ranges)?;
-            eval_binary_op(&lhs, *op, &rhs)
+            eval_binary_op(&lhs, *op, &rhs).map_err(|e| e.to_string())
         }
         Expr::IsNull { expr, negated } => {
             let v = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
@@ -3415,9 +3496,9 @@ fn eval_join_aggregate_expr(
             let v = eval_join_aggregate_expr(expr, meta, rows, table_ranges)?;
             let low_v = eval_join_aggregate_expr(low, meta, rows, table_ranges)?;
             let high_v = eval_join_aggregate_expr(high, meta, rows, table_ranges)?;
-            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
+            let ge_low = compare_values(&v, &low_v).map_err(|e| e.to_string()).map(|ord| ord >= std::cmp::Ordering::Equal)?;
             let le_high =
-                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
+                compare_values(&v, &high_v).map_err(|e| e.to_string()).map(|ord| ord <= std::cmp::Ordering::Equal)?;
             let between = ge_low && le_high;
             Ok(Value::Integer(
                 (if *negated { !between } else { between }) as i64,
@@ -3633,209 +3714,28 @@ fn eval_usize_expr(expr: &Expr) -> Result<usize, String> {
 }
 
 fn eval_expr(expr: &Expr, row_ctx: Option<(&TableMeta, &[Value])>) -> Result<Value, String> {
-    match expr {
-        Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
-        Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
-        Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
-        Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, row_ctx),
-        Expr::ColumnRef { table, column } => {
-            let (meta, row) =
-                row_ctx.ok_or_else(|| "column reference requires a table row".to_string())?;
-            if let Some(table_name) = table {
-                if !meta.name.eq_ignore_ascii_case(table_name) {
-                    return Err(format!(
-                        "unknown table qualifier '{}' for table '{}'",
-                        table_name, meta.name
-                    ));
-                }
-            }
-            if column == "*" {
-                return Err("'*' cannot be used as a scalar expression".to_string());
-            }
-            let col_idx = find_column_index(meta, column)
-                .ok_or_else(|| format!("unknown column '{}' in table '{}'", column, meta.name))?;
-            Ok(row[col_idx].clone())
+    match row_ctx {
+        Some((meta, row)) => {
+            let ctx = SingleTableContext { meta, row };
+            eval_expr_simple(expr, Some(&ctx as &dyn RowContext)).map_err(|e: ralph_executor::ExecutorError| e.to_string())
         }
-        Expr::UnaryOp { op, expr } => {
-            let v = eval_expr(expr, row_ctx)?;
-            match op {
-                UnaryOperator::Negate => match v {
-                    Value::Integer(i) => Ok(Value::Integer(-i)),
-                    Value::Real(f) => Ok(Value::Real(-f)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err("cannot negate non-numeric value".to_string()),
-                },
-                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&v)) as i64)),
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let lhs = eval_expr(left, row_ctx)?;
-            let rhs = eval_expr(right, row_ctx)?;
-            eval_binary_op(&lhs, *op, &rhs)
-        }
-        Expr::IsNull { expr, negated } => {
-            let v = eval_expr(expr, row_ctx)?;
-            let is_null = matches!(v, Value::Null);
-            let result = if *negated { !is_null } else { is_null };
-            Ok(Value::Integer(result as i64))
-        }
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            let v = eval_expr(expr, row_ctx)?;
-            let low_v = eval_expr(low, row_ctx)?;
-            let high_v = eval_expr(high, row_ctx)?;
-            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
-            let le_high =
-                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
-            let between = ge_low && le_high;
-            Ok(Value::Integer(
-                (if *negated { !between } else { between }) as i64,
-            ))
-        }
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let value = eval_expr(expr, row_ctx)?;
-            let mut found = false;
-            for item in list {
-                let candidate = eval_expr(item, row_ctx)?;
-                if values_equal(&value, &candidate) {
-                    found = true;
-                    break;
-                }
-            }
-            Ok(Value::Integer(
-                (if *negated { !found } else { found }) as i64,
-            ))
-        }
-        Expr::FunctionCall { name, args } => {
-            eval_scalar_function_expr(name, args, |arg| eval_expr(arg, row_ctx))
-        }
+        None => eval_expr_simple(expr, None).map_err(|e: ralph_executor::ExecutorError| e.to_string()),
     }
 }
 
-/// Evaluate an expression in a joined-row context with table-qualified column resolution.
-///
-/// `table_ranges` maps (table_alias, start_col_idx, end_col_idx) to locate which
-/// slice of `row` belongs to which table.
 fn eval_join_expr(
     expr: &Expr,
     meta: &TableMeta,
     row: &[Value],
     table_ranges: &[(String, usize, usize)],
 ) -> Result<Value, String> {
-    match expr {
-        Expr::IntegerLiteral(i) => Ok(Value::Integer(*i)),
-        Expr::FloatLiteral(f) => Ok(Value::Real(*f)),
-        Expr::StringLiteral(s) => Ok(Value::Text(s.clone())),
-        Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_join_expr(inner, meta, row, table_ranges),
-        Expr::ColumnRef { table, column } => {
-            if column == "*" {
-                return Err("'*' cannot be used as a scalar expression".to_string());
-            }
-            if let Some(table_qualifier) = table {
-                // Qualified: find the table range and resolve within it
-                let (_, start, end) = table_ranges
-                    .iter()
-                    .find(|(alias, _, _)| alias.eq_ignore_ascii_case(table_qualifier))
-                    .ok_or_else(|| format!("unknown table or alias '{}'", table_qualifier))?;
-                let range_cols = &meta.columns[*start..*end];
-                let local_idx = range_cols
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(column))
-                    .ok_or_else(|| {
-                        format!("unknown column '{}' in table '{}'", column, table_qualifier)
-                    })?;
-                Ok(row[start + local_idx].clone())
-            } else {
-                // Unqualified: search all table ranges, error if ambiguous
-                let mut found: Option<usize> = None;
-                for (_, start, end) in table_ranges {
-                    for (i, col) in meta.columns[*start..*end].iter().enumerate() {
-                        if col.eq_ignore_ascii_case(column) {
-                            if found.is_some() {
-                                return Err(format!("ambiguous column name '{}'", column));
-                            }
-                            found = Some(start + i);
-                        }
-                    }
-                }
-                let idx = found.ok_or_else(|| format!("unknown column '{}'", column))?;
-                Ok(row[idx].clone())
-            }
-        }
-        Expr::UnaryOp { op, expr } => {
-            let v = eval_join_expr(expr, meta, row, table_ranges)?;
-            match op {
-                UnaryOperator::Negate => match v {
-                    Value::Integer(i) => Ok(Value::Integer(-i)),
-                    Value::Real(f) => Ok(Value::Real(-f)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err("cannot negate non-numeric value".to_string()),
-                },
-                UnaryOperator::Not => Ok(Value::Integer((!is_truthy(&v)) as i64)),
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let lhs = eval_join_expr(left, meta, row, table_ranges)?;
-            let rhs = eval_join_expr(right, meta, row, table_ranges)?;
-            eval_binary_op(&lhs, *op, &rhs)
-        }
-        Expr::IsNull { expr, negated } => {
-            let v = eval_join_expr(expr, meta, row, table_ranges)?;
-            let is_null = matches!(v, Value::Null);
-            let result = if *negated { !is_null } else { is_null };
-            Ok(Value::Integer(result as i64))
-        }
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => {
-            let v = eval_join_expr(expr, meta, row, table_ranges)?;
-            let low_v = eval_join_expr(low, meta, row, table_ranges)?;
-            let high_v = eval_join_expr(high, meta, row, table_ranges)?;
-            let ge_low = compare_values(&v, &low_v).map(|ord| ord >= std::cmp::Ordering::Equal)?;
-            let le_high =
-                compare_values(&v, &high_v).map(|ord| ord <= std::cmp::Ordering::Equal)?;
-            let between = ge_low && le_high;
-            Ok(Value::Integer(
-                (if *negated { !between } else { between }) as i64,
-            ))
-        }
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let value = eval_join_expr(expr, meta, row, table_ranges)?;
-            let mut found = false;
-            for item in list {
-                let candidate = eval_join_expr(item, meta, row, table_ranges)?;
-                if values_equal(&value, &candidate) {
-                    found = true;
-                    break;
-                }
-            }
-            Ok(Value::Integer(
-                (if *negated { !found } else { found }) as i64,
-            ))
-        }
-        Expr::FunctionCall { name, args } => eval_scalar_function_expr(name, args, |arg| {
-            eval_join_expr(arg, meta, row, table_ranges)
-        }),
-    }
+    let ctx = JoinedRowContext {
+        meta,
+        row,
+        table_ranges,
+    };
+    eval_expr_simple(expr, Some(&ctx as &dyn RowContext)).map_err(|e: ralph_executor::ExecutorError| e.to_string())
 }
-
 fn eval_scalar_function_expr<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, String>
 where
     F: FnMut(&Expr) -> Result<Value, String>,
@@ -3847,134 +3747,6 @@ where
     eval_scalar_function(name, &values).map_err(|err| err.to_string())
 }
 
-fn eval_binary_op(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value, String> {
-    use BinaryOperator::*;
-
-    match op {
-        Add | Subtract | Multiply | Divide | Modulo => eval_numeric_binary(lhs, op, rhs),
-        Eq => Ok(Value::Integer(values_equal(lhs, rhs) as i64)),
-        NotEq => Ok(Value::Integer((!values_equal(lhs, rhs)) as i64)),
-        Lt => {
-            compare_values(lhs, rhs).map(|o| Value::Integer((o == std::cmp::Ordering::Less) as i64))
-        }
-        LtEq => compare_values(lhs, rhs).map(|o| {
-            Value::Integer((o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal) as i64)
-        }),
-        Gt => compare_values(lhs, rhs)
-            .map(|o| Value::Integer((o == std::cmp::Ordering::Greater) as i64)),
-        GtEq => compare_values(lhs, rhs).map(|o| {
-            Value::Integer(
-                (o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal) as i64,
-            )
-        }),
-        And => Ok(Value::Integer((is_truthy(lhs) && is_truthy(rhs)) as i64)),
-        Or => Ok(Value::Integer((is_truthy(lhs) || is_truthy(rhs)) as i64)),
-        Like => {
-            if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
-                return Ok(Value::Null);
-            }
-            let haystack = value_to_string(lhs);
-            let pattern = value_to_string(rhs);
-            Ok(Value::Integer(sql_like_match(&haystack, &pattern) as i64))
-        }
-        Concat => Ok(Value::Text(format!(
-            "{}{}",
-            value_to_string(lhs),
-            value_to_string(rhs)
-        ))),
-    }
-}
-
-fn eval_numeric_binary(lhs: &Value, op: BinaryOperator, rhs: &Value) -> Result<Value, String> {
-    let (l, r, as_integer) = numeric_operands(lhs, rhs)?;
-    let out = match op {
-        BinaryOperator::Add => l + r,
-        BinaryOperator::Subtract => l - r,
-        BinaryOperator::Multiply => l * r,
-        BinaryOperator::Divide => {
-            if r == 0.0 {
-                return Err("division by zero".to_string());
-            }
-            l / r
-        }
-        BinaryOperator::Modulo => {
-            if r == 0.0 {
-                return Err("modulo by zero".to_string());
-            }
-            l % r
-        }
-        _ => unreachable!("non-arithmetic operator passed to eval_numeric_binary"),
-    };
-    if as_integer {
-        Ok(Value::Integer(out as i64))
-    } else {
-        Ok(Value::Real(out))
-    }
-}
-
-fn numeric_operands(lhs: &Value, rhs: &Value) -> Result<(f64, f64, bool), String> {
-    let l = value_to_f64(lhs)?;
-    let r = value_to_f64(rhs)?;
-    let both_int = matches!(lhs, Value::Integer(_)) && matches!(rhs, Value::Integer(_));
-    Ok((l, r, both_int))
-}
-
-fn value_to_f64(v: &Value) -> Result<f64, String> {
-    match v {
-        Value::Integer(i) => Ok(*i as f64),
-        Value::Real(f) => Ok(*f),
-        Value::Null => Ok(0.0),
-        Value::Text(_) => Err("expected numeric value".to_string()),
-    }
-}
-
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(f) => f.to_string(),
-        Value::Text(s) => s.clone(),
-    }
-}
-
-fn values_equal(lhs: &Value, rhs: &Value) -> bool {
-    match (lhs, rhs) {
-        (Value::Null, Value::Null) => true,
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Real(a), Value::Real(b)) => a == b,
-        (Value::Integer(a), Value::Real(b)) => (*a as f64) == *b,
-        (Value::Real(a), Value::Integer(b)) => *a == (*b as f64),
-        (Value::Text(a), Value::Text(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn compare_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, String> {
-    match (lhs, rhs) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(a.cmp(b)),
-        (Value::Real(a), Value::Real(b)) => a
-            .partial_cmp(b)
-            .ok_or_else(|| "cannot compare NaN values".to_string()),
-        (Value::Integer(a), Value::Real(b)) => (*a as f64)
-            .partial_cmp(b)
-            .ok_or_else(|| "cannot compare NaN values".to_string()),
-        (Value::Real(a), Value::Integer(b)) => a
-            .partial_cmp(&(*b as f64))
-            .ok_or_else(|| "cannot compare NaN values".to_string()),
-        (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        _ => Err("cannot compare values of different types".to_string()),
-    }
-}
-
-fn is_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Integer(i) => *i != 0,
-        Value::Real(f) => *f != 0.0,
-        Value::Text(s) => !s.is_empty(),
-    }
-}
 
 /// Returns `true` if `expr` contains any column reference that resolves to a
 /// column in the table identified by `target_alias`.
@@ -4171,55 +3943,6 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
         out.push(byte);
         idx += 2;
     }
-    Ok(out)
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = OFFSET_BASIS;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-fn encode_row(row: &[Value]) -> Result<Vec<u8>, String> {
-    let col_count: u32 = row
-        .len()
-        .try_into()
-        .map_err(|_| "row has too many columns".to_string())?;
-
-    let mut out = Vec::new();
-    out.extend_from_slice(&col_count.to_be_bytes());
-    for value in row {
-        encode_value(value, &mut out).map_err(|e| e.to_string())?;
-    }
-    Ok(out)
-}
-
-fn encode_index_payload(buckets: &[IndexBucket]) -> Result<Vec<u8>, String> {
-    let bucket_count: u32 = buckets
-        .len()
-        .try_into()
-        .map_err(|_| "too many index buckets".to_string())?;
-    let mut out = Vec::new();
-    out.extend_from_slice(&bucket_count.to_be_bytes());
-
-    for bucket in buckets {
-        encode_value(&bucket.value, &mut out).map_err(|e| e.to_string())?;
-        let row_count: u32 = bucket
-            .rowids
-            .len()
-            .try_into()
-            .map_err(|_| "too many rowids in index bucket".to_string())?;
-        out.extend_from_slice(&row_count.to_be_bytes());
-        for rowid in &bucket.rowids {
-            out.extend_from_slice(&rowid.to_be_bytes());
-        }
-    }
-
     Ok(out)
 }
 
