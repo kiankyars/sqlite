@@ -2799,7 +2799,10 @@ fn select_uses_aggregates(stmt: &SelectStmt) -> bool {
 fn expr_contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, args } => {
-            is_aggregate_function(name) || args.iter().any(expr_contains_aggregate)
+            let is_agg_call = is_aggregate_function(name)
+                && !((name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX"))
+                    && args.len() > 1);
+            is_agg_call || args.iter().any(expr_contains_aggregate)
         }
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
@@ -2942,7 +2945,10 @@ fn eval_aggregate_expr(
             ))
         }
         Expr::FunctionCall { name, args } => {
-            if is_aggregate_function(name) {
+            let is_agg_call = is_aggregate_function(name)
+                && !((name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX"))
+                    && args.len() > 1);
+            if is_agg_call {
                 eval_aggregate_function(name, args, meta, rows, scalar_row_count)
             } else {
                 eval_scalar_function_expr(name, args, |arg| {
@@ -3523,7 +3529,10 @@ fn eval_join_aggregate_expr(
             ))
         }
         Expr::FunctionCall { name, args } => {
-            if is_aggregate_function(name) {
+            let is_agg_call = is_aggregate_function(name)
+                && !((name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX"))
+                    && args.len() > 1);
+            if is_agg_call {
                 eval_join_aggregate_function(name, args, meta, rows, table_ranges)
             } else {
                 eval_scalar_function_expr(name, args, |arg| {
@@ -7604,6 +7613,58 @@ mod tests {
                 );
             }
             _ => panic!("expected SELECT result"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn scalar_functions_min_max_hex_quote() {
+        let path = temp_db_path("scalar_func_new");
+        let mut db = Database::open(&path).unwrap();
+
+        // 1. Test scalar MIN/MAX (no FROM)
+        let result = db.execute("SELECT MIN(1, 10, 5), MAX(1, 10, 5);").unwrap();
+        if let ExecuteResult::Select(res) = result {
+            assert_eq!(res.rows, vec![vec![Value::Integer(1), Value::Integer(10)]]);
+        } else {
+            panic!("expected select result");
+        }
+
+        // 2. Test HEX/QUOTE (no FROM)
+        let result = db.execute("SELECT HEX('abc'), QUOTE('abc');").unwrap();
+        if let ExecuteResult::Select(res) = result {
+             assert_eq!(res.rows, vec![vec![Value::Text("616263".into()), Value::Text("'abc'".into())]]);
+        } else {
+            panic!("expected select result");
+        }
+
+        // 3. Test scalar MIN/MAX with NULLs
+        let result = db.execute("SELECT MIN(NULL, 5), MAX(NULL, 5);").unwrap();
+        if let ExecuteResult::Select(res) = result {
+             assert_eq!(res.rows, vec![vec![Value::Integer(5), Value::Integer(5)]]);
+        } else {
+            panic!("expected select result");
+        }
+
+        // 4. Test scalar MIN/MAX in WHERE clause
+        db.execute("CREATE TABLE t (id INTEGER, val INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100), (2, 200);").unwrap();
+        let result = db.execute("SELECT id FROM t WHERE val > MAX(10, 150);").unwrap();
+        if let ExecuteResult::Select(res) = result {
+             assert_eq!(res.rows, vec![vec![Value::Integer(2)]]);
+        } else {
+             panic!("expected select result");
+        }
+
+        // 5. Test scalar MIN/MAX mixed with Aggregate MIN/MAX
+        // SELECT MAX(val), MAX(1, 2) FROM t
+        // MAX(val) is aggregate. MAX(1, 2) is scalar.
+        let result = db.execute("SELECT MAX(val), MAX(1, 2) FROM t;").unwrap();
+        if let ExecuteResult::Select(res) = result {
+             assert_eq!(res.rows, vec![vec![Value::Integer(200), Value::Integer(2)]]);
+        } else {
+             panic!("expected select result");
         }
 
         cleanup(&path);

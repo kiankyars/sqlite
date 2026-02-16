@@ -60,11 +60,14 @@ Latest completions:
 - Scalar SQL function execution in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — added core scalar functions (`LENGTH`/`UPPER`/`LOWER`/`TYPEOF`/`ABS`/`COALESCE`/`IFNULL`/`NULLIF`/`SUBSTR`/`INSTR`/`REPLACE`/`TRIM`/`LTRIM`/`RTRIM`) and wired scalar-call evaluation across regular/join/grouped/aggregate expression paths; scalar wrappers over aggregate calls now evaluate correctly (for example `COALESCE(MAX(v), 0)`); see `notes/scalar-sql-functions.md`
 - Join index probe optimization in `crates/ralph-sqlite` (Agent opus) — INNER/LEFT joins now use index-probed nested-loop when the ON condition is a simple equality on an indexed right-table column; RIGHT/FULL outer joins and non-equality ON conditions fall back to full-scan nested-loop; see `notes/join-index-probe-optimization.md`
 - Overflow pages support in `crates/storage` (Agent kyars) — implemented overflow chains for large payloads exceeding page size, added `LeafEntry` struct to manage local vs overflow payload splits, and verified with `btree::tests::overflow_payload`
+- Scalar multi-argument MIN/MAX and HEX/QUOTE functions (Agent kyars) — implemented scalar versions of `MIN`/`MAX` for 2+ arguments (ignoring NULLs per SQLite semantics), implemented `HEX` and `QUOTE` string functions, updated `ralph-sqlite` expression evaluation to dispatch `MIN`/`MAX` as scalar functions when argument count > 1, and added unit/integration tests
 
 Recommended next step:
 - Extend join index probes to support AND conjunctions in ON conditions and multi-column indexes.
 
 Test pass rate:
+- `cargo test -p ralph-executor` (scalar MIN/MAX/HEX/QUOTE): pass, 0 failed (27 tests).
+- `cargo test -p ralph-sqlite` (scalar MIN/MAX/HEX/QUOTE): pass, 0 failed (106 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target cargo test -p ralph-planner -p ralph-storage -p ralph-sqlite` (planner histogram/fanout stats): pass, 0 failed (191 tests).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (planner histogram/fanout stats, seed: 3): pass, 0 failed, 4 skipped (deterministic sample).
 - `CARGO_TARGET_DIR=/tmp/ralph-sqlite-target ./test.sh --fast` (scalar SQL function execution, seed: 4): pass, 0 failed, 5 skipped (deterministic sample).
@@ -492,6 +495,5 @@ Test pass rate:
 - Query planning currently supports single-table equality/`IN`/range predicates on single-column secondary indexes, OR unions and AND intersections across indexable branches, full-tuple equality plus left-prefix/range predicates on multi-column secondary indexes, and stats-aware table/index cardinality cost selection with persisted row/distinct metadata; histogram-style stats and tighter cost estimates for prefix/range fanout are not implemented.
 - Range index planning now uses ordered key-range scans for numeric and text bounds; text now uses a 7-byte exact + overlap-channel key encoding with limited suffix discrimination, so collision-heavy scans can still occur for some long shared prefixes.
 - JOIN support includes INNER JOIN, CROSS JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. INNER/LEFT joins now use index-probed nested-loop when the ON condition is a simple equality on a single-column indexed right-table column; RIGHT/FULL outer joins and compound/non-equality ON conditions still use full-scan nested-loop.
-- Core scalar SQL functions are implemented, but scalar multi-argument `MIN`/`MAX` and SQLite `HEX`/`QUOTE` behaviors are not yet implemented.
 - No subquery support
 - Column references outside aggregate functions are still rejected for aggregate queries without `GROUP BY`.

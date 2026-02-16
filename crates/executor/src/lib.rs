@@ -647,6 +647,67 @@ pub fn eval_scalar_function(name: &str, args: &[Value]) -> ExecResult<Value> {
         return Ok(Value::Text(source.replace(&from, &to)));
     }
 
+    if name.eq_ignore_ascii_case("MIN") {
+        let mut min_val: Option<Value> = None;
+        for arg in args {
+            if matches!(arg, Value::Null) {
+                continue;
+            }
+            match min_val {
+                None => min_val = Some(arg.clone()),
+                Some(ref current) => {
+                    let ordering = compare_values(arg, current)?;
+                    if ordering == std::cmp::Ordering::Less {
+                        min_val = Some(arg.clone());
+                    }
+                }
+            }
+        }
+        return Ok(min_val.unwrap_or(Value::Null));
+    }
+
+    if name.eq_ignore_ascii_case("MAX") {
+        let mut max_val: Option<Value> = None;
+        for arg in args {
+            if matches!(arg, Value::Null) {
+                continue;
+            }
+            match max_val {
+                None => max_val = Some(arg.clone()),
+                Some(ref current) => {
+                    let ordering = compare_values(arg, current)?;
+                    if ordering == std::cmp::Ordering::Greater {
+                        max_val = Some(arg.clone());
+                    }
+                }
+            }
+        }
+        return Ok(max_val.unwrap_or(Value::Null));
+    }
+
+    if name.eq_ignore_ascii_case("HEX") {
+        expect_arg_count(name, args, 1)?;
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Text("".to_string()));
+        }
+        let s = value_to_string(&args[0]);
+        let hex: String = s.bytes().map(|b| format!("{:02X}", b)).collect();
+        return Ok(Value::Text(hex));
+    }
+
+    if name.eq_ignore_ascii_case("QUOTE") {
+        expect_arg_count(name, args, 1)?;
+        match &args[0] {
+            Value::Null => return Ok(Value::Text("NULL".to_string())),
+            Value::Integer(i) => return Ok(Value::Text(i.to_string())),
+            Value::Real(f) => return Ok(Value::Text(f.to_string())),
+            Value::Text(s) => {
+                let escaped = s.replace("'", "''");
+                return Ok(Value::Text(format!("'{}'", escaped)));
+            }
+        }
+    }
+
     if name.eq_ignore_ascii_case("TRIM") {
         return eval_trim_function(name, args, TrimDirection::Both);
     }
@@ -1573,6 +1634,141 @@ mod tests {
         assert_eq!(
             eval_binary_op(&text, BinaryOperator::Like, &null).unwrap(),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn eval_scalar_min_max() {
+        // MIN
+        assert_eq!(
+            eval_expr_simple(
+                &call(
+                    "MIN",
+                    vec![
+                        Expr::IntegerLiteral(10),
+                        Expr::IntegerLiteral(5),
+                        Expr::IntegerLiteral(20)
+                    ]
+                ),
+                None
+            )
+            .unwrap(),
+            int(5)
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call(
+                    "MIN",
+                    vec![Expr::IntegerLiteral(10), Expr::Null, Expr::IntegerLiteral(5)]
+                ),
+                None
+            )
+            .unwrap(),
+            int(5)
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call("MIN", vec![Expr::Null, Expr::Null]),
+                None
+            )
+            .unwrap(),
+            Value::Null
+        );
+
+        // MAX
+        assert_eq!(
+            eval_expr_simple(
+                &call(
+                    "MAX",
+                    vec![
+                        Expr::IntegerLiteral(10),
+                        Expr::IntegerLiteral(5),
+                        Expr::IntegerLiteral(20)
+                    ]
+                ),
+                None
+            )
+            .unwrap(),
+            int(20)
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call(
+                    "MAX",
+                    vec![Expr::IntegerLiteral(10), Expr::Null, Expr::IntegerLiteral(20)]
+                ),
+                None
+            )
+            .unwrap(),
+            int(20)
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call("MAX", vec![Expr::Null, Expr::Null]),
+                None
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn eval_scalar_hex() {
+        assert_eq!(
+            eval_expr_simple(
+                &call("HEX", vec![Expr::StringLiteral("abc".to_string())]),
+                None
+            )
+            .unwrap(),
+            Value::Text("616263".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(&call("HEX", vec![Expr::IntegerLiteral(1)]), None).unwrap(),
+            Value::Text("31".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(&call("HEX", vec![Expr::Null]), None).unwrap(),
+            Value::Text("".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_scalar_quote() {
+        assert_eq!(
+            eval_expr_simple(
+                &call("QUOTE", vec![Expr::IntegerLiteral(1)]),
+                None
+            )
+            .unwrap(),
+            Value::Text("1".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call("QUOTE", vec![Expr::FloatLiteral(1.5)]),
+                None
+            )
+            .unwrap(),
+            Value::Text("1.5".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(&call("QUOTE", vec![Expr::Null]), None).unwrap(),
+            Value::Text("NULL".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call("QUOTE", vec![Expr::StringLiteral("abc".to_string())]),
+                None
+            )
+            .unwrap(),
+            Value::Text("'abc'".to_string())
+        );
+        assert_eq!(
+            eval_expr_simple(
+                &call("QUOTE", vec![Expr::StringLiteral("a'b".to_string())]),
+                None
+            )
+            .unwrap(),
+            Value::Text("'a''b'".to_string())
         );
     }
 }
