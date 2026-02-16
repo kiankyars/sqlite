@@ -59,6 +59,7 @@ Latest completions:
 - Planner histogram/fanout statistics for multi-column prefix/range costing in `crates/storage` + `crates/planner` + `crates/ralph-sqlite` (Agent codex) — persisted index stats now include per-prefix distinct-count vectors, stats-aware `IndexPrefixRange` costing now estimates eq-prefix fanout and range selectivity from prefix-level distributions, and write-path stats refresh now recomputes/persists prefix distinct counts; see `notes/planner-histogram-fanout-stats.md`
 - Scalar SQL function execution in `crates/executor` + `crates/ralph-sqlite` (Agent codex) — added core scalar functions (`LENGTH`/`UPPER`/`LOWER`/`TYPEOF`/`ABS`/`COALESCE`/`IFNULL`/`NULLIF`/`SUBSTR`/`INSTR`/`REPLACE`/`TRIM`/`LTRIM`/`RTRIM`) and wired scalar-call evaluation across regular/join/grouped/aggregate expression paths; scalar wrappers over aggregate calls now evaluate correctly (for example `COALESCE(MAX(v), 0)`); see `notes/scalar-sql-functions.md`
 - Join index probe optimization in `crates/ralph-sqlite` (Agent opus) — INNER/LEFT joins now use index-probed nested-loop when the ON condition is a simple equality on an indexed right-table column; RIGHT/FULL outer joins and non-equality ON conditions fall back to full-scan nested-loop; see `notes/join-index-probe-optimization.md`
+- Overflow pages support in `crates/storage` (Agent kyars) — implemented overflow chains for large payloads exceeding page size, added `LeafEntry` struct to manage local vs overflow payload splits, and verified with `btree::tests::overflow_payload`
 
 Recommended next step:
 - Extend join index probes to support AND conjunctions in ON conditions and multi-column indexes.
@@ -466,6 +467,12 @@ Test pass rate:
   - RIGHT JOIN and FULL OUTER JOIN fall back to full-scan nested-loop (unmatched-right tracking requires all right rows)
   - Non-equality and compound ON conditions fall back to full-scan nested-loop
   - Added 9 integration tests; see `notes/join-index-probe-optimization.md`
+
+- [x] Overflow pages support (agent kyars)
+  - Implemented overflow chains for large payloads exceeding page size
+  - Added `LeafEntry` struct to manage local vs overflow payload splits
+  - Added `read_overflow_chain` and `write_overflow_chain` helpers in B+tree
+  - Verified with `btree::tests::overflow_payload`
 
 - [x] LIKE operator correctness fix (agent opus)
   - Replaced naive `String::contains` with DP-based `sql_like_match` supporting `%` (zero-or-more) and `_` (single-char) wildcards
