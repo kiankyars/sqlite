@@ -1,5 +1,4 @@
 /target
-/agent_logs
 test_failures.log
 *.db
 *.db-wal

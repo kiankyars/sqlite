@@ -1,0 +1,24 @@
+Task complete. Here's a summary of what was done:
+
+## Summary
+
+**Task: UPDATE/DELETE planner-driven index selection**
+
+### Changes made:
+
+1. **`crates/planner/src/lib.rs`** — Added `plan_where(where_clause, table_name, indexes) -> AccessPath`, a general-purpose entry point for planning access paths from arbitrary WHERE clauses (not tied to `SelectStmt`). Added 3 unit tests.
+
+2. **`crates/ralph-sqlite/src/lib.rs`** — Three changes:
+   - Added `Database::read_candidate_entries()` helper that uses `AccessPath::IndexEq` to probe a secondary index B+tree for matching rowids, then fetches only those table rows (instead of scanning the whole table)
+   - Updated `execute_update()` to call `plan_where()` and use `read_candidate_entries()`
+   - Updated `execute_delete()` to call `plan_where()` and use `read_candidate_entries()`
+   - Added 3 integration tests covering index-driven UPDATE, index-driven DELETE, and UPDATE that changes the indexed column value
+
+3. **`PROGRESS.md`** — Updated status, test pass rates, completed tasks list, and known issues
+
+4. **`notes/update-delete-index-selection.md`** — Added handoff notes
+
+### Test results:
+- **137/137** workspace tests pass (including 6 new tests from this task + 6 from another agent's concurrent schema work)
+- **5/5** `test.sh` full pass
+- No regressions, merge conflict with concurrent schema work resolved cleanly

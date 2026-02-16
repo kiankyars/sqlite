@@ -1,0 +1,29 @@
+All done. Here's a summary of what was created:
+
+## Bootstrap Complete
+
+**Commit `6eb9e0f`** — 17 files, 678 insertions across:
+
+### Rust Workspace (`Cargo.toml`)
+- **5 crates** with proper dependency graph:
+  - `ralph-parser` — SQL tokenizer/parser/AST (no deps)
+  - `ralph-planner` — query plan generation (depends on parser)
+  - `ralph-executor` — volcano-style execution (depends on planner + storage)
+  - `ralph-storage` — pager, B+tree, WAL (no deps)
+  - `ralph-sqlite` — top-level integration (depends on all)
+- All stubs build cleanly and have passing unit tests (5/5 pass)
+
+### Documentation
+- **README.md** — purpose, architecture diagram, build/test instructions, scope/non-goals
+- **DESIGN.md** — module boundaries, on-disk page layout (interior/leaf), pager/B+tree/WAL strategy, 6-stage roadmap, lock-file protocol
+- **PROGRESS.md** — current status, 19-item prioritized backlog, completed tasks
+
+### Test Harness (`test.sh`)
+- **Full mode**: runs all tests (cargo build, cargo test, sqlite3 oracle comparisons)
+- **Fast mode** (`--fast`): deterministic 10% sampling via `md5sum` hash of `AGENT_ID:test_name`, accepting values < 26/256
+- **sqlite3 oracle**: placeholder comparison tests ready to wire up once the engine executes queries
+- Clear pass/fail/skip summary with failure logging
+
+### Lock-File Protocol
+- Defined in DESIGN.md: files in `current_tasks/` with `created_at_unix`, `agent_id`, `task`
+- 1-hour stale threshold, atomic creation, no nested locks

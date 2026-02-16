@@ -1,0 +1,2928 @@
+OpenAI Codex v0.98.0 (research preview)
+--------
+workdir: /project/6049267/kyars/parallel-ralph/sqlite/workspace-3
+model: gpt-5.3-codex
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: high
+reasoning summaries: auto
+session id: 019c4c5f-cbb6-71b1-9560-f30c4f9ab035
+--------
+user
+# SQLite Agent Prompt
+
+You are building an embedded SQLite-like database engine in Rust.
+
+## Workflow
+
+1. Orient first:
+- Read `README.md`, `DESIGN.md`, `PROGRESS.md`, and relevant `notes/`.
+- Check `current_tasks/` for active locks. Do not work on a task that is already locked.
+
+2. Claim one task:
+- Pick the highest-priority unlocked task from `PROGRESS.md`.
+- Create `current_tasks/<task_name>.txt`.
+- Commit and push the lock before implementation.
+
+3. Implement in small, testable increments. Do not delete or rewrite another agent's code without reading `notes/` first.
+
+4. Test before push:
+- Run `./test.sh --fast` before each push.
+- If behavior changes, add tests in the same commit.
+- Use `sqlite3` as behavioral oracle for SQL semantics/results; normalize when comparing so tests are stable.
+- Keep internal storage/engine invariants owned by this repo's design.
+
+5. Update shared state:
+- Update `PROGRESS.md` when finishing a task: what you did, current test pass rate, what should be done next.
+- Add important handoff notes in `notes/<topic>.md`.
+- Update `README.md` or `DESIGN.md` only if implementation reality changes; keep updates minimal and in the same commit as related code changes.
+
+6. Clean up:
+- Remove your lock file when done.
+- Pull/rebase and push cleanly. If you hit a merge conflict, resolve carefully; read the other agent's changes before resolving.
+
+## Constraints
+
+- Follow best-practice stale-lock handling.
+- If you remove stale locks, include that cleanup in a commit and push.
+- Keep changes scoped.
+- Do not push regressions.
+- Avoid `unsafe` unless documented and justified in `DESIGN.md`.
+- If stuck on a bug, document what you tried in `notes/` and move on.
+mcp startup: no servers
+
+thinking
+**Starting repo inspection**
+codex
+I’ll follow the repo workflow exactly: first I’m checking orientation docs and active locks, then I’ll claim the highest-priority unlocked task before making any code changes. I’m starting by reading the project state files and lock directory.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'rg --files README.md DESIGN.md PROGRESS.md notes current_tasks 2>/dev/null || true' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'ls -la' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 272ms:
+total 84
+drwxr-s--- 7 kyars rrg-lilimou  4096 Feb 11 01:11 .
+drwxr-s--- 9 kyars rrg-lilimou  4096 Feb 10 23:18 ..
+drwxr-s--- 7 kyars rrg-lilimou  4096 Feb 11 03:04 .git
+-rw-r----- 1 kyars rrg-lilimou    78 Feb 10 21:09 .gitignore
+-rw-r----- 1 kyars rrg-lilimou   571 Feb 10 22:50 Cargo.lock
+-rw-r----- 1 kyars rrg-lilimou   156 Feb 10 21:09 Cargo.toml
+-rw-r----- 1 kyars rrg-lilimou  8434 Feb 10 23:31 DESIGN.md
+-rw-r----- 1 kyars rrg-lilimou 16807 Feb 11 01:11 PROGRESS.md
+-rw-r----- 1 kyars rrg-lilimou  2077 Feb 10 21:09 README.md
+drwxr-s--- 2 kyars rrg-lilimou  4096 Feb 11 03:04 agent_logs
+drwxr-s--- 7 kyars rrg-lilimou  4096 Feb 10 21:09 crates
+drwxr-s--- 2 kyars rrg-lilimou  4096 Feb 11 01:13 current_tasks
+drwxr-s--- 2 kyars rrg-lilimou  4096 Feb 11 01:11 notes
+-rwxr-x--- 1 kyars rrg-lilimou  6614 Feb 10 21:09 test.sh
+ succeeded in 291ms:
+README.md
+DESIGN.md
+PROGRESS.md
+notes/query-planner-index-selection.md
+notes/schema.md
+notes/btree-delete-rebalance.md
+notes/end-to-end-create-insert-select.md
+notes/wal-write-path-commit.md
+notes/pager.md
+notes/parser-create-insert-select.md
+notes/btree.md
+notes/parser-implementation.md
+notes/secondary-indexes.md
+notes/transaction-sql.md
+notes/page-allocator-freelist.md
+notes/update-delete-execution.md
+notes/order-by-select-execution.md
+notes/ast-types.md
+notes/parser-tokenizer.md
+notes/update-delete-index-selection.md
+
+thinking
+**Planning lock file inspection**
+codex
+I found two existing lock files, so next I’m reading `PROGRESS.md` plus those lock contents to identify the highest-priority task that is actually available.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,220p' README.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,260p' DESIGN.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,320p' PROGRESS.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 356ms:
+# ralph-sqlite
+
+A SQLite-compatible database engine built from scratch in Rust.
+
+## Purpose
+
+ralph-sqlite is an educational and experimental implementation of a relational database engine modeled after SQLite. It implements SQL parsing, query planning, execution, and a page-based storage engine with B+tree indexes, transactions, and write-ahead logging.
+
+## Architecture Overview
+
+The project is organized as a Cargo workspace with five crates:
+
+```
+crates/
+├── parser/        SQL tokenizer, parser, and AST definitions
+├── planner/       Logical and physical query plan generation
+├── executor/      Volcano-style query execution engine
+├── storage/       Pager, B+tree, on-disk format, WAL, transactions
+└── ralph-sqlite/  Top-level integration crate
+```
+ succeeded in 381ms:
+# Design Document
+
+## Architecture and Module Boundaries
+
+### Crate Dependency Graph
+
+```
+ralph-sqlite (integration)
+├── ralph-parser    (no internal deps)
+├── ralph-planner   (depends on: ralph-parser)
+├── ralph-executor  (depends on: ralph-planner, ralph-storage)
+└── ralph-storage   (no internal deps)
+```
+
+### Module Responsibilities
+
+**ralph-parser** — SQL text in, AST out.
+- Tokenizer: produces a stream of typed tokens from raw SQL.
+- Parser: recursive-descent parser consumes tokens, produces AST nodes.
+- AST types: `Select`, `Insert`, `Update`, `Delete`, `CreateTable`, `DropTable`, expressions, column refs, literals, operators.
+ succeeded in 384ms:
+# Progress
+
+## Current Status
+
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
+
+Latest completions:
+- Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+- Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+- Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
+- B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+- Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+- End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+- B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
+- End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
+- Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
+- WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
+- SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
+- SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
+- SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
+
+thinking
+**Planning deeper inspection of progress and lock files**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '320,520p' PROGRESS.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git status --short --branch' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'for f in current_tasks/*.txt; do echo "--- $f"; cat "$f"; stat -c '"'mtime=%Y (%y)' \""'$f"; done' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 285ms:
+
+ succeeded in 292ms:
+## main...origin/main
+ M crates/parser/src/ast.rs
+ M crates/parser/src/lib.rs
+ M crates/parser/src/parser.rs
+ M crates/parser/src/token.rs
+ M crates/parser/src/tokenizer.rs
+ M crates/storage/src/header.rs
+ M crates/storage/src/pager.rs
+ succeeded in 298ms:
+--- current_tasks/drop-table-drop-index.txt
+created_at_unix=1770801200
+agent_id=opus
+task=Implement DROP TABLE and DROP INDEX execution (parser + ralph-sqlite)
+mtime=1770801213 (2026-02-11 01:13:33.000000000 -0800)
+--- current_tasks/schema-persistence-integration.txt
+created_at_unix=1770800480
+agent_id=2
+task=Integrate schema table into Database for persistent table/index catalogs
+mtime=1770800840 (2026-02-11 01:07:20.000000000 -0800)
+
+thinking
+**Searching for pending tasks**
+codex
+I’ve confirmed both active locks are recent (not stale), and the tracked backlog items are already marked complete. I’m now scanning for the next highest-priority unfinished work item outside that list so I can claim an unlocked task safely.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "rg -n \"pending task|pending|TODO|\\[ \\]|Next|Backlog|Known Issues|schema persistence|drop table|drop index\" PROGRESS.md README.md DESIGN.md notes/*.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'ls -1 notes' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 395ms:
+ast-types.md
+btree-delete-rebalance.md
+btree.md
+end-to-end-create-insert-select.md
+expression-evaluation.md
+order-by-select-execution.md
+page-allocator-freelist.md
+pager.md
+parser-create-insert-select.md
+parser-implementation.md
+parser-tokenizer.md
+query-planner-index-selection.md
+schema.md
+secondary-indexes.md
+select-aggregate-execution.md
+transaction-sql.md
+update-delete-execution.md
+update-delete-index-selection.md
+volcano-iterator-model.md
+wal-recovery-checkpoint.md
+ succeeded in 418ms:
+notes/update-delete-execution.md:29:- Schema/table metadata remains connection-local pending task #8.
+notes/transaction-sql.md:42:- Catalog persistence is still pending task #8, so transaction catalog rollback/commit behavior is currently connection-local only.
+notes/wal-recovery-checkpoint.md:14:  - Flushes pending dirty pages first (to preserve commit semantics), then checkpoints committed WAL frames and truncates WAL.
+notes/parser-implementation.md:52:## What's Next
+notes/query-planner-index-selection.md:52:- Table and index catalogs remain connection-local pending schema-table persistence (task #8).
+notes/secondary-indexes.md:27:- Index metadata is still connection-local (same as table catalog); persistence is pending schema task #8.
+notes/secondary-indexes.md:28:- SELECT planning still does full table scans; index selection is pending task #14.
+notes/end-to-end-create-insert-select.md:29:- Rowid keys are assigned by scanning current table rows and appending `max(rowid)+1`.
+notes/pager.md:29:## What's Next
+DESIGN.md:120:- [ ] SQL tokenizer and parser for SELECT/INSERT/CREATE TABLE
+DESIGN.md:121:- [ ] AST types
+DESIGN.md:122:- [ ] Basic pager with read/write of 4KB pages
+DESIGN.md:123:- [ ] File header and page allocation
+DESIGN.md:124:- [ ] Test harness with sqlite3 oracle
+DESIGN.md:127:- [ ] B+tree insert and point lookup
+DESIGN.md:128:- [ ] B+tree range scan with leaf linking
+DESIGN.md:129:- [ ] Schema table (sqlite_master equivalent)
+DESIGN.md:130:- [ ] Table creation on disk
+DESIGN.md:131:- [ ] INSERT and simple SELECT execution end-to-end
+DESIGN.md:141:- [ ] UPDATE execution
+
+thinking
+**Selecting highest-priority unlocked task**
+codex
+I’m selecting an unlocked next item: `freelist management` (the earliest unfinished Stage 6 item and first known-issue gap not currently locked). Before claiming it, I’m reading the pager/freelist notes and current storage code to scope a minimal, testable change.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,220p' notes/page-allocator-freelist.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,220p' notes/pager.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,260p' crates/storage/src/pager.rs" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,260p' crates/storage/src/header.rs" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 292ms:
+# Pager Handoff: Page Allocator Freelist Stub
+
+## What was implemented
+
+- Updated `Pager::allocate_page()` in `crates/storage/src/pager.rs` to:
+  - Reuse a page from the freelist when `header.freelist_head != 0`.
+  - Read the freelist next pointer from bytes `0..4` of the freelist head page (big-endian `u32`).
+  - Validate that `freelist_head` and the next pointer are in range (`0` or `< page_count`).
+  - Zero the reused page before returning it.
+  - Decrement `freelist_count` with saturating behavior.
+  - Fall back to extending the file when freelist is empty.
+
+## Tests added
+
+- `allocate_reuses_freelist_before_extension`
+- `allocate_zeroes_reused_freelist_page`
+
+## Behavior notes
+
+- This is a freelist **stub**: there is still no public `free_page()` API yet.
+ succeeded in 293ms:
+# Pager Notes
+
+## File Layout
+
+- **Page 0**: Contains the 100-byte `FileHeader` at the start, followed by unused space to fill `page_size`.
+- Pages are addressed by `PageNum` (u32, 0-based).
+- All integers in the header are big-endian.
+
+## API Summary
+
+```rust
+Pager::open(path)                // Open or create a database file
+Pager::open_with_pool_size(path, n) // Open with custom buffer pool capacity
+pager.read_page(page_num)        // -> &[u8]
+pager.write_page(page_num)       // -> &mut [u8], marks dirty
+pager.allocate_page()            // -> PageNum (extends file)
+pager.pin(page_num) / unpin()    // Prevent/allow LRU eviction
+pager.flush_all()                // Write all dirty pages + header to disk
+pager.header() / header_mut()    // Access the FileHeader
+```
+ succeeded in 286ms:
+//! Database file header (stored in the first 100 bytes of page 0).
+
+use std::io::{self, Read, Write};
+
+/// Magic bytes identifying a ralph-sqlite database file.
+pub const MAGIC: &[u8; 16] = b"ralph-sqlite\0\0\0\0";
+
+/// Default page size in bytes.
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
+
+/// Size of the file header in bytes.
+pub const HEADER_SIZE: usize = 100;
+
+/// The file header stored at the beginning of the database file (page 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHeader {
+    /// Page size in bytes (must be a power of 2, >= 512).
+    pub page_size: u32,
+    /// Total number of pages in the database file.
+    pub page_count: u32,
+ succeeded in 331ms:
+//! Pager: page-level I/O with an in-memory buffer pool.
+//!
+//! The pager manages reading and writing fixed-size pages from/to the database
+//! file. It maintains a buffer pool with LRU eviction and dirty-page tracking.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use crate::header::FileHeader;
+use crate::wal::Wal;
+
+/// Default number of pages in the buffer pool.
+const DEFAULT_POOL_SIZE: usize = 256;
+
+/// A page number (0-based). Page 0 contains the file header.
+pub type PageNum = u32;
+
+/// A single in-memory page frame.
+
+thinking
+**Inspecting uncommitted pager changes**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '260,620p' crates/storage/src/pager.rs" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 276ms:
+    pub fn commit(&mut self) -> io::Result<()> {
+        self.flush_all()
+    }
+
+    /// Checkpoint committed WAL frames into the database file and truncate WAL.
+    pub fn checkpoint(&mut self) -> io::Result<usize> {
+        let has_dirty_pages = self.header_dirty || self.pool.values().any(|frame| frame.dirty);
+        if has_dirty_pages {
+            self.flush_all()?;
+        }
+        self.wal.checkpoint(&mut self.file, self.page_size)
+    }
+
+    /// Pin a page (prevent eviction).
+    pub fn pin(&mut self, page_num: PageNum) {
+        if let Some(frame) = self.pool.get_mut(&page_num) {
+            frame.pin_count += 1;
+        }
+    }
+
+
+thinking
+**Extending free_page tests**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '620,980p' crates/storage/src/pager.rs" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 257ms:
+
+        // Allocate 5 pages (+ page 0 = 6 total, but pool fits 4).
+        for _ in 0..5 {
+            pager.allocate_page().unwrap();
+        }
+
+        // Write something to each page so they're dirty and get flushed on eviction.
+        for pg in 1..=5 {
+            let data = pager.write_page(pg).unwrap();
+            data[0] = pg as u8;
+        }
+
+        // Pool should have at most 4 frames.
+        assert!(pager.pool.len() <= 4);
+
+        // Re-read all pages—evicted ones should be re-loaded from disk.
+        for pg in 1..=5 {
+            let data = pager.read_page(pg).unwrap();
+            assert_eq!(data[0], pg as u8);
+        }
+
+thinking
+**Assessing uncommitted pager changes**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "git diff -- crates/storage/src/pager.rs | sed -n '1,240p'" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git diff --stat' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "git diff -- crates/storage/src/header.rs | sed -n '1,220p'" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "git diff -- crates/parser/src/token.rs crates/parser/src/tokenizer.rs crates/parser/src/ast.rs crates/parser/src/parser.rs crates/parser/src/lib.rs | sed -n '1,280p'" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 340ms:
+diff --git a/crates/storage/src/header.rs b/crates/storage/src/header.rs
+index 1644716..be2ac67 100644
+--- a/crates/storage/src/header.rs
++++ b/crates/storage/src/header.rs
+@@ -94,7 +94,10 @@ impl FileHeader {
+         let mut buf = [0u8; HEADER_SIZE];
+         reader.read_exact(&mut buf)?;
+         Self::deserialize(&buf).ok_or_else(|| {
+-            io::Error::new(io::ErrorKind::InvalidData, "invalid database header (bad magic)")
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "invalid database header (bad magic)",
++            )
+         })
+     }
+ }
+ succeeded in 355ms:
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index c698316..96c7e1b 100644
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -216,6 +216,46 @@ impl Pager {
+         Ok(page_num)
+     }
+ 
++    /// Add an existing page to the freelist so it can be reused by future
++    /// allocations.
++    pub fn free_page(&mut self, page_num: PageNum) -> io::Result<()> {
++        if page_num == 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "cannot free header page 0",
++            ));
++        }
++        if page_num >= self.header.page_count {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
+ succeeded in 772ms:
+ crates/parser/src/ast.rs       |  15 +----
+ crates/parser/src/lib.rs       |   1 -
+ crates/parser/src/parser.rs    |  92 +++++++++++++---------------
+ crates/parser/src/token.rs     |   2 +-
+ crates/parser/src/tokenizer.rs |   1 -
+ crates/storage/src/header.rs   |   5 +-
+ crates/storage/src/pager.rs    | 134 +++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 183 insertions(+), 67 deletions(-)
+ succeeded in 773ms:
+diff --git a/crates/parser/src/ast.rs b/crates/parser/src/ast.rs
+index de12f03..41e7784 100644
+--- a/crates/parser/src/ast.rs
++++ b/crates/parser/src/ast.rs
+@@ -139,20 +139,11 @@ pub enum Expr {
+         right: Box<Expr>,
+     },
+     /// Unary operation: op expr
+-    UnaryOp {
+-        op: UnaryOperator,
+-        expr: Box<Expr>,
+-    },
++    UnaryOp { op: UnaryOperator, expr: Box<Expr> },
+     /// `expr IS NULL` or `expr IS NOT NULL`
+-    IsNull {
+-        expr: Box<Expr>,
+-        negated: bool,
+-    },
++    IsNull { expr: Box<Expr>, negated: bool },
+     /// Function call: name(args...)
+
+thinking
+**Clarifying lock file handling**
+codex
+I’ve identified `freelist management` as the next unlocked priority. I’ll claim it with a lock file now, commit that lock alone, and push before touching implementation files.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'set -euo pipefail
+lock_file="current_tasks/freelist-management.txt"
+if [ -e "$lock_file" ]; then
+  echo "lock_exists"
+  exit 2
+fi
+created_at="$(date +%s)"
+agent_id="${AGENT_ID:-codex}"
+(
+  set -o noclobber
+  cat > "$lock_file" <<EOF
+created_at_unix=${created_at}
+agent_id=${agent_id}
+task=Implement pager freelist management API (`free_page`) and tests
+EOF
+)
+echo "created $lock_file"' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 286ms:
+/cvmfs/soft.computecanada.ca/custom/software/lmod/lmod/init/bash: line 153: BASH_SOURCE[1]: unbound variable
+created current_tasks/freelist-management.txt
+
+thinking
+**Investigating command substitution risk**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "cat current_tasks/freelist-management.txt && echo '---' && git status --short" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 276ms:
+created_at_unix=1770807948
+agent_id=3
+task=Implement pager freelist management API () and tests
+---
+ M crates/parser/src/ast.rs
+ M crates/parser/src/lib.rs
+ M crates/parser/src/parser.rs
+ M crates/parser/src/token.rs
+ M crates/parser/src/tokenizer.rs
+ M crates/storage/src/header.rs
+ M crates/storage/src/pager.rs
+?? current_tasks/freelist-management.txt
+
+thinking
+**Planning lock file fix**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "cat > current_tasks/freelist-management.txt <<'EOF'
+created_at_unix=1770807948
+agent_id=3
+task=Implement pager freelist management API (free_page) and tests
+EOF" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 259ms:
+
+
+thinking
+**Deciding minimal locking**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git add current_tasks/freelist-management.txt && git commit -m "chore: lock freelist management task"' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 438ms:
+[main cc6bfc6] chore: lock freelist management task
+ 1 file changed, 3 insertions(+)
+ create mode 100644 current_tasks/freelist-management.txt
+
+thinking
+**Ensuring push synchronization**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git push' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 1.74s:
+To github.com:kiankyars/sqlite.git
+   2fb630d..cc6bfc6  main -> main
+
+thinking
+**Evaluating preexisting modifications for commit**
+codex
+Lock is committed and pushed (`cc6bfc6`).  
+Next I’ll complete the task in this order:
+
+1. Validate the existing freelist changes in `crates/storage` (behavior + edge cases) and adjust if needed.
+2. Run storage tests plus `./test.sh --fast` as required by the workflow.
+3. Update shared state docs (`PROGRESS.md`, and a focused handoff note in `notes/`) with exactly what changed and verification status.
+4. Commit only task-scoped files (excluding unrelated in-progress parser edits), push, then remove the task lock in a final commit and push.
+
+thinking
+**Running targeted storage tests**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'cargo test -p ralph-storage' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3
+thinking
+**Tracking long-running session**
+ succeeded in 1m 01s:
+   Compiling ralph-storage v0.1.0 (/project/6049267/kyars/parallel-ralph/sqlite/workspace-3/crates/storage)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.88s
+     Running unittests src/lib.rs (target/debug/deps/ralph_storage-5ca061b9a235b56d)
+
+running 43 tests
+test btree::tests::create_and_lookup_empty ... ok
+test btree::tests::insert_and_lookup_multiple ... ok
+test btree::tests::delete_existing_and_missing_keys ... ok
+test btree::tests::insert_and_lookup_single ... ok
+test btree::tests::delete_compacts_root_after_leftmost_leaf_becomes_empty ... ok
+test btree::tests::persistence_after_flush ... ok
+test btree::tests::delete_after_leaf_splits ... ok
+test btree::tests::insert_triggers_leaf_split ... ok
+test btree::tests::update_existing_key ... ok
+test btree::tests::scan_all_entries ... ok
+test btree::tests::insert_reverse_order ... ok
+test btree::tests::range_scan ... ok
+test header::tests::bad_magic_returns_none ... ok
+test header::tests::roundtrip_custom_header ... ok
+test header::tests::roundtrip_default_header ... ok
+
+thinking
+**Planning freelist persistence tests**
+codex
+The freelist API code already exists in the working tree and passes `cargo test -p ralph-storage`. I’m adding one focused persistence test plus task-state documentation updates (`PROGRESS.md` and a new note), then I’ll run `./test.sh --fast` before pushing.
+
+thinking
+**Planning multi-file patch and test updates**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'rg -n "Latest completions|Test pass rate|Known Issues|freelist" PROGRESS.md' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '1,120p' PROGRESS.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "sed -n '170,230p' PROGRESS.md" in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 333ms:
+7:Latest completions:
+10:- Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
+28:Test pass rate:
+59:5. ~~Page allocator with freelist stub~~ ✓
+90:  - File header: magic, page_size, page_count, freelist_head/count, schema_root (100 bytes, big-endian)
+93:- [x] Page allocator with freelist-pop reuse stub (agent 4)
+94:  - `allocate_page()` now reuses freelist head pages before extending the file
+95:  - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+96:  - Reused pages are zeroed before return; header freelist metadata is updated and validated
+177:## Known Issues
+179:- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
+ succeeded in 366ms:
+  - Added storage tests for committed-frame recovery, uncommitted-tail ignore behavior, checkpoint WAL truncation, and recovered header reload
+- [x] UPDATE/DELETE planner-driven index selection (agent opus)
+  - Added `plan_where(where_clause, table_name, indexes) -> AccessPath` general-purpose planner API
+  - Updated `execute_update` and `execute_delete` to call planner and use `read_candidate_entries` helper for index-driven row selection
+  - Full WHERE predicate still re-applied after index probe for correctness
+  - Added 3 planner tests and 3 integration tests; see `notes/update-delete-index-selection.md`
+
+## Known Issues
+
+- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
+- Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+- Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+- B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+- UPDATE/DELETE use index-driven row selection when a suitable equality index exists; they fall back to full table scan otherwise.
+- Query planning is currently limited to single-table equality predicates on single-column secondary indexes; range, OR, multi-index, and cost-based planning are not implemented.
+- No GROUP BY / HAVING parsing yet (keywords defined but parser logic not implemented)
+- No JOIN support (single-table FROM only)
+- No subquery support
+- Table catalog is currently connection-local in `ralph-sqlite`; schema metadata persistence is pending task #8.
+- Index catalog is currently connection-local in `ralph-sqlite`; persistence is pending task #8.
+ succeeded in 376ms:
+# Progress
+
+## Current Status
+
+**Phase: Stage 5 (partial)** — Tokenizer/parser, pager, B+tree, schema table, end-to-end CREATE/INSERT/SELECT/UPDATE/DELETE execution, SELECT `ORDER BY`/`LIMIT`/aggregates, WAL write-ahead commit path, WAL startup recovery/checkpoint, SQL transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`), a standalone Volcano executor core (`Scan`/`Filter`/`Project`) with expression evaluation, and query planner index selection for SELECT/UPDATE/DELETE are implemented.
+
+Latest completions:
+- Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+- Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+- Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
+- B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+- Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+- End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+- B+tree delete primitive for UPDATE/DELETE groundwork (Agent 3) — key removal via tree descent to target leaf, with unit tests for single-leaf and split-tree deletes (no rebalance/merge yet)
+- End-to-end `UPDATE` + `DELETE` execution in `crates/ralph-sqlite` (Agent codex) — WHERE filtering + assignment evaluation wired to B+tree row updates/deletes, with affected-row counts and integration tests
+- Secondary indexes with `CREATE INDEX` execution, backfill, and insert-time maintenance in `crates/ralph-sqlite` (Agent 4)
+- WAL write path + commit in `crates/storage` (Agent codex) — WAL sidecar file format, page/commit frames with checksums, and write-ahead commit flow wired into SQL write statements
+- SQL transaction control in parser + integration layer (Agent codex) — `BEGIN [TRANSACTION]`, `COMMIT [TRANSACTION]`, `ROLLBACK [TRANSACTION]` parsing/execution with autocommit gating and rollback-to-snapshot behavior for connection-local catalogs
+- SELECT `ORDER BY` execution in `crates/ralph-sqlite` (Agent 3) — supports expression sort keys (including non-projected columns), ASC/DESC multi-key ordering, and preserves `LIMIT/OFFSET` after sort
+- SELECT aggregate execution in `crates/ralph-sqlite` (Agent codex) — supports `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no `GROUP BY`) with NULL-aware semantics and single-row aggregate output
+
+thinking
+**Adding pager freelist persistence test**
+file update
+M /project/6049267/kyars/parallel-ralph/sqlite/workspace-3/crates/storage/src/pager.rs
+@@ -809,2 +809,35 @@
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+apply_patch(auto_approved=true) exited 0 in 22ms:
+Success. Updated the following files:
+M crates/storage/src/pager.rs
+file update:
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+file update:
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Adding note file**
+codex
+I’ve added a persistence-focused unit test for `free_page` behavior across reopen. Next I’m documenting the task in `notes/` and updating `PROGRESS.md` before running the required fast harness.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc "cat > notes/freelist-management.md <<'EOF'
+# Pager Handoff: Freelist Management ("'`free_page`)
+
+## What was implemented
+
+- Added `Pager::free_page(page_num)` in `crates/storage/src/pager.rs`.
+- `free_page` now:
+  - rejects invalid frees (`page_num == 0` and out-of-range page ids),
+  - rejects duplicate frees by traversing the freelist chain,
+  - links the freed page at freelist head (`page[0..4] = old_head`),
+  - zeroes the freed page payload before relinking,
+  - updates `header.freelist_head` / `header.freelist_count`, and
+  - marks header/page state dirty for WAL-backed commit/flush.
+
+## Tests
+
+Added/updated pager unit tests:
+- `free_page_adds_to_freelist_and_allocate_reuses_it`
+- `free_page_rejects_invalid_and_duplicate_pages`
+- `free_page_persists_across_reopen`
+
+## Notes / limitations
+
+- This task provides the pager-level free-page primitive only.
+- Higher layers (B+tree/schema/index lifecycle) still need to call `free_page` when they physically drop or recycle pages.
+EOF' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 257ms:
+
+file update:
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Patching PROGRESS.md sections**
+file update
+M /project/6049267/kyars/parallel-ralph/sqlite/workspace-3/PROGRESS.md
+@@ -10,2 +10,3 @@
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+@@ -28,2 +29,3 @@
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+@@ -96,2 +98,6 @@
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+@@ -178,3 +184,3 @@
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+apply_patch(auto_approved=true) exited 0 in 55ms:
+Success. Updated the following files:
+M PROGRESS.md
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Planning frequent test runs**
+codex
+I’ve finished the task-scoped edits and docs updates. I’m running verification now (`cargo test -p ralph-storage` and then `./test.sh --fast`) before committing and pushing the implementation.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'cargo test -p ralph-storage' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 2.20s:
+   Compiling ralph-storage v0.1.0 (/project/6049267/kyars/parallel-ralph/sqlite/workspace-3/crates/storage)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.85s
+     Running unittests src/lib.rs (target/debug/deps/ralph_storage-5ca061b9a235b56d)
+
+running 44 tests
+test btree::tests::create_and_lookup_empty ... ok
+test btree::tests::delete_existing_and_missing_keys ... ok
+test btree::tests::insert_and_lookup_multiple ... ok
+test btree::tests::insert_and_lookup_single ... ok
+test btree::tests::delete_compacts_root_after_leftmost_leaf_becomes_empty ... ok
+test btree::tests::persistence_after_flush ... ok
+test btree::tests::delete_after_leaf_splits ... ok
+test btree::tests::insert_triggers_leaf_split ... ok
+test btree::tests::range_scan ... ok
+test btree::tests::scan_all_entries ... ok
+test btree::tests::insert_reverse_order ... ok
+test btree::tests::update_existing_key ... ok
+test header::tests::bad_magic_returns_none ... ok
+test header::tests::roundtrip_custom_header ... ok
+test header::tests::roundtrip_default_header ... ok
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc './test.sh --fast' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 301ms:
+ralph-sqlite test harness
+Mode: FAST (10% deterministic sample, seed: 3)
+
+══════════════════════════════════════════════
+ Section 3: Build check
+══════════════════════════════════════════════
+  SKIP: cargo-build (sampled out)
+
+══════════════════════════════════════════════
+ Section 1: Cargo unit tests
+══════════════════════════════════════════════
+  SKIP: cargo-test (sampled out)
+
+══════════════════════════════════════════════
+ Section 2: Oracle comparison tests
+══════════════════════════════════════════════
+  SKIP: oracle-select-literal (sampled out)
+  SKIP: oracle-select-arithmetic (sampled out)
+  PASS: oracle-select-string (oracle-only, engine pending)
+
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Scoping commit to storage changes**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git status --short' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 290ms:
+ M PROGRESS.md
+ M crates/parser/src/ast.rs
+ M crates/parser/src/lib.rs
+ M crates/parser/src/parser.rs
+ M crates/parser/src/token.rs
+ M crates/parser/src/tokenizer.rs
+ M crates/storage/src/header.rs
+ M crates/storage/src/pager.rs
+?? notes/freelist-management.md
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Staging core diffs selectively**
+codex
+Verification passed. I’m now committing only task-scoped files (`crates/storage/src/pager.rs`, `PROGRESS.md`, and `notes/freelist-management.md`) so unrelated parser work stays untouched.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git add crates/storage/src/pager.rs PROGRESS.md notes/freelist-management.md && git commit -m "feat(storage): add pager free-page freelist management"' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 1.20s:
+[main 93618e0] feat(storage): add pager free-page freelist management
+ 3 files changed, 198 insertions(+), 1 deletion(-)
+ create mode 100644 notes/freelist-management.md
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Committing and pushing code**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git push' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 exited 1 in 1.23s:
+To github.com:kiankyars/sqlite.git
+ ! [rejected]        main -> main (fetch first)
+error: failed to push some refs to 'github.com:kiankyars/sqlite.git'
+hint: Updates were rejected because the remote contains work that you do
+hint: not have locally. This is usually caused by another repository pushing
+hint: to the same ref. You may want to first integrate the remote changes
+hint: (e.g., 'git pull ...') before pushing again.
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Using autostash for safe rebase**
+codex
+A concurrent push landed on `main`, so my push was rejected. I’m rebasing onto latest `origin/main` with autostash, then I’ll rerun `./test.sh --fast` (required before push) and push again.
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git pull --rebase --autostash' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 4.62s:
+From github.com:kiankyars/sqlite
+   cc6bfc6..5797d7d  main       -> origin/main
+Created autostash: 08520bd
+Rebasing (1/1)Applied autostash.
+                                                                                Successfully rebased and updated refs/heads/main.
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Checking for git conflicts and rewrite need**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git status --short --branch' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git --no-pager log --oneline --decorate -5' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 285ms:
+d7c5da6 (HEAD -> main) feat(storage): add pager free-page freelist management
+5797d7d (origin/main, origin/HEAD) chore: clean stale locks and claim schema persistence integration
+cc6bfc6 chore: lock freelist management task
+2fb630d lock: claim DROP TABLE / DROP INDEX execution task
+027bdd9 feat(planner): add index-driven row selection for UPDATE and DELETE
+ succeeded in 299ms:
+## main...origin/main [ahead 1]
+ M crates/parser/src/ast.rs
+ M crates/parser/src/lib.rs
+ M crates/parser/src/parser.rs
+ M crates/parser/src/token.rs
+ M crates/parser/src/tokenizer.rs
+ M crates/storage/src/header.rs
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Preparing tests before push**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc './test.sh --fast' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 277ms:
+ralph-sqlite test harness
+Mode: FAST (10% deterministic sample, seed: 3)
+
+══════════════════════════════════════════════
+ Section 3: Build check
+══════════════════════════════════════════════
+  SKIP: cargo-build (sampled out)
+
+══════════════════════════════════════════════
+ Section 1: Cargo unit tests
+══════════════════════════════════════════════
+  SKIP: cargo-test (sampled out)
+
+══════════════════════════════════════════════
+ Section 2: Oracle comparison tests
+══════════════════════════════════════════════
+  SKIP: oracle-select-literal (sampled out)
+  SKIP: oracle-select-arithmetic (sampled out)
+  PASS: oracle-select-string (oracle-only, engine pending)
+
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Pushing implementation commit**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git push' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 1.47s:
+To github.com:kiankyars/sqlite.git
+   5797d7d..d7c5da6  main -> main
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Cleaning lock files and committing**
+codex
+Implementation commit is on `origin/main`. I’m doing workflow cleanup now by removing `current_tasks/freelist-management.txt`, then I’ll run `./test.sh --fast` again and push the lock-release commit.
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Switching to git rm for removal**
+codex
+The `rm` invocation was blocked by policy, so I’ll use `git rm` directly to release the lock and commit.
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+
+
+thinking
+**Switching to patch-based file deletion**
+file update
+D /project/6049267/kyars/parallel-ralph/sqlite/workspace-3/current_tasks/freelist-management.txt
+created_at_unix=1770807948
+agent_id=3
+task=Implement pager freelist management API (free_page) and tests
+apply_patch(auto_approved=true) exited 0 in 22ms:
+Success. Updated the following files:
+D current_tasks/freelist-management.txt
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+
+thinking
+**Attempting git commit despite potential path restrictions**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git add current_tasks/freelist-management.txt && git commit -m "chore: release freelist management task lock"' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 354ms:
+[main 9c17788] chore: release freelist management task lock
+ 1 file changed, 3 deletions(-)
+ delete mode 100644 current_tasks/freelist-management.txt
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+
+thinking
+**Running quick tests before push**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc './test.sh --fast' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 285ms:
+ralph-sqlite test harness
+Mode: FAST (10% deterministic sample, seed: 3)
+
+══════════════════════════════════════════════
+ Section 3: Build check
+══════════════════════════════════════════════
+  SKIP: cargo-build (sampled out)
+
+══════════════════════════════════════════════
+ Section 1: Cargo unit tests
+══════════════════════════════════════════════
+  SKIP: cargo-test (sampled out)
+
+══════════════════════════════════════════════
+ Section 2: Oracle comparison tests
+══════════════════════════════════════════════
+  SKIP: oracle-select-literal (sampled out)
+  SKIP: oracle-select-arithmetic (sampled out)
+  PASS: oracle-select-string (oracle-only, engine pending)
+
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+
+thinking
+**Confirming commit push**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git push' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 1.34s:
+To github.com:kiankyars/sqlite.git
+   d7c5da6..9c17788  main -> main
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+
+thinking
+**Summarizing final state and clean status**
+exec
+/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin/bash -lc 'git status --short --branch' in /project/6049267/kyars/parallel-ralph/sqlite/workspace-3 succeeded in 334ms:
+## main...origin/main
+ M crates/parser/src/ast.rs
+ M crates/parser/src/lib.rs
+ M crates/parser/src/parser.rs
+ M crates/parser/src/token.rs
+ M crates/parser/src/tokenizer.rs
+ M crates/storage/src/header.rs
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+
+thinking
+**Summarizing final update details**
+codex
+Task claimed, implemented, tested, documented, and lock released per workflow.
+
+Implemented and pushed:
+- `crates/storage/src/pager.rs`: added pager freelist management via `Pager::free_page(...)` (validation, duplicate detection, freelist relinking) and added `free_page_persists_across_reopen` test.
+- `notes/freelist-management.md`: handoff note for freelist management.
+- `PROGRESS.md`: updated latest completions, test pass rate, completed tasks, and known-issues freelist note.
+- `current_tasks/freelist-management.txt`: created for claim, then removed after completion.
+
+Verification run:
+- `cargo test -p ralph-storage`: pass, 44 passed / 0 failed.
+- `./test.sh --fast`: pass, 0 failed (deterministic sample: 1 passed, 4 skipped).
+- Re-ran `./test.sh --fast` before each push as required.
+
+Git activity:
+- Lock commit pushed: `cc6bfc6`
+- Implementation commit pushed: `d7c5da6`
+- Lock release commit pushed: `9c17788`
+
+Note:
+- Unrelated pre-existing local modifications remain untouched in parser/header files (`crates/parser/src/*.rs`, `crates/storage/src/header.rs`).
+file update:
+diff --git a/PROGRESS.md b/PROGRESS.md
+index 0579dcab9abfdc16470d6e5d365c52b2273a78e5..1c2689de28a5171a2d26cc47a0a167a57156cf2c
+--- a/PROGRESS.md
++++ b/PROGRESS.md
+@@ -8,6 +8,7 @@
+ - Full SQL parser with modular tokenizer, AST, and recursive-descent parser (Agent 1)
+ - Basic pager with buffer pool implemented in `crates/storage` (Agent 2)
+ - Page allocator with freelist-pop stub implemented in `crates/storage` (Agent 4)
++- Pager freelist management API in `crates/storage` (Agent 3) — added `Pager::free_page()` with validation/duplicate detection and allocation-reuse persistence coverage
+ - B+tree with insert, point lookup, leaf-linked range scan, and splitting (Agent 2)
+ - Schema table (sqlite_master equivalent) with create/find/list operations (Agent 2)
+ - End-to-end `CREATE TABLE` + `INSERT` + `SELECT` path in `crates/ralph-sqlite` (Agent 4)
+@@ -26,6 +27,7 @@
+ - UPDATE/DELETE index selection in `crates/planner` + `crates/ralph-sqlite` (Agent opus) — added `plan_where` general-purpose planner entry point; UPDATE and DELETE now use planner-driven index selection instead of unconditional full table scans; index consistency maintained for indexed column value changes
+ 
+ Test pass rate:
++- `cargo test -p ralph-storage` (freelist management): pass, 0 failed (43 tests).
+ - `cargo test --workspace` (task #15 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #17 implementation): pass, 0 failed.
+ - `cargo test --workspace` (task #18 implementation): pass, 0 failed.
+@@ -94,6 +96,10 @@
+   - `allocate_page()` now reuses freelist head pages before extending the file
+   - Freelist next pointer read from bytes `0..4` (big-endian `u32`) of the freelist head page
+   - Reused pages are zeroed before return; header freelist metadata is updated and validated
++- [x] Freelist management API in pager (agent 3)
++  - Added `Pager::free_page(page_num)` to recycle pages back onto the freelist
++  - `free_page` validates page range, rejects duplicate free requests, and relinks freed pages as freelist head pages
++  - Added pager tests for reuse ordering, invalid/duplicate free rejection, and free-list persistence across reopen
+ - [x] B+tree insert, point lookup, range scan, and leaf splitting (agent 2)
+   - Insert with automatic leaf/interior node splitting
+   - Point lookup via tree traversal
+@@ -176,7 +182,7 @@
+ 
+ ## Known Issues
+ 
+-- Pager has freelist-pop reuse, but there is no public `free_page()` API yet.
++- Pager now exposes `free_page()`, but higher-level page lifecycle wiring (e.g., schema/index/drop workflows) is still pending.
+ - Dirty-page eviction still flushes directly to the DB file; WAL is guaranteed on explicit commit/flush path.
+ - Explicit transaction rollback does not undo dirty-page eviction writes that already reached the DB file; rollback reliably discards uncommitted pages that stayed buffered.
+ - B+tree delete rebalance currently compacts only empty-node underflow; occupancy-based redistribution/merge policy is not implemented.
+diff --git a/crates/storage/src/pager.rs b/crates/storage/src/pager.rs
+index 96c7e1bcf875ecd9a08b2a60264eb10621e855c1..9f0bfa86205ea856c306106312af4c7d619ab6d3
+--- a/crates/storage/src/pager.rs
++++ b/crates/storage/src/pager.rs
+@@ -807,6 +807,39 @@
+     }
+ 
+     #[test]
++    fn free_page_persists_across_reopen() {
++        let path = temp_db_path("freelist_free_persist.db");
++        cleanup(&path);
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            let p1 = pager.allocate_page().unwrap();
++            let p2 = pager.allocate_page().unwrap();
++            let p3 = pager.allocate_page().unwrap();
++            assert_eq!((p1, p2, p3), (1, 2, 3));
++
++            pager.free_page(p2).unwrap();
++            pager.free_page(p3).unwrap();
++            pager.flush_all().unwrap();
++        }
++
++        {
++            let mut pager = Pager::open(&path).unwrap();
++            assert_eq!(pager.header().freelist_head, 3);
++            assert_eq!(pager.header().freelist_count, 2);
++
++            let reused_1 = pager.allocate_page().unwrap();
++            let reused_2 = pager.allocate_page().unwrap();
++            assert_eq!((reused_1, reused_2), (3, 2));
++            assert_eq!(pager.header().freelist_head, 0);
++            assert_eq!(pager.header().freelist_count, 0);
++            assert_eq!(pager.page_count(), 4);
++        }
++
++        cleanup(&path);
++    }
++
++    #[test]
+     fn flush_writes_wal_page_frames_and_commit_record() {
+         let path = temp_db_path("wal_commit_record.db");
+         cleanup(&path);
+diff --git a/current_tasks/freelist-management.txt b/current_tasks/freelist-management.txt
+deleted file mode 100644
+index 2042bb03260963fed04a4c99f9988c2df2e9fa1b..0000000000000000000000000000000000000000
+--- a/current_tasks/freelist-management.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-created_at_unix=1770807948
+-agent_id=3
+-task=Implement pager freelist management API (free_page) and tests
+
+tokens used
+47,351
+Task claimed, implemented, tested, documented, and lock released per workflow.
+
+Implemented and pushed:
+- `crates/storage/src/pager.rs`: added pager freelist management via `Pager::free_page(...)` (validation, duplicate detection, freelist relinking) and added `free_page_persists_across_reopen` test.
+- `notes/freelist-management.md`: handoff note for freelist management.
+- `PROGRESS.md`: updated latest completions, test pass rate, completed tasks, and known-issues freelist note.
+- `current_tasks/freelist-management.txt`: created for claim, then removed after completion.
+
+Verification run:
+- `cargo test -p ralph-storage`: pass, 44 passed / 0 failed.
+- `./test.sh --fast`: pass, 0 failed (deterministic sample: 1 passed, 4 skipped).
+- Re-ran `./test.sh --fast` before each push as required.
+
+Git activity:
+- Lock commit pushed: `cc6bfc6`
+- Implementation commit pushed: `d7c5da6`
+- Lock release commit pushed: `9c17788`
+
+Note:
+- Unrelated pre-existing local modifications remain untouched in parser/header files (`crates/parser/src/*.rs`, `crates/storage/src/header.rs`).

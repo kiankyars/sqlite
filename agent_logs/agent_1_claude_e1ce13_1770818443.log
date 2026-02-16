@@ -1,0 +1,24 @@
+Done! Here's a summary of what was accomplished:
+
+## Summary
+
+### Task: INNER JOIN / CROSS JOIN Execution
+
+**Status:** Complete, pushed to main.
+
+**Changes made across 8 files:**
+
+1. **`crates/parser/src/token.rs`** — Added `Join`, `Inner`, `Cross` keywords
+2. **`crates/parser/src/ast.rs`** — Added `JoinClause` struct and `JoinType` enum; extended `FromClause` with `joins: Vec<JoinClause>`
+3. **`crates/parser/src/parser.rs`** — Extended `parse_from_clause` to handle `FROM a, b`, `FROM a JOIN b ON`, `FROM a INNER JOIN b ON`, `FROM a CROSS JOIN b`, table aliases, and multi-table chains. Added 6 parser tests.
+4. **`crates/planner/src/lib.rs`** — Fixed test compatibility with new `FromClause` field
+5. **`crates/ralph-sqlite/src/lib.rs`** — Implemented join execution:
+   - `execute_join()` — nested-loop cross product with ON-condition filtering
+   - `execute_select_join()` — full SELECT path for joins (WHERE, projection, ORDER BY, LIMIT)
+   - `eval_join_expr()` — expression evaluator with table-qualified column resolution and ambiguity detection
+   - Added 9 integration tests covering cross join, inner join, aliases, WHERE, SELECT *, LIMIT, unqualified columns, and three-way joins
+6. **`notes/inner-join-execution.md`** — Implementation notes
+7. **`PROGRESS.md`** — Updated with task completion, test counts, known issues
+8. **`README.md`** — Added JOIN to scope
+
+**Test results:** 205 tests pass (up from 190), `./test.sh` full 5/5 passed, no regressions.
