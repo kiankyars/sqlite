@@ -78,6 +78,70 @@ pub struct Entry {
     pub payload: Vec<u8>,
 }
 
+struct LeafEntry {
+    key: i64,
+    total_len: usize,
+    local_payload: Vec<u8>,
+    overflow_page: Option<PageNum>,
+}
+
+fn max_local_payload(page_size: usize) -> usize {
+    page_size / 4
+}
+
+fn write_overflow_chain(pager: &mut Pager, data: &[u8]) -> io::Result<PageNum> {
+    let page_size = pager.page_size();
+    let capacity = page_size - 4;
+    let mut current_page = pager.allocate_page()?;
+    let first_page = current_page;
+
+    let mut written = 0;
+    while written < data.len() {
+        let remaining = data.len() - written;
+        let chunk_size = std::cmp::min(remaining, capacity);
+        let next_page = if remaining > chunk_size {
+            pager.allocate_page()?
+        } else {
+            0
+        };
+
+        let page = pager.write_page(current_page)?;
+        page[0..4].copy_from_slice(&next_page.to_be_bytes());
+        page[4..4 + chunk_size].copy_from_slice(&data[written..written + chunk_size]);
+
+        written += chunk_size;
+        current_page = next_page;
+    }
+    Ok(first_page)
+}
+
+fn read_overflow_chain(
+    pager: &mut Pager,
+    start_page: PageNum,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut current_page = start_page;
+    let page_size = pager.page_size();
+    let capacity = page_size - 4;
+
+    while out.len() < len {
+        if current_page == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overflow chain incomplete",
+            ));
+        }
+        let page = pager.read_page(current_page)?;
+        let next_page = u32::from_be_bytes(page[0..4].try_into().unwrap());
+        let needed = len - out.len();
+        let available = std::cmp::min(needed, capacity);
+        out.extend_from_slice(&page[4..4 + available]);
+        current_page = next_page;
+    }
+    Ok(out)
+}
+
 impl<'a> BTree<'a> {
     /// Create a new B+tree handle. The `root_page` must already be allocated
     /// and initialized (see `create`).
@@ -208,13 +272,32 @@ impl<'a> BTree<'a> {
             if let Some(idx) = find_cell_by_key_leaf(page, key) {
                 // Update: only if payload fits in the same slot.
                 // For simplicity, we delete and re-insert.
+                // TODO: Free old overflow pages if any.
                 let page = self.pager.write_page(page_num)?;
                 delete_leaf_cell(page, page_size, idx);
                 // Fall through to insert below.
             }
         }
 
-        let cell_size = LEAF_CELL_HEADER_SIZE + payload.len();
+        let max_local = max_local_payload(page_size);
+        let entry = if payload.len() > max_local {
+            let overflow_page = write_overflow_chain(self.pager, &payload[max_local..])?;
+            LeafEntry {
+                key,
+                total_len: payload.len(),
+                local_payload: payload[..max_local].to_vec(),
+                overflow_page: Some(overflow_page),
+            }
+        } else {
+            LeafEntry {
+                key,
+                total_len: payload.len(),
+                local_payload: payload.to_vec(),
+                overflow_page: None,
+            }
+        };
+
+        let cell_size = LEAF_CELL_HEADER_SIZE + entry.local_payload.len() + if entry.overflow_page.is_some() { 4 } else { 0 };
 
         // Check if there's room in this leaf.
         let has_room = {
@@ -224,11 +307,11 @@ impl<'a> BTree<'a> {
 
         if has_room {
             let page = self.pager.write_page(page_num)?;
-            insert_leaf_cell(page, page_size, key, payload);
+            insert_leaf_cell(page, page_size, &entry);
             Ok(InsertResult::Ok)
         } else {
             // Split the leaf.
-            self.split_leaf(page_num, key, payload)
+            self.split_leaf(page_num, entry)
         }
     }
 
@@ -273,23 +356,22 @@ impl<'a> BTree<'a> {
     fn split_leaf(
         &mut self,
         page_num: PageNum,
-        new_key: i64,
-        new_payload: &[u8],
+        new_entry: LeafEntry,
     ) -> io::Result<InsertResult> {
         let page_size = self.pager.page_size();
 
         // Collect all entries from the current leaf + the new entry.
-        let mut entries: Vec<(i64, Vec<u8>)> = {
+        let mut entries: Vec<LeafEntry> = {
             let page = self.pager.read_page(page_num)?;
-            read_all_leaf_entries(page)
+            read_all_leaf_entries_raw(page)
         };
-        entries.push((new_key, new_payload.to_vec()));
-        entries.sort_by_key(|(k, _)| *k);
+        entries.push(new_entry);
+        entries.sort_by_key(|e| e.key);
 
         let split_point = entries.len() / 2;
         let left_entries = &entries[..split_point];
         let right_entries = &entries[split_point..];
-        let median_key = right_entries[0].0;
+        let median_key = right_entries[0].key;
 
         // Get the old next_leaf pointer.
         let old_next_leaf = {
@@ -305,8 +387,8 @@ impl<'a> BTree<'a> {
             let page = self.pager.write_page(new_page)?;
             init_leaf(page, page_size);
             set_next_leaf(page, old_next_leaf);
-            for (k, p) in right_entries {
-                insert_leaf_cell(page, page_size, *k, p);
+            for entry in right_entries {
+                insert_leaf_cell(page, page_size, entry);
             }
         }
 
@@ -315,8 +397,8 @@ impl<'a> BTree<'a> {
             let page = self.pager.write_page(page_num)?;
             init_leaf(page, page_size);
             set_next_leaf(page, new_page);
-            for (k, p) in left_entries {
-                insert_leaf_cell(page, page_size, *k, p);
+            for entry in left_entries {
+                insert_leaf_cell(page, page_size, entry);
             }
         }
 
@@ -422,7 +504,8 @@ impl<'a> BTree<'a> {
                 // Search for the key in this leaf.
                 let page = self.pager.read_page(page_num)?;
                 if let Some(idx) = find_cell_by_key_leaf(page, key) {
-                    let payload = read_leaf_payload(page, idx);
+                    let entry = read_leaf_entry_raw(page, idx);
+                    let payload = self.resolve_overflow(entry)?;
                     Ok(Some(payload))
                 } else {
                     Ok(None)
@@ -439,6 +522,18 @@ impl<'a> BTree<'a> {
                 io::ErrorKind::InvalidData,
                 format!("unknown page type: {}", other),
             )),
+        }
+    }
+
+    fn resolve_overflow(&mut self, entry: LeafEntry) -> io::Result<Vec<u8>> {
+        if let Some(overflow_page) = entry.overflow_page {
+            let mut payload = entry.local_payload;
+            let overflow_len = entry.total_len - payload.len();
+            let overflow_data = read_overflow_chain(self.pager, overflow_page, overflow_len)?;
+            payload.extend(overflow_data);
+            Ok(payload)
+        } else {
+            Ok(entry.local_payload)
         }
     }
 
@@ -588,11 +683,11 @@ impl<'a> BTree<'a> {
         let right_page_num = parent.children[right_idx];
         let mut merged_entries = {
             let left_page = self.pager.read_page(left_page_num)?;
-            read_all_leaf_entries(left_page)
+            read_all_leaf_entries_raw(left_page)
         };
         let right_entries = {
             let right_page = self.pager.read_page(right_page_num)?;
-            read_all_leaf_entries(right_page)
+            read_all_leaf_entries_raw(right_page)
         };
         merged_entries.extend(right_entries);
 
@@ -632,7 +727,7 @@ impl<'a> BTree<'a> {
             let right_page = self.pager.write_page(right_page_num)?;
             write_leaf_entries(right_page, page_size, &right_side_entries, right_next);
         }
-        parent.keys[left_idx] = right_side_entries[0].0;
+        parent.keys[left_idx] = right_side_entries[0].key;
         let parent_page = self.pager.write_page(parent_page_num)?;
         write_interior_node(parent_page, page_size, &parent);
         Ok(())
@@ -800,12 +895,13 @@ impl<'a> BTree<'a> {
         loop {
             let (entries, next_leaf) = {
                 let page = self.pager.read_page(current)?;
-                let entries = read_all_leaf_entries(page);
+                let entries = read_all_leaf_entries_raw(page);
                 let next = get_next_leaf(page);
                 (entries, next)
             };
 
-            for (key, payload) in entries {
+            for entry in entries {
+                let key = entry.key;
                 if let Some(min) = min_key {
                     if key < min {
                         continue;
@@ -816,6 +912,7 @@ impl<'a> BTree<'a> {
                         return Ok(results);
                     }
                 }
+                let payload = self.resolve_overflow(entry)?;
                 results.push(Entry { key, payload });
             }
 
@@ -964,22 +1061,34 @@ fn interior_has_room(page: &[u8], _page_size: usize) -> bool {
 }
 
 /// Insert a leaf cell (key + payload) into the page, maintaining sorted order.
-fn insert_leaf_cell(page: &mut [u8], _page_size: usize, key: i64, payload: &[u8]) {
+fn insert_leaf_cell(page: &mut [u8], _page_size: usize, entry: &LeafEntry) {
     let cell_count = get_cell_count(page);
-    let cell_size = LEAF_CELL_HEADER_SIZE + payload.len();
+    let cell_size = LEAF_CELL_HEADER_SIZE
+        + entry.local_payload.len()
+        + if entry.overflow_page.is_some() {
+            4
+        } else {
+            0
+        };
 
     // Allocate cell space (grows downward).
     let new_content_offset = get_cell_content_offset(page) - cell_size;
     set_cell_content_offset(page, new_content_offset);
 
     // Write cell data.
-    let off = new_content_offset;
-    page[off..off + 8].copy_from_slice(&key.to_be_bytes());
-    page[off + 8..off + 12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    page[off + 12..off + 12 + payload.len()].copy_from_slice(payload);
+    let mut off = new_content_offset;
+    page[off..off + 8].copy_from_slice(&entry.key.to_be_bytes());
+    off += 8;
+    page[off..off + 4].copy_from_slice(&(entry.total_len as u32).to_be_bytes());
+    off += 4;
+    page[off..off + entry.local_payload.len()].copy_from_slice(&entry.local_payload);
+    off += entry.local_payload.len();
+    if let Some(pg) = entry.overflow_page {
+        page[off..off + 4].copy_from_slice(&pg.to_be_bytes());
+    }
 
     // Find insertion position in sorted order.
-    let insert_pos = find_insert_pos_leaf(page, cell_count, key);
+    let insert_pos = find_insert_pos_leaf(page, cell_count, entry.key);
 
     // Shift cell offset entries to make room.
     for i in (insert_pos..cell_count).rev() {
@@ -1030,23 +1139,43 @@ fn find_cell_by_key_leaf(page: &[u8], key: i64) -> Option<usize> {
     None
 }
 
-fn read_leaf_payload(page: &[u8], idx: usize) -> Vec<u8> {
+fn read_leaf_entry_raw(page: &[u8], idx: usize) -> LeafEntry {
     let offset = get_cell_offset(page, idx);
-    let payload_size =
-        u32::from_be_bytes(page[offset + 8..offset + 12].try_into().unwrap()) as usize;
-    page[offset + 12..offset + 12 + payload_size].to_vec()
+    let key = i64::from_be_bytes(page[offset..offset + 8].try_into().unwrap());
+    let total_len = u32::from_be_bytes(page[offset + 8..offset + 12].try_into().unwrap()) as usize;
+
+    let max_local = max_local_payload(page.len());
+    let local_len = if total_len > max_local {
+        max_local
+    } else {
+        total_len
+    };
+
+    let payload_offset = offset + 12;
+    let local_payload = page[payload_offset..payload_offset + local_len].to_vec();
+
+    let overflow_page = if total_len > local_len {
+        let overflow_offset = payload_offset + local_len;
+        Some(u32::from_be_bytes(
+            page[overflow_offset..overflow_offset + 4].try_into().unwrap(),
+        ))
+    } else {
+        None
+    };
+
+    LeafEntry {
+        key,
+        total_len,
+        local_payload,
+        overflow_page,
+    }
 }
 
-fn read_all_leaf_entries(page: &[u8]) -> Vec<(i64, Vec<u8>)> {
+fn read_all_leaf_entries_raw(page: &[u8]) -> Vec<LeafEntry> {
     let cell_count = get_cell_count(page);
     let mut entries = Vec::with_capacity(cell_count);
     for i in 0..cell_count {
-        let offset = get_cell_offset(page, i);
-        let key = i64::from_be_bytes(page[offset..offset + 8].try_into().unwrap());
-        let payload_size =
-            u32::from_be_bytes(page[offset + 8..offset + 12].try_into().unwrap()) as usize;
-        let payload = page[offset + 12..offset + 12 + payload_size].to_vec();
-        entries.push((key, payload));
+        entries.push(read_leaf_entry_raw(page, i));
     }
     entries
 }
@@ -1196,21 +1325,25 @@ fn interior_entries_fit_in_page(key_count: usize, page_size: usize) -> bool {
     interior_entries_required_bytes(key_count) <= page_size
 }
 
-fn leaf_entries_required_bytes(entries: &[(i64, Vec<u8>)]) -> usize {
+fn leaf_entries_required_bytes(entries: &[LeafEntry]) -> usize {
     PAGE_HEADER_SIZE
         + entries.len() * CELL_PTR_SIZE
         + entries
             .iter()
-            .map(|(_, payload)| LEAF_CELL_HEADER_SIZE + payload.len())
+            .map(|entry| {
+                LEAF_CELL_HEADER_SIZE
+                    + entry.local_payload.len()
+                    + if entry.overflow_page.is_some() { 4 } else { 0 }
+            })
             .sum::<usize>()
 }
 
-fn leaf_entries_fit_in_page(entries: &[(i64, Vec<u8>)], page_size: usize) -> bool {
+fn leaf_entries_fit_in_page(entries: &[LeafEntry], page_size: usize) -> bool {
     leaf_entries_required_bytes(entries) <= page_size
 }
 
 fn choose_leaf_redistribution_split(
-    entries: &[(i64, Vec<u8>)],
+    entries: &[LeafEntry],
     page_size: usize,
 ) -> io::Result<usize> {
     if entries.len() < 2 {
@@ -1222,9 +1355,11 @@ fn choose_leaf_redistribution_split(
 
     let mut prefix_entry_bytes = Vec::with_capacity(entries.len() + 1);
     prefix_entry_bytes.push(0usize);
-    for (_, payload) in entries {
-        let next =
-            prefix_entry_bytes.last().copied().unwrap() + LEAF_CELL_HEADER_SIZE + payload.len();
+    for entry in entries {
+        let cell_size = LEAF_CELL_HEADER_SIZE
+            + entry.local_payload.len()
+            + if entry.overflow_page.is_some() { 4 } else { 0 };
+        let next = prefix_entry_bytes.last().copied().unwrap() + cell_size;
         prefix_entry_bytes.push(next);
     }
 
@@ -1295,13 +1430,13 @@ fn choose_interior_redistribution_split(
 fn write_leaf_entries(
     page: &mut [u8],
     page_size: usize,
-    entries: &[(i64, Vec<u8>)],
+    entries: &[LeafEntry],
     next_leaf: PageNum,
 ) {
     init_leaf(page, page_size);
     set_next_leaf(page, next_leaf);
-    for (key, payload) in entries {
-        insert_leaf_cell(page, page_size, *key, payload);
+    for entry in entries {
+        insert_leaf_cell(page, page_size, entry);
     }
 }
 
@@ -1376,8 +1511,13 @@ mod tests {
     ) -> PageNum {
         let page_size = pager.page_size();
         let page_num = pager.allocate_page().unwrap();
-        let entries: Vec<(i64, Vec<u8>)> = (0..count)
-            .map(|idx| (start_key + idx as i64, payload.to_vec()))
+        let entries: Vec<LeafEntry> = (0..count)
+            .map(|idx| LeafEntry {
+                key: start_key + idx as i64,
+                total_len: payload.len(),
+                local_payload: payload.to_vec(),
+                overflow_page: None,
+            })
             .collect();
         {
             let page = pager.write_page(page_num).unwrap();
@@ -1829,7 +1969,7 @@ mod tests {
         let (right_count, right_first_key) = {
             let right_page = tree.pager.read_page(right_child).unwrap();
             let count = get_cell_count(right_page);
-            let first_key = read_all_leaf_entries(right_page)[0].0;
+            let first_key = read_all_leaf_entries_raw(right_page)[0].key;
             (count, first_key)
         };
 
@@ -2120,6 +2260,31 @@ mod tests {
             assert_eq!(tree.lookup(2).unwrap(), Some(b"beta".to_vec()));
             assert_eq!(tree.lookup(3).unwrap(), Some(b"gamma".to_vec()));
         }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn overflow_payload() {
+        let path = temp_db_path("btree_overflow.db");
+        cleanup(&path);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let root = BTree::create(&mut pager).unwrap();
+        let mut tree = BTree::new(&mut pager, root);
+
+        // Payload larger than page size (4096).
+        let payload = vec![0xDD; 5000];
+        tree.insert(1, &payload).unwrap();
+
+        let result = tree.lookup(1).unwrap();
+        assert_eq!(result, Some(payload.clone()));
+
+        // Scan should also work.
+        let entries = tree.scan_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload.len(), 5000);
+        assert_eq!(entries[0].payload, payload);
 
         cleanup(&path);
     }
